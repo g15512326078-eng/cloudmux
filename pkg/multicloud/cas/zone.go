@@ -74,7 +74,7 @@ func (self *SZone) GetIRegion() cloudprovider.ICloudRegion {
 }
 
 func (self *SZone) getHosts() ([]SHost, error) {
-	hosts, err := self.region.cli.GetHosts()
+	hosts, err := self.region.cachedHosts()
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +102,7 @@ func (self *SZone) GetIHosts() ([]cloudprovider.ICloudHost, error) {
 }
 
 func (self *SZone) GetIHostById(id string) (cloudprovider.ICloudHost, error) {
-	host, err := self.region.cli.GetHost(id)
+	host, err := self.region.getHost(id)
 	if err != nil {
 		return nil, err
 	}

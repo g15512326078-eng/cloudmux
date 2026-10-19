@@ -32,6 +32,9 @@ type SRegion struct {
 	multicloud.SNoLbRegion
 
 	cli *SCasClient
+
+	// per-sync cache, see cache.go
+	cache sSyncCache
 }
 
 func (self *SRegion) GetClient() *SCasClient {
@@ -109,9 +112,9 @@ func (self *SRegion) CreateIVpc(opts *cloudprovider.VpcCreateOptions) (cloudprov
 }
 
 func (self *SRegion) GetIZones() ([]cloudprovider.ICloudZone, error) {
-	pools, err := self.cli.GetHostPools()
+	pools, err := self.cachedHostPools()
 	if err != nil {
-		return nil, errors.Wrapf(err, "GetHostPools")
+		return nil, err
 	}
 	ret := []cloudprovider.ICloudZone{}
 	for i := range pools {
@@ -157,10 +160,25 @@ func (self *SRegion) GetIHosts() ([]cloudprovider.ICloudHost, error) {
 	return ret, nil
 }
 
+// getHost looks the host up in the cached host list first and only asks
+// host/id/{id} for hosts that are not in it.
 func (self *SRegion) getHost(id string) (*SHost, error) {
-	host, err := self.cli.GetHost(id)
+	hosts, err := self.cachedHosts()
 	if err != nil {
 		return nil, err
+	}
+	var host *SHost
+	for i := range hosts {
+		if hosts[i].GetId() == id {
+			host = &hosts[i]
+			break
+		}
+	}
+	if host == nil {
+		host, err = self.cli.GetHost(id)
+		if err != nil {
+			return nil, err
+		}
 	}
 	zone, err := self.getZone(host.HostPoolId)
 	if err != nil {
@@ -204,13 +222,12 @@ func (self *SRegion) GetIStorageById(id string) (cloudprovider.ICloudStorage, er
 }
 
 func (self *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
-	vms, err := self.cli.GetInstances(nil)
+	vms, err := self.cachedInstances()
 	if err != nil {
 		return nil, err
 	}
 	ret := []cloudprovider.ICloudVM{}
 	for i := range vms {
-		vms[i].region = self
 		ret = append(ret, &vms[i])
 	}
 	return ret, nil

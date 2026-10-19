@@ -119,8 +119,13 @@ func newFakeCas(t *testing.T) (*fakeCas, *httptest.Server) {
 		"/cas/casrs/host/id/1/vswitch": fixture(t, "host_vswitch"),
 		"/cas/casrs/vm/vmList":         fixture(t, "vm_list"),
 		"/cas/casrs/vm/detail/9":       fixture(t, "vm_detail"),
-		"/cas/casrs/vmTemplate/all":    fixture(t, "vmtemplate_all"),
-		"/cas/casrs/version":           `{"casVersion":"test-version"}`,
+		// The api.yaml examples for vmList and vm/detail describe different
+		// VMs, so the bulk detail is empty here and the mapping test goes
+		// through the per-VM vm/detail/{id} fallback. The bulk path is
+		// tested with the consistent fake in sync_test.go.
+		"/cas/casrs/vm/detail/all":  `{"domain":[]}`,
+		"/cas/casrs/vmTemplate/all": fixture(t, "vmtemplate_all"),
+		"/cas/casrs/version":        `{"casVersion":"test-version"}`,
 	}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)

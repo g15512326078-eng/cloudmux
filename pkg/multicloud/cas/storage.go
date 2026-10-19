@@ -66,6 +66,15 @@ type SStorage struct {
 }
 
 func (self *SHost) getStorages() ([]SStorage, error) {
+	pools, shared, err := self.zone.region.cachedHostStorages(self.Id)
+	if err != nil {
+		return nil, err
+	}
+	return newStorages(self, pools, shared), nil
+}
+
+// fetchStorages is getStorages without the per-sync cache, for Refresh.
+func (self *SHost) fetchStorages() ([]SStorage, error) {
 	cli := self.zone.region.cli
 	pools, err := cli.GetStoragePools(self.Id)
 	if err != nil {
@@ -123,7 +132,7 @@ func (self *SStorage) GetStatus() string {
 }
 
 func (self *SStorage) Refresh() error {
-	storages, err := self.host.getStorages()
+	storages, err := self.host.fetchStorages()
 	if err != nil {
 		return err
 	}
@@ -208,13 +217,7 @@ func (self *SStorage) contains(path string) bool {
 // the host pool for a shared one) and keeps the disks whose path is in it.
 func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 	region := self.host.zone.region
-	params := url.Values{}
-	if self.shared {
-		params.Set("hpId", fmt.Sprintf("%d", self.host.HostPoolId))
-	} else {
-		params.Set("hostId", fmt.Sprintf("%d", self.host.Id))
-	}
-	vms, err := region.cli.GetInstances(params)
+	vms, err := region.cachedInstances()
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +229,6 @@ func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 		if !self.shared && vms[i].HostId != self.host.Id {
 			continue
 		}
-		vms[i].region = region
 		disks, err := vms[i].getDisks()
 		if err != nil {
 			return nil, errors.Wrapf(err, "vm %s disks", vms[i].Name)

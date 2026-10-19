@@ -16,7 +16,6 @@ package cas
 
 import (
 	"fmt"
-	"net/url"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -209,7 +208,7 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 }
 
 func (self *SHost) getIWires() ([]cloudprovider.ICloudWire, error) {
-	vswitches, err := self.zone.region.cli.GetHostVSwitches(self.Id)
+	vswitches, err := self.zone.region.cachedHostVSwitches(self.Id)
 	if err != nil {
 		return nil, err
 	}
@@ -260,10 +259,9 @@ func (self *SHost) GetIStorageById(id string) (cloudprovider.ICloudStorage, erro
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "storage %s on host %s", id, self.Name)
 }
 
+// GetIVMs filters the region's cached, paged VM list by hostId.
 func (self *SHost) GetIVMs() ([]cloudprovider.ICloudVM, error) {
-	params := url.Values{}
-	params.Set("hostId", self.GetId())
-	vms, err := self.zone.region.cli.GetInstances(params)
+	vms, err := self.zone.region.cachedInstances()
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +270,6 @@ func (self *SHost) GetIVMs() ([]cloudprovider.ICloudVM, error) {
 		if vms[i].HostId != self.Id {
 			continue
 		}
-		vms[i].region = self.zone.region
 		vms[i].host = self
 		ret = append(ret, &vms[i])
 	}

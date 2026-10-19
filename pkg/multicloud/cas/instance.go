@@ -213,9 +213,32 @@ func parseInstanceDetail(resp jsonutils.JSONObject) (*SInstanceDetail, error) {
 	return detail, nil
 }
 
+// GetHostInstanceDetails is GET vm/detail/all?hostId=: the details of every
+// VM on a host in one call (hostId is required by api.yaml).
+func (cli *SCasClient) GetHostInstanceDetails(hostId int64) ([]SInstanceDetail, error) {
+	params := url.Values{}
+	params.Set("hostId", fmt.Sprintf("%d", hostId))
+	resp, err := cli.request(httputils.GET, "vm/detail/all", params, nil)
+	if err != nil {
+		return nil, err
+	}
+	return parseInstanceDetails(resp)
+}
+
+// getDetail takes the VM's detail from the cached per-host bulk detail
+// (vm/detail/all?hostId=) and only falls back to vm/detail/{id} for a VM
+// that is not in its host's list (e.g. it migrated mid-sync).
 func (self *SInstance) getDetail() (*SInstanceDetail, error) {
 	if self.detail != nil {
 		return self.detail, nil
+	}
+	details, err := self.region.cachedHostDetails(self.HostId)
+	if err != nil {
+		return nil, err
+	}
+	if detail, ok := details[self.Uuid]; ok {
+		self.detail = detail
+		return detail, nil
 	}
 	detail, err := self.region.cli.GetInstanceDetail(self.Id)
 	if err != nil {

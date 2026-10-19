@@ -294,3 +294,145 @@ func TestGetInstanceByUuid(t *testing.T) {
 		t.Errorf("GetInstance(nope) = %v, want ErrNotFound", err)
 	}
 }
+
+// walkRegion touches every read path a cloudpods sync uses, on one region
+// object, and returns how many VMs/disks/nics it saw.
+func walkRegion(t *testing.T, cli *SCasClient) (int, int, int) {
+	regions, err := cli.GetIRegions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	region := regions[0]
+	nVM, nDisk, nNic := 0, 0, 0
+	zones, err := region.GetIZones()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, zone := range zones {
+		if _, err := zone.GetIStorages(); err != nil {
+			t.Fatal(err)
+		}
+		hosts, err := zone.GetIHosts()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, host := range hosts {
+			if _, err := host.GetIHostNics(); err != nil {
+				t.Fatal(err)
+			}
+			storages, err := host.GetIStorages()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, st := range storages {
+				if _, err := st.GetIDisks(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			vms, err := host.GetIVMs()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, vm := range vms {
+				nVM++
+				disks, err := vm.GetIDisks()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, disk := range disks {
+					nDisk++
+					if _, err := disk.GetIStorage(); err != nil {
+						t.Fatalf("disk %s storage: %v", disk.GetGlobalId(), err)
+					}
+				}
+				nics, err := vm.GetINics()
+				if err != nil {
+					t.Fatal(err)
+				}
+				nNic += len(nics)
+			}
+		}
+	}
+	vpcs, err := region.GetIVpcs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, vpc := range vpcs {
+		wires, err := vpc.GetIWires()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, wire := range wires {
+			if _, err := wire.GetINetworks(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := region.GetIVMs(); err != nil {
+		t.Fatal(err)
+	}
+	caches, err := region.GetIStoragecaches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range caches {
+		if _, err := c.GetICloudImages(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return nVM, nDisk, nNic
+}
+
+func TestSyncRequestCount(t *testing.T) {
+	const nHosts = 2
+	// hostpool/all + host + vmTemplate/all + one vm/vmList page, plus per
+	// host: host/id/{id}, storage/pool, host/id/{id}/storage,
+	// host/id/{id}/vswitch, vm/detail/all?hostId=.
+	want := 4 + 5*nHosts
+	for _, nVMs := range []int{6, 60} {
+		f := newFakeCloud(t, nHosts, nVMs)
+		cli, _ := f.start()
+		nVM, nDisk, nNic := walkRegion(t, cli)
+		if nVM != nVMs || nDisk != 2*nVMs || nNic != nVMs {
+			t.Errorf("%d vms: saw %d vms %d disks %d nics", nVMs, nVM, nDisk, nNic)
+		}
+		if got := f.total(); got != want {
+			t.Errorf("%d vms: %d requests, want %d: %v", nVMs, got, want, f.hits)
+		}
+		for k := range f.hits {
+			if strings.HasPrefix(k, "vm/detail/") && !strings.HasPrefix(k, "vm/detail/all?") {
+				t.Errorf("per-VM detail request %s", k)
+			}
+		}
+		if n := f.hitCount("vm/vmList"); n != 1 {
+			t.Errorf("%d vm/vmList requests, want 1", n)
+		}
+	}
+	// paging adds only list pages
+	f := newFakeCloud(t, nHosts, 60)
+	cli, _ := f.start()
+	cli.pageSize = 25
+	walkRegion(t, cli)
+	if got := f.total(); got != want-1+3 {
+		t.Errorf("paged: %d requests, want %d", got, want+2)
+	}
+}
+
+func TestDetailFallbackForMovedVM(t *testing.T) {
+	f := newFakeCloud(t, 2, 2)
+	cli, _ := f.start()
+	region := cli.GetRegion()
+	vms, err := region.cachedInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm := vms[0]
+	vm.HostId = 2 // list says host 2, but host 2's bulk detail does not have it
+	disks, err := vm.GetIDisks()
+	if err != nil || len(disks) != 2 {
+		t.Fatalf("GetIDisks = %v, %v", disks, err)
+	}
+	if f.hitCount(fmt.Sprintf("vm/detail/%d", vm.Id)) != 1 {
+		t.Errorf("expected a vm/detail/%d fallback: %v", vm.Id, f.hits)
+	}
+}
