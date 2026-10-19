@@ -101,7 +101,26 @@ type SInstanceNetwork struct {
 }
 
 // GetInstances pages through vm/vmList (see listPaged) and returns every VM.
+// VM_TYPE_VMWARE is vmList "type" 1 ("VMware虚拟机"), a VM CAS manages on a
+// VMware host; those are not CAS-hypervisor guests and are not synced.
+const VM_TYPE_VMWARE = 1
+
+// GetInstances is the paged vm/vmList without VMware-type VMs.
 func (cli *SCasClient) GetInstances(params url.Values) ([]SInstance, error) {
+	vms, err := cli.listInstances(params)
+	if err != nil {
+		return nil, err
+	}
+	ret := []SInstance{}
+	for i := range vms {
+		if vms[i].Type != VM_TYPE_VMWARE {
+			ret = append(ret, vms[i])
+		}
+	}
+	return ret, nil
+}
+
+func (cli *SCasClient) listInstances(params url.Values) ([]SInstance, error) {
 	items, err := cli.listPaged("vm/vmList", params, "domain", "uuid")
 	if err != nil {
 		return nil, err
@@ -137,9 +156,14 @@ func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
 	if detail == nil {
 		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vm %s", uuid)
 	}
+	var notFound error
 	find := func(vms []SInstance) *SInstance {
 		for i := range vms {
 			if vms[i].Uuid == uuid {
+				if vms[i].Type == VM_TYPE_VMWARE {
+					notFound = errors.Wrapf(cloudprovider.ErrNotFound, "vm %s is a VMware VM", uuid)
+					return nil
+				}
 				vms[i].detail = detail
 				return &vms[i]
 			}
@@ -153,15 +177,15 @@ func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
 	if err != nil {
 		return nil, err
 	}
-	if vm := find(vms); vm != nil {
-		return vm, nil
+	if vm := find(vms); vm != nil || notFound != nil {
+		return vm, notFound
 	}
-	vms, err = cli.GetInstances(nil)
+	vms, err = cli.listInstances(nil)
 	if err != nil {
 		return nil, err
 	}
-	if vm := find(vms); vm != nil {
-		return vm, nil
+	if vm := find(vms); vm != nil || notFound != nil {
+		return vm, notFound
 	}
 	return nil, errors.Errorf("vm %s has a detail (id %d) but is not in vm/vmList", uuid, detail.Id)
 }
@@ -430,6 +454,10 @@ func (self *SInstance) GetINics() ([]cloudprovider.ICloudNic, error) {
 	}
 	ret := []cloudprovider.ICloudNic{}
 	for i := range detail.nics {
+		// netType 2 is "none" (no network attached)
+		if detail.nics[i].NetType == NIC_NET_TYPE_NONE {
+			continue
+		}
 		ret = append(ret, &SInstanceNic{SInstanceNetwork: detail.nics[i], ins: self})
 	}
 	return ret, nil
@@ -493,6 +521,10 @@ func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
 func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
 	return errors.Wrap(cloudprovider.ErrNotImplemented, "DetachDisk")
 }
+
+// vm/detail network[].netType: 0 bridge, 1 NAT, 2 none, 3 passthrough,
+// 4 SR-IOV. Only "none" is skipped; 3/4 are kept unverified.
+const NIC_NET_TYPE_NONE = 2
 
 // SInstanceNic wraps VMRsDomainDetail.network[].
 type SInstanceNic struct {

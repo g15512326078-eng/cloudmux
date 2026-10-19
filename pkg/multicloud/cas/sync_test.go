@@ -505,3 +505,45 @@ func TestNetworkTopology(t *testing.T) {
 		t.Errorf("nic without vswitch -> %q", nic.GetINetworkId())
 	}
 }
+
+func TestCheapFixes(t *testing.T) {
+	f := newFakeCloud(t, 1, 3)
+	cli, _ := f.start()
+	// mark vm 2 as VMware via a wrapper handler
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == API_PREFIX+"/vm/vmList" {
+			rec := httptest.NewRecorder()
+			f.ServeHTTP(rec, r)
+			obj, _ := jsonutils.Parse(rec.Body.Bytes())
+			items, _ := obj.GetArray("domain")
+			for _, it := range items {
+				if id, _ := it.Int("id"); id == 2 {
+					it.(*jsonutils.JSONDict).Set("type", jsonutils.NewInt(VM_TYPE_VMWARE))
+				}
+			}
+			reply(w, obj)
+			return
+		}
+		f.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	cli.accessUrl = srv.URL
+	vms, err := cli.GetInstances(nil)
+	if err != nil || uuids(vms) != "uuid-1,uuid-3" {
+		t.Errorf("GetInstances = %s, %v (VMware VM must be filtered)", uuids(vms), err)
+	}
+	if _, err := cli.GetInstance("uuid-2"); errors.Cause(err) != cloudprovider.ErrNotFound {
+		t.Errorf("GetInstance(VMware) = %v, want ErrNotFound", err)
+	}
+
+	vm := &SInstance{detail: &SInstanceDetail{nics: []SInstanceNetwork{{NetType: 0, VsName: "vs0"}, {NetType: NIC_NET_TYPE_NONE}}}}
+	if nics, _ := vm.GetINics(); len(nics) != 1 {
+		t.Errorf("netType none not skipped: %d nics", len(nics))
+	}
+	for capMB, want := range map[int64]int{0: 0, 1024: 1, 1025: 2, 20480: 20} {
+		img := &SImage{SVmTemplate: SVmTemplate{StorageCapacity: capMB}}
+		if got := img.GetMinOsDiskSizeGb(); got != want {
+			t.Errorf("MinOsDisk(%d MB) = %d, want %d", capMB, got, want)
+		}
+	}
+}

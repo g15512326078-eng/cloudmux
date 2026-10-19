@@ -110,8 +110,9 @@ func (self *SImage) GetImageType() cloudprovider.TImageType {
 	return cloudprovider.ImageTypeSystem
 }
 
+// GetMinOsDiskSizeGb rounds storageCapacity (MB, unit unverified) up.
 func (self *SImage) GetMinOsDiskSizeGb() int {
-	return int(self.StorageCapacity / 1024)
+	return int((self.StorageCapacity + 1023) / 1024)
 }
 
 func (self *SImage) GetMinRamSizeMb() int {
