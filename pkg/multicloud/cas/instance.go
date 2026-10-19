@@ -489,19 +489,45 @@ func (self *SInstance) SetSecurityGroups(secgroupIds []string) error {
 	return cloudprovider.ErrNotSupported
 }
 
-// Writes below are P1: CAS answers most of them with an async RsTaskMsg
-// whose semantics are not yet verified, so they are not implemented.
-
+// StartVM is PUT /cas/casrs/vm/start/{id} (api.yaml: "uuid也适用", path type
+// is integer — we send the numeric domain id). Returns RsTaskMsg; waitTask.
 func (self *SInstance) StartVM(ctx context.Context) error {
-	return errors.Wrap(cloudprovider.ErrNotImplemented, "StartVM")
+	_, err := self.region.cli.doAsync(httputils.PUT, fmt.Sprintf("vm/start/%d", self.Id), nil, nil)
+	return err
 }
 
+// StopVM is PUT /cas/casrs/vm/stop/{id}. When opts.IsForce is set it uses
+// PUT /cas/casrs/vm/powerOff/{id} instead ("关闭虚拟机电源"). Both return
+// RsTaskMsg. UNVERIFIED: whether stop is ACPI-graceful and how long
+// powerOff takes vs stop.
 func (self *SInstance) StopVM(ctx context.Context, opts *cloudprovider.ServerStopOptions) error {
-	return errors.Wrap(cloudprovider.ErrNotImplemented, "StopVM")
+	path := fmt.Sprintf("vm/stop/%d", self.Id)
+	if opts != nil && opts.IsForce {
+		path = fmt.Sprintf("vm/powerOff/%d", self.Id)
+	}
+	_, err := self.region.cli.doAsync(httputils.PUT, path, nil, nil)
+	return err
 }
 
+// RestartVM is PUT /cas/casrs/vm/restart/{id} (checklist 1.3). ICloudVM has
+// no Reboot method; cloudpods soft-reboot of managed guests typically
+// stop+start. This is exposed for callers that want the native restart.
+func (self *SInstance) RestartVM(ctx context.Context) error {
+	_, err := self.region.cli.doAsync(httputils.PUT, fmt.Sprintf("vm/restart/%d", self.Id), nil, nil)
+	return err
+}
+
+// DeleteVM is DELETE /cas/casrs/vm/delete/uuid/{uuid} with type=1 (删除数据
+// 存储) and isWipeVolume=true. The id-only delete path has no wipe flags;
+// the uuid path documents type 0=keep storage, 1=delete storage, 3=recycle
+// bin. UNVERIFIED on real CAS: default when type is omitted, delBase0
+// meaning, and whether a running VM must be stopped first.
 func (self *SInstance) DeleteVM(ctx context.Context) error {
-	return errors.Wrap(cloudprovider.ErrNotImplemented, "DeleteVM")
+	params := url.Values{}
+	params.Set("type", "1")
+	params.Set("isWipeVolume", "true")
+	_, err := self.region.cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
+	return err
 }
 
 func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
@@ -524,8 +550,23 @@ func (self *SInstance) ChangeConfig(ctx context.Context, config *cloudprovider.S
 	return errors.Wrap(cloudprovider.ErrNotImplemented, "ChangeConfig")
 }
 
+// GetVNCInfo is GET /cas/casrs/vmvnc/vnc/{id} (sync). novnc/{id} also exists
+// (proxyIp + token) but is unused here — cloudpods' managed VNC path wants
+// host/port/password. Password is returned to the caller; it is redacted
+// in debug logs via isSecretKey.
 func (self *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudprovider.ServerVncOutput, error) {
-	return nil, errors.Wrap(cloudprovider.ErrNotImplemented, "GetVNCInfo")
+	info, err := self.region.cli.GetVnc(self.Id)
+	if err != nil {
+		return nil, err
+	}
+	return &cloudprovider.ServerVncOutput{
+		Protocol:   "vnc",
+		Host:       info.Ip,
+		Port:       int64(info.Port),
+		Password:   info.Password,
+		Hypervisor: api.HYPERVISOR_CAS,
+		InstanceId: self.Uuid,
+	}, nil
 }
 
 func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
