@@ -303,13 +303,20 @@ func (self *SInstance) GetCreatedAt() time.Time {
 	return t
 }
 
+// Refresh re-reads the VM bypassing the per-sync cache and keeps the fresh
+// detail (jsonutils.Update only copies exported fields, and getDetail would
+// otherwise fall back to the possibly older cached bulk detail).
 func (self *SInstance) Refresh() error {
 	vm, err := self.region.cli.GetInstance(self.Uuid)
 	if err != nil {
 		return err
 	}
-	self.detail = nil
-	return jsonutils.Update(self, vm)
+	err = jsonutils.Update(self, vm)
+	if err != nil {
+		return err
+	}
+	self.detail = vm.detail
+	return nil
 }
 
 // GetStatus maps vmStatus: unknown, running, paused, shutOff, ha_exception.

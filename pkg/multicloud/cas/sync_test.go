@@ -50,6 +50,19 @@ type fakeVM struct {
 	id     int
 	hostId int
 	uuid   string
+	ip     string // guest IP in vm/detail; default 10.0.0.<id>
+	cpu    int    // vmList cpu; default 2
+}
+
+// updateVM changes a VM between requests (under the lock the handler uses).
+func (f *fakeCloud) updateVM(id int, fn func(vm *fakeVM)) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for i := range f.vms {
+		if f.vms[i].id == id {
+			fn(&f.vms[i])
+		}
+	}
 }
 
 func newFakeCloud(t *testing.T, nHosts, nVMs int) *fakeCloud {
@@ -75,11 +88,19 @@ func (f *fakeCloud) start() (*SCasClient, *httptest.Server) {
 }
 
 func (f *fakeCloud) vmList(vm fakeVM) dict {
+	cpu := vm.cpu
+	if cpu == 0 {
+		cpu = 2
+	}
 	return dict{"id": vm.id, "uuid": vm.uuid, "name": fmt.Sprintf("vm%d", vm.id), "title": fmt.Sprintf("VM %d", vm.id),
-		"hostId": vm.hostId, "hostPoolId": 1, "clusterId": 1, "cpu": 2, "memory": 2048, "vmStatus": "running", "system": 1}
+		"hostId": vm.hostId, "hostPoolId": 1, "clusterId": 1, "cpu": cpu, "memory": 2048, "vmStatus": "running", "system": 1}
 }
 
 func (f *fakeCloud) vmDetail(vm fakeVM) dict {
+	ip := vm.ip
+	if len(ip) == 0 {
+		ip = fmt.Sprintf("10.0.0.%d", vm.id)
+	}
 	return dict{"id": vm.id, "uuid": vm.uuid, "name": fmt.Sprintf("vm%d", vm.id), "status": "running",
 		"graphics": []dict{{"type": "vnc", "port": 5900 + vm.id, "password": "VNC-SECRET"}},
 		"storage": []dict{
@@ -87,7 +108,7 @@ func (f *fakeCloud) vmDetail(vm fakeVM) dict {
 			{"device": "cdrom", "deviceName": "hdc", "path": ""},
 			{"device": "disk", "deviceName": "vdb", "path": fmt.Sprintf("/vms/share1/vm%d-data", vm.id), "size": 10240, "format": "qcow2", "targetBus": "virtio"},
 		},
-		"network": []dict{{"netType": 0, "mac": fmt.Sprintf("0C:DA:41:00:00:%02x", vm.id), "ipAddr": fmt.Sprintf("10.0.0.%d", vm.id),
+		"network": []dict{{"netType": 0, "mac": fmt.Sprintf("0C:DA:41:00:00:%02x", vm.id), "ipAddr": ip,
 			"vsName": "vswitch0", "deviceModel": "virtio"}},
 	}
 }
@@ -118,6 +139,7 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f.lock.Lock()
 	f.hits[path+"?"+q.Encode()]++
+	vms := append([]fakeVM{}, f.vms...)
 	f.lock.Unlock()
 	qint := func(k string) int {
 		v, _ := strconv.Atoi(q.Get(k))
@@ -156,7 +178,7 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}})
 	case path == "vm/vmList":
 		match := []dict{}
-		for _, vm := range f.vms {
+		for _, vm := range vms {
 			if (q.Has("hostId") && qint("hostId") != vm.hostId) || (q.Has("hpId") && qint("hpId") != 1) ||
 				(q.Has("domainIdList") && qint("domainIdList") != vm.id) {
 				continue
@@ -180,7 +202,7 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, dict{"domain": match})
 	case path == "vm/list/detail":
 		ret := []dict{}
-		for _, vm := range f.vms {
+		for _, vm := range vms {
 			if (q.Has("vmUuids") && q.Get("vmUuids") != vm.uuid) || (q.Has("hostId") && qint("hostId") != vm.hostId) {
 				continue
 			}
@@ -189,7 +211,7 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, dict{"domain": ret})
 	case path == "vm/detail/all":
 		ret := []dict{}
-		for _, vm := range f.vms {
+		for _, vm := range vms {
 			if qint("hostId") == vm.hostId {
 				ret = append(ret, f.vmDetail(vm))
 			}
@@ -197,7 +219,7 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, dict{"domain": ret})
 	case len(parts) == 3 && parts[0] == "vm" && parts[1] == "detail":
 		id, _ := strconv.Atoi(parts[2])
-		for _, vm := range f.vms {
+		for _, vm := range vms {
 			if vm.id == id {
 				reply(w, f.vmDetail(vm))
 				return
@@ -559,5 +581,36 @@ func TestNicIPv6NotReported(t *testing.T) {
 	net := &SNetwork{wire: &SWire{vpc: &SVpc{VSwitchName: "vswitch0"}, zone: &SZone{SHostPool: SHostPool{Id: 1}}}}
 	if net.GetIp6Start() != "" {
 		t.Errorf("placeholder network unexpectedly has a v6 range %q; GetIP6 could be re-enabled", net.GetIp6Start())
+	}
+}
+
+func TestRefreshUpdatesDetail(t *testing.T) {
+	f := newFakeCloud(t, 1, 2)
+	cli, _ := f.start()
+	region := cli.GetRegion()
+	vms, err := region.GetIVMs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	vm := vms[0].(*SInstance)
+	nics, err := vm.GetINics() // fills vm.detail from the cached bulk detail
+	if err != nil || len(nics) != 1 || nics[0].GetIP() != "10.0.0.1" || vm.GetVcpuCount() != 2 {
+		t.Fatalf("before: nics %v %v cpu %d", nics, err, vm.GetVcpuCount())
+	}
+	f.updateVM(1, func(v *fakeVM) { v.ip, v.cpu = "10.9.9.9", 4 })
+	if err := vm.Refresh(); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	nics, err = vm.GetINics()
+	if err != nil || len(nics) != 1 || nics[0].GetIP() != "10.9.9.9" {
+		t.Errorf("after Refresh nic ip = %v, %v, want 10.9.9.9 (detail kept)", nics, err)
+	}
+	if vm.GetVcpuCount() != 4 {
+		t.Errorf("after Refresh cpu = %d, want 4", vm.GetVcpuCount())
+	}
+	// the region cache still holds the old bulk detail; Refresh must not read it
+	cached, _ := region.cachedHostDetails(1)
+	if cached["uuid-1"].nics[0].IpAddr != "10.0.0.1" {
+		t.Errorf("test premise: cache should still be stale")
 	}
 }
