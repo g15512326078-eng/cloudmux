@@ -130,31 +130,31 @@ func (cli *SCasClient) listInstances(params url.Values) ([]SInstance, error) {
 }
 
 // GetInstance looks a VM up by uuid (its external id):
-//  1. GET vm/list/detail?vmUuids=<uuid>: no element -> ErrNotFound;
-//  2. GET vm/vmList?domainIdList=<id> for the list fields (hostId, ...);
-//  3. if the filter was not honoured, fall back to the full paged list.
+//  1. GET vm/detail/uuid/{uuid} (path-based, api.yaml returns a single
+//     VMRsDomainDetail); 404, or 409 whose message says "不存在", is
+//     ErrNotFound via request(); a detail for another uuid is an error.
+//  2. The detail has no hostId/hostPoolId, so the list fields come from
+//     GET vm/vmList?hpId=<hp>&domainIdList=<id> for each host pool
+//     (api.yaml: domainIdList only works together with hpId).
+//  3. If no pool returned it, the full paged vm/vmList.
 //
-// If the detail exists but the list does not have it, that is an error,
-// not ErrNotFound, so cloudpods does not mark the VM lost.
+// A VMware-type VM is ErrNotFound. If the detail exists but no list has
+// the VM, that is an error, not ErrNotFound, so cloudpods does not mark
+// the VM lost.
 func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
-	params := url.Values{}
-	params.Set("vmUuids", uuid)
-	resp, err := cli.request(httputils.GET, "vm/list/detail", params, nil)
+	if len(uuid) == 0 {
+		return nil, errors.Wrap(cloudprovider.ErrNotFound, "empty vm uuid")
+	}
+	resp, err := cli.request(httputils.GET, "vm/detail/uuid/"+url.PathEscape(uuid), nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	details, err := parseInstanceDetails(resp)
+	detail, err := parseInstanceDetail(resp)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "vm/detail/uuid/%s", uuid)
 	}
-	var detail *SInstanceDetail
-	for i := range details {
-		if details[i].Uuid == uuid {
-			detail = &details[i]
-		}
-	}
-	if detail == nil {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vm %s", uuid)
+	if detail.Uuid != uuid {
+		return nil, errors.Errorf("vm/detail/uuid/%s returned vm %s", uuid, detail.Uuid)
 	}
 	var notFound error
 	find := func(vms []SInstance) *SInstance {
@@ -170,17 +170,24 @@ func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
 		}
 		return nil
 	}
-	params = url.Values{}
-	params.Set("domainIdList", fmt.Sprintf("%d", detail.Id))
-	vms := []SInstance{}
-	err = cli.list("vm/vmList", params, "domain", &vms)
+	pools, err := cli.GetHostPools()
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "GetHostPools")
 	}
-	if vm := find(vms); vm != nil || notFound != nil {
-		return vm, notFound
+	for i := range pools {
+		params := url.Values{}
+		params.Set("hpId", fmt.Sprintf("%d", pools[i].Id))
+		params.Set("domainIdList", fmt.Sprintf("%d", detail.Id))
+		vms := []SInstance{}
+		err = cli.list("vm/vmList", params, "domain", &vms)
+		if err != nil {
+			return nil, err
+		}
+		if vm := find(vms); vm != nil || notFound != nil {
+			return vm, notFound
+		}
 	}
-	vms, err = cli.listInstances(nil)
+	vms, err := cli.listInstances(nil)
 	if err != nil {
 		return nil, err
 	}

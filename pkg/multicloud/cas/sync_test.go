@@ -41,6 +41,7 @@ type fakeCloud struct {
 
 	ignoreOffset bool
 	ignoreLimit  bool
+	notFound409  bool // unknown vm/detail/uuid -> 409 "不存在" instead of 404
 
 	lock sync.Mutex
 	hits map[string]int // "path?sorted query" -> count
@@ -51,6 +52,7 @@ type fakeVM struct {
 	hostId int
 	uuid   string
 	ip     string // guest IP in vm/detail; default 10.0.0.<id>
+	hidden bool   // has a detail but is missing from vm/vmList
 	cpu    int    // vmList cpu; default 2
 }
 
@@ -179,8 +181,9 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "vm/vmList":
 		match := []dict{}
 		for _, vm := range vms {
-			if (q.Has("hostId") && qint("hostId") != vm.hostId) || (q.Has("hpId") && qint("hpId") != 1) ||
-				(q.Has("domainIdList") && qint("domainIdList") != vm.id) {
+			// api.yaml: domainIdList is only honoured together with hpId
+			if vm.hidden || (q.Has("hostId") && qint("hostId") != vm.hostId) || (q.Has("hpId") && qint("hpId") != 1) ||
+				(q.Has("hpId") && q.Has("domainIdList") && qint("domainIdList") != vm.id) {
 				continue
 			}
 			match = append(match, f.vmList(vm))
@@ -200,15 +203,20 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			match = match[offset:end]
 		}
 		reply(w, dict{"domain": match})
-	case path == "vm/list/detail":
-		ret := []dict{}
+	case len(parts) == 4 && parts[0] == "vm" && parts[1] == "detail" && parts[2] == "uuid":
 		for _, vm := range vms {
-			if (q.Has("vmUuids") && q.Get("vmUuids") != vm.uuid) || (q.Has("hostId") && qint("hostId") != vm.hostId) {
-				continue
+			if vm.uuid == parts[3] {
+				reply(w, f.vmDetail(vm))
+				return
 			}
-			ret = append(ret, f.vmDetail(vm))
 		}
-		reply(w, dict{"domain": ret})
+		if f.notFound409 {
+			w.Header().Set("Error-Code", "3006")
+			w.Header().Set("Error-Message", "虚拟机不存在。")
+			w.WriteHeader(http.StatusConflict)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
 	case path == "vm/detail/all":
 		ret := []dict{}
 		for _, vm := range vms {
@@ -306,19 +314,40 @@ func TestGetInstanceByUuid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInstance: %v", err)
 	}
-	if vm.Id != 4 || vm.HostId != 2 || vm.detail == nil || len(vm.detail.disks) != 3 {
+	if vm.Id != 4 || vm.HostId != 2 || vm.HostPoolId != 1 || vm.detail == nil || len(vm.detail.disks) != 3 {
 		t.Errorf("vm = %+v", vm)
 	}
-	if n := f.total(); n != 2 {
-		t.Errorf("GetInstance used %d requests, want 2 (list/detail + filtered vmList): %v", n, f.hits)
+	for _, k := range []string{"vm/detail/uuid/uuid-4?", "hostpool/all?", "vm/vmList?domainIdList=4&hpId=1"} {
+		if f.hitCount(k) != 1 {
+			t.Errorf("expected one %s request: %v", k, f.hits)
+		}
 	}
-	if _, err := cli.GetInstance("nope"); errors.Cause(err) != cloudprovider.ErrNotFound {
-		t.Errorf("GetInstance(nope) = %v, want ErrNotFound", err)
+	if n := f.total(); n != 3 {
+		t.Errorf("GetInstance used %d requests, want 3: %v", n, f.hits)
+	}
+
+	// not found: 404, and 409 with a "不存在" message
+	for _, use409 := range []bool{false, true} {
+		f.notFound409 = use409
+		if _, err := cli.GetInstance("nope"); errors.Cause(err) != cloudprovider.ErrNotFound {
+			t.Errorf("GetInstance(nope) 409=%v: %v, want ErrNotFound", use409, err)
+		}
+	}
+	if _, err := cli.GetInstance(""); errors.Cause(err) != cloudprovider.ErrNotFound {
+		t.Errorf("GetInstance(\"\") = %v", err)
+	}
+
+	// a detail without a list entry is an error, never NotFound (no "lost")
+	f.updateVM(5, func(v *fakeVM) { v.hidden = true })
+	before := f.hitCount("vm/vmList?limit=")
+	if _, err := cli.GetInstance("uuid-5"); err == nil || errors.Cause(err) == cloudprovider.ErrNotFound {
+		t.Errorf("GetInstance(hidden) = %v, want a non-NotFound error", err)
+	}
+	if f.hitCount("vm/vmList?limit=") != before+1 {
+		t.Errorf("expected the full paged list fallback")
 	}
 }
 
-// walkRegion touches every read path a cloudpods sync uses, on one region
-// object, and returns how many VMs/disks/nics it saw.
 func walkRegion(t *testing.T, cli *SCasClient) (int, int, int) {
 	regions, err := cli.GetIRegions()
 	if err != nil {
