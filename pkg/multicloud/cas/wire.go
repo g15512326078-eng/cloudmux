@@ -49,19 +49,23 @@ func (cli *SCasClient) GetHostVSwitches(hostId int64) ([]SVSwitch, error) {
 	return ret, cli.list(fmt.Sprintf("host/id/%d/vswitch", hostId), nil, "vSwitch", &ret)
 }
 
-// SWire maps the vswitches named VSwitchName inside one host pool.
+// SWire is one (VPC, zone) pair: the vswitches named vpc.VSwitchName on the
+// hosts of one host pool.
 type SWire struct {
 	multicloud.SResourceBase
 	multicloud.STagBase
 
 	vpc  *SVpc
 	zone *SZone
+}
 
-	VSwitchName string
+// wireId is shared with SInstanceNic.GetINetworkId.
+func wireId(vswitchName string, hostPoolId int64) string {
+	return fmt.Sprintf("vswitch/%s/hostpool/%d", vswitchName, hostPoolId)
 }
 
 func (self *SWire) GetId() string {
-	return fmt.Sprintf("hostpool/%d/vswitch/%s", self.zone.Id, self.VSwitchName)
+	return wireId(self.vpc.VSwitchName, self.zone.Id)
 }
 
 func (self *SWire) GetGlobalId() string {
@@ -69,7 +73,7 @@ func (self *SWire) GetGlobalId() string {
 }
 
 func (self *SWire) GetName() string {
-	return fmt.Sprintf("%s-%s", self.zone.Name, self.VSwitchName)
+	return fmt.Sprintf("%s-%s", self.zone.Name, self.vpc.VSwitchName)
 }
 
 func (self *SWire) GetStatus() string {
@@ -92,15 +96,18 @@ func (self *SWire) GetBandwidth() int {
 	return 10000
 }
 
-// GetINetworks: CAS vswitches carry no guest IP pool, so no networks are
-// synced (same approach as the proxmox provider); cloudpods matches guest
-// NICs to on-premise networks by IP.
+// GetINetworks returns the wire's single placeholder network (see
+// network.go); CAS vswitches carry no guest IP pool.
 func (self *SWire) GetINetworks() ([]cloudprovider.ICloudNetwork, error) {
-	return []cloudprovider.ICloudNetwork{}, nil
+	return []cloudprovider.ICloudNetwork{&SNetwork{wire: self}}, nil
 }
 
 func (self *SWire) GetINetworkById(netid string) (cloudprovider.ICloudNetwork, error) {
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "network %s", netid)
+	network := &SNetwork{wire: self}
+	if network.GetGlobalId() != netid {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "network %s", netid)
+	}
+	return network, nil
 }
 
 func (self *SWire) CreateINetwork(opts *cloudprovider.SNetworkCreateOptions) (cloudprovider.ICloudNetwork, error) {

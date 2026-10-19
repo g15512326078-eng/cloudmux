@@ -494,8 +494,7 @@ func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
 	return errors.Wrap(cloudprovider.ErrNotImplemented, "DetachDisk")
 }
 
-// SInstanceNic wraps VMRsDomainDetail.network[]. Like proxmox, CAS has no
-// IPAM to sync, so the network is resolved by cloudpods from the guest IP.
+// SInstanceNic wraps VMRsDomainDetail.network[].
 type SInstanceNic struct {
 	cloudprovider.DummyICloudNic
 	SInstanceNetwork
@@ -527,8 +526,14 @@ func (self *SInstanceNic) InClassicNetwork() bool {
 	return false
 }
 
+// GetINetworkId points at the placeholder network of the wire for this
+// NIC's vswitch in the VM's host pool: "vswitch/<vsName>/hostpool/<hpId>/default".
+// A NIC without a vswitch (e.g. netType 2, "none") has no network.
 func (self *SInstanceNic) GetINetworkId() string {
-	return ""
+	if len(self.VsName) == 0 {
+		return ""
+	}
+	return networkId(wireId(self.VsName, self.ins.HostPoolId))
 }
 
 func (self *SInstanceNic) GetSubAddress() ([]string, error) {

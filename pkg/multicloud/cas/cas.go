@@ -434,4 +434,5 @@ var (
 	_ cloudprovider.ICloudNic          = (*SInstanceNic)(nil)
 	_ cloudprovider.ICloudVpc          = (*SVpc)(nil)
 	_ cloudprovider.ICloudWire         = (*SWire)(nil)
+	_ cloudprovider.ICloudNetwork      = (*SNetwork)(nil)
 )

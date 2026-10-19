@@ -207,21 +207,42 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	return nil, errors.Wrap(cloudprovider.ErrNotImplemented, "CreateVM")
 }
 
-func (self *SHost) getIWires() ([]cloudprovider.ICloudWire, error) {
+// getWires returns one wire per distinct vswitch name on the host, in the
+// host's pool. vpcs shares VPC objects between hosts (may be nil).
+func (self *SHost) getWires(vpcs map[string]*SVpc) ([]*SWire, error) {
 	vswitches, err := self.zone.region.cachedHostVSwitches(self.Id)
 	if err != nil {
 		return nil, err
 	}
-	vpc := self.zone.region.getVpc()
-	ret := []cloudprovider.ICloudWire{}
+	if vpcs == nil {
+		vpcs = map[string]*SVpc{}
+	}
+	ret := []*SWire{}
 	seen := map[string]bool{}
 	for i := range vswitches {
-		wire := &SWire{vpc: vpc, zone: self.zone, VSwitchName: vswitches[i].Name}
-		if seen[wire.GetGlobalId()] {
+		name := vswitches[i].Name
+		if len(name) == 0 || seen[name] {
 			continue
 		}
-		seen[wire.GetGlobalId()] = true
-		ret = append(ret, wire)
+		seen[name] = true
+		vpc, ok := vpcs[name]
+		if !ok {
+			vpc = &SVpc{region: self.zone.region, VSwitchName: name}
+			vpcs[name] = vpc
+		}
+		ret = append(ret, &SWire{vpc: vpc, zone: self.zone})
+	}
+	return ret, nil
+}
+
+func (self *SHost) getIWires() ([]cloudprovider.ICloudWire, error) {
+	wires, err := self.getWires(nil)
+	if err != nil {
+		return nil, err
+	}
+	ret := []cloudprovider.ICloudWire{}
+	for i := range wires {
+		ret = append(ret, wires[i])
 	}
 	return ret, nil
 }

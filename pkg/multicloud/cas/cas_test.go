@@ -338,12 +338,25 @@ func TestSyncMapping(t *testing.T) {
 	if err != nil || len(wires) != 1 {
 		t.Fatalf("GetIWires = %v, %v", wires, err)
 	}
-	if wires[0].GetGlobalId() != "hostpool/1/vswitch/test" || wires[0].GetIZone().GetGlobalId() != "1" {
+	if vpcs[0].GetGlobalId() != "vswitch/test" || vpcs[0].GetCidrBlock() != "0.0.0.0/0" {
+		t.Errorf("vpc = %s %s", vpcs[0].GetGlobalId(), vpcs[0].GetCidrBlock())
+	}
+	if wires[0].GetGlobalId() != "vswitch/test/hostpool/1" || wires[0].GetIZone().GetGlobalId() != "1" ||
+		wires[0].GetIVpc().GetGlobalId() != "vswitch/test" {
 		t.Errorf("wire = %s", wires[0].GetGlobalId())
 	}
 	networks, err := wires[0].GetINetworks()
-	if err != nil || len(networks) != 0 {
-		t.Errorf("GetINetworks = %v, %v", networks, err)
+	if err != nil || len(networks) != 1 {
+		t.Fatalf("GetINetworks = %v, %v", networks, err)
+	}
+	n := networks[0]
+	if n.GetGlobalId() != "vswitch/test/hostpool/1/default" || !n.IsEmulated() || n.GetIpStart() != "0.0.0.1" ||
+		n.GetIpEnd() != "255.255.255.254" || n.GetIpMask() != 0 || n.GetServerType() != api.NETWORK_TYPE_GUEST ||
+		n.GetIWire().GetGlobalId() != wires[0].GetGlobalId() {
+		t.Errorf("network = %s %v %s-%s/%d %s", n.GetGlobalId(), n.IsEmulated(), n.GetIpStart(), n.GetIpEnd(), n.GetIpMask(), n.GetServerType())
+	}
+	if _, err := wires[0].GetINetworkById("vswitch/test/hostpool/1/default"); err != nil {
+		t.Errorf("GetINetworkById: %v", err)
 	}
 	nics, err := host.GetIHostNics()
 	if err != nil || len(nics) != 1 || nics[0].GetIWire().GetGlobalId() != wires[0].GetGlobalId() {
@@ -397,8 +410,11 @@ func TestSyncMapping(t *testing.T) {
 	if err != nil || len(vnics) != 1 {
 		t.Fatalf("GetINics = %v, %v", vnics, err)
 	}
-	if vnics[0].GetMAC() != "0c:da:41:1d:19:d0" || vnics[0].GetIP() != "10.10.10.1" || vnics[0].GetDriver() != "virtio" || vnics[0].GetINetworkId() != "" {
-		t.Errorf("nic = %s %s %s", vnics[0].GetMAC(), vnics[0].GetIP(), vnics[0].GetDriver())
+	if vnics[0].GetMAC() != "0c:da:41:1d:19:d0" || vnics[0].GetIP() != "10.10.10.1" || vnics[0].GetDriver() != "virtio" ||
+		// the api.yaml VM example sits on "vswitch0", the host example only
+		// has "test"; the consistent case is in TestNetworkTopology.
+		vnics[0].GetINetworkId() != "vswitch/vswitch0/hostpool/1/default" {
+		t.Errorf("nic = %s %s %s %s", vnics[0].GetMAC(), vnics[0].GetIP(), vnics[0].GetDriver(), vnics[0].GetINetworkId())
 	}
 
 	// writes are stubbed

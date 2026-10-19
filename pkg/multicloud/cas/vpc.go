@@ -15,6 +15,8 @@
 package cas
 
 import (
+	"fmt"
+
 	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
@@ -22,28 +24,30 @@ import (
 	"yunion.io/x/cloudmux/pkg/multicloud"
 )
 
-// SVpc is a single pseudo VPC per account; CAS has no VPC concept.
+// SVpc is a pseudo VPC per vswitch name (nutanix style: the vswitch is the
+// L2 segment). CAS has no VPC concept and vswitches are per host, so all
+// vswitches with the same name in the account form one VPC; each host pool
+// that has it contributes one wire (see SWire), each wire one placeholder
+// network (see SNetwork).
 type SVpc struct {
 	multicloud.SVpc
 	multicloud.STagBase
 
 	region *SRegion
-}
 
-func (self *SRegion) getVpc() *SVpc {
-	return &SVpc{region: self}
+	VSwitchName string
 }
 
 func (self *SVpc) GetId() string {
-	return self.region.GetId()
+	return fmt.Sprintf("vswitch/%s", self.VSwitchName)
 }
 
 func (self *SVpc) GetGlobalId() string {
-	return self.region.GetGlobalId()
+	return self.GetId()
 }
 
 func (self *SVpc) GetName() string {
-	return self.region.GetName()
+	return self.VSwitchName
 }
 
 func (self *SVpc) GetStatus() string {
@@ -63,7 +67,7 @@ func (self *SVpc) GetRegion() cloudprovider.ICloudRegion {
 }
 
 func (self *SVpc) GetIsDefault() bool {
-	return true
+	return false
 }
 
 func (self *SVpc) GetCidrBlock() string {
@@ -86,31 +90,17 @@ func (self *SVpc) Delete() error {
 	return cloudprovider.ErrNotSupported
 }
 
-// GetIWires returns one wire per (host pool, vswitch name).
+// GetIWires returns one wire per host pool (zone) in which at least one
+// host has a vswitch with this VPC's name.
 func (self *SVpc) GetIWires() ([]cloudprovider.ICloudWire, error) {
-	zones, err := self.region.GetIZones()
+	wires, err := self.region.getWires()
 	if err != nil {
 		return nil, err
 	}
 	ret := []cloudprovider.ICloudWire{}
-	seen := map[string]bool{}
-	for i := range zones {
-		hosts, err := zones[i].(*SZone).getHosts()
-		if err != nil {
-			return nil, err
-		}
-		for j := range hosts {
-			wires, err := hosts[j].getIWires()
-			if err != nil {
-				return nil, errors.Wrapf(err, "host %s wires", hosts[j].Name)
-			}
-			for k := range wires {
-				if seen[wires[k].GetGlobalId()] {
-					continue
-				}
-				seen[wires[k].GetGlobalId()] = true
-				ret = append(ret, wires[k])
-			}
+	for i := range wires {
+		if wires[i].vpc.VSwitchName == self.VSwitchName {
+			ret = append(ret, wires[i])
 		}
 	}
 	return ret, nil
@@ -127,4 +117,52 @@ func (self *SVpc) GetIWireById(id string) (cloudprovider.ICloudWire, error) {
 		}
 	}
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "wire %s", id)
+}
+
+// getWires walks every host's (cached) vswitch list and returns one wire per
+// (vswitch name, host pool), each pointing to the VPC of that name.
+func (self *SRegion) getWires() ([]*SWire, error) {
+	zones, err := self.GetIZones()
+	if err != nil {
+		return nil, err
+	}
+	vpcs := map[string]*SVpc{}
+	ret := []*SWire{}
+	seen := map[string]bool{}
+	for i := range zones {
+		zone := zones[i].(*SZone)
+		hosts, err := zone.getHosts()
+		if err != nil {
+			return nil, errors.Wrapf(err, "zone %s hosts", zone.Name)
+		}
+		for j := range hosts {
+			wires, err := hosts[j].getWires(vpcs)
+			if err != nil {
+				return nil, errors.Wrapf(err, "host %s wires", hosts[j].Name)
+			}
+			for _, wire := range wires {
+				if !seen[wire.GetGlobalId()] {
+					seen[wire.GetGlobalId()] = true
+					ret = append(ret, wire)
+				}
+			}
+		}
+	}
+	return ret, nil
+}
+
+func (self *SRegion) getVpcs() ([]*SVpc, error) {
+	wires, err := self.getWires()
+	if err != nil {
+		return nil, err
+	}
+	ret := []*SVpc{}
+	seen := map[string]bool{}
+	for i := range wires {
+		if !seen[wires[i].vpc.VSwitchName] {
+			seen[wires[i].vpc.VSwitchName] = true
+			ret = append(ret, wires[i].vpc)
+		}
+	}
+	return ret, nil
 }

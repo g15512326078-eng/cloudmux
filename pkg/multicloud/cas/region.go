@@ -242,16 +242,30 @@ func (self *SRegion) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 	return vm, nil
 }
 
+// GetIVpcs returns one pseudo VPC per distinct vswitch name (see vpc.go).
 func (self *SRegion) GetIVpcs() ([]cloudprovider.ICloudVpc, error) {
-	return []cloudprovider.ICloudVpc{self.getVpc()}, nil
+	vpcs, err := self.getVpcs()
+	if err != nil {
+		return nil, err
+	}
+	ret := []cloudprovider.ICloudVpc{}
+	for i := range vpcs {
+		ret = append(ret, vpcs[i])
+	}
+	return ret, nil
 }
 
 func (self *SRegion) GetIVpcById(id string) (cloudprovider.ICloudVpc, error) {
-	vpc := self.getVpc()
-	if vpc.GetGlobalId() != id {
-		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vpc %s", id)
+	vpcs, err := self.getVpcs()
+	if err != nil {
+		return nil, err
 	}
-	return vpc, nil
+	for i := range vpcs {
+		if vpcs[i].GetGlobalId() == id {
+			return vpcs[i], nil
+		}
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vpc %s", id)
 }
 
 func (self *SRegion) GetIStoragecaches() ([]cloudprovider.ICloudStoragecache, error) {

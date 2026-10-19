@@ -436,3 +436,72 @@ func TestDetailFallbackForMovedVM(t *testing.T) {
 		t.Errorf("expected a vm/detail/%d fallback: %v", vm.Id, f.hits)
 	}
 }
+
+func TestNetworkTopology(t *testing.T) {
+	// host 1 has vswitch0+vswitch1, host 2 only vswitch0, both in hostpool 1.
+	f := newFakeCloud(t, 2, 3)
+	cli, _ := f.start()
+	region := cli.GetRegion()
+	vpcs, err := region.GetIVpcs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{}
+	networkIds := map[string]bool{}
+	for _, vpc := range vpcs {
+		wires, err := vpc.GetIWires()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, wire := range wires {
+			nets, err := wire.GetINetworks()
+			if err != nil || len(nets) != 1 {
+				t.Fatalf("wire %s networks = %v, %v", wire.GetGlobalId(), nets, err)
+			}
+			if wire.GetIVpc().GetGlobalId() != vpc.GetGlobalId() || wire.GetIZone().GetGlobalId() != "1" {
+				t.Errorf("wire %s vpc/zone mismatch", wire.GetGlobalId())
+			}
+			networkIds[nets[0].GetGlobalId()] = true
+			got = append(got, vpc.GetGlobalId()+">"+wire.GetGlobalId()+">"+nets[0].GetGlobalId())
+		}
+	}
+	want := "vswitch/vswitch0>vswitch/vswitch0/hostpool/1>vswitch/vswitch0/hostpool/1/default," +
+		"vswitch/vswitch1>vswitch/vswitch1/hostpool/1>vswitch/vswitch1/hostpool/1/default"
+	if strings.Join(got, ",") != want {
+		t.Errorf("topology = %v\nwant %s", got, want)
+	}
+	if _, err := region.GetIVpcById("vswitch/vswitch1"); err != nil {
+		t.Errorf("GetIVpcById: %v", err)
+	}
+	// every guest NIC points at a synced network
+	vms, err := region.GetIVMs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, vm := range vms {
+		nics, err := vm.GetINics()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, nic := range nics {
+			if !networkIds[nic.GetINetworkId()] {
+				t.Errorf("vm %s nic network %q not synced", vm.GetGlobalId(), nic.GetINetworkId())
+			}
+		}
+	}
+	// host nics: one per wire of the host
+	for hostId, want := range map[string]int{"1": 2, "2": 1} {
+		host, err := region.GetIHostById(hostId)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nics, err := host.GetIHostNics()
+		if err != nil || len(nics) != want {
+			t.Errorf("host %s nics = %d, %v, want %d", hostId, len(nics), err, want)
+		}
+	}
+	nic := &SInstanceNic{SInstanceNetwork: SInstanceNetwork{NetType: 2}, ins: &SInstance{HostPoolId: 1}}
+	if nic.GetINetworkId() != "" {
+		t.Errorf("nic without vswitch -> %q", nic.GetINetworkId())
+	}
+}
