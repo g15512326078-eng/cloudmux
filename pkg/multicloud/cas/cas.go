@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/icholy/digest"
 
@@ -80,6 +81,11 @@ type SCasClient struct {
 
 	lock   sync.Mutex
 	client *http.Client
+
+	// taskPollInterval / taskTimeout override waitTask defaults when > 0
+	// (tests set them; production leaves them zero).
+	taskPollInterval time.Duration
+	taskTimeout      time.Duration
 }
 
 // NewCasClient builds a client and probes GET /cas/casrs/host (the path
@@ -390,8 +396,10 @@ func (cli *SCasClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 }
 
 func (cli *SCasClient) GetCapabilities() []string {
+	// P1: compute is writable (start/stop/delete/deploy). Network stays
+	// read-only: CreateINetwork / security groups are not implemented.
 	return []string{
-		cloudprovider.CLOUD_CAPABILITY_COMPUTE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK + cloudprovider.READ_ONLY_SUFFIX,
 	}
 }
