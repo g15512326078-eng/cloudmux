@@ -21,6 +21,7 @@
 package cas
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -28,6 +29,7 @@ import (
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/httputils"
 
+	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
 
@@ -44,7 +46,8 @@ type SDomainDeploy struct {
 	TargetHostId int64               `json:"targetHostId"`
 	CpuCore      int                 `json:"cpuCore,omitempty"`
 	CpuSocket    int                 `json:"cpuSocket,omitempty"`
-	Memory       int                 `json:"memory,omitempty"` // UNVERIFIED unit; we send MB
+	Memory       int                 `json:"memory,omitempty"`
+	MemoryUnit   string              `json:"memoryUnit,omitempty"` // always "MB" with Memory
 	UserData     string              `json:"userData,omitempty"`
 	DiskFormat   string              `json:"diskFormat,omitempty"`
 	Network      []SDomainDeployNic  `json:"network,omitempty"`
@@ -116,6 +119,11 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 	if opts.Cpu <= 0 || opts.MemoryMB <= 0 {
 		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "Cpu and MemoryMB are required")
 	}
+	if len(opts.DataDisks) > 0 {
+		// VMRsDomainDeploy has no clear data-disk size mapping; cloudpods
+		// expects len(DataDisks)+1 disks after create and would fail later.
+		return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "CAS CreateVM does not support DataDisks (%d requested)", len(opts.DataDisks))
+	}
 	body := &SDomainDeploy{
 		Id:           tplId,
 		Title:        opts.Name,
@@ -126,10 +134,11 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 		TargetHostId: host.Id,
 		// UNVERIFIED split: api.yaml has both cpuSocket and cpuCore. We put
 		// the requested vCPU count in cpuSocket and leave cpuCore=1.
-		CpuSocket: opts.Cpu,
-		CpuCore:   1,
-		Memory:    opts.MemoryMB,
-		UserData:  opts.UserData,
+		CpuSocket:  opts.Cpu,
+		CpuCore:    1,
+		Memory:     opts.MemoryMB,
+		MemoryUnit: "MB",
+		UserData:   opts.UserData,
 	}
 	nic := SDomainDeployNic{}
 	if vs := vswitchNameFromNetworkId(opts.ExternalNetworkId); len(vs) > 0 {
@@ -184,51 +193,43 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	if err != nil {
 		return nil, errors.Wrapf(err, "DeployVM")
 	}
-	vm, err := self.zone.region.findDeployedVM(msg, body.DomainName)
+	vm, err := self.zone.region.findDeployedVM(msg)
 	if err != nil {
 		return nil, err
 	}
 	vm.host = self
 	vm.region = self.zone.region
+	// cloudpods CAS guest driver expects VM_READY (shutOff) after create.
+	// api.yaml is silent on whether deploy leaves the guest running; if it
+	// does, stop so the initial-state wait succeeds.
+	if vm.GetStatus() == api.VM_RUNNING || vm.GetStatus() == api.VM_SUSPEND {
+		if err := vm.StopVM(context.Background(), &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
+			return nil, errors.Wrapf(err, "StopVM after deploy (status was %s)", vm.GetStatus())
+		}
+		if err := vm.Refresh(); err != nil {
+			return nil, errors.Wrapf(err, "Refresh after post-deploy StopVM")
+		}
+	}
 	return vm, nil
 }
 
-// findDeployedVM resolves the VM created by deploy. Prefer message.targetId
-// (numeric domain id) via vm/detail/{id}; fall back to scanning the VM list
-// by name. UNVERIFIED: whether targetId is always set on deploy completion,
-// and whether domainName is unique.
-func (self *SRegion) findDeployedVM(msg *SMessage, name string) (*SInstance, error) {
-	if msg != nil && msg.TargetId > 0 {
-		detail, err := self.cli.GetInstanceDetail(msg.TargetId)
-		if err == nil && len(detail.Uuid) > 0 {
-			vm, err := self.cli.GetInstance(detail.Uuid)
-			if err != nil {
-				return nil, err
-			}
-			vm.region = self
-			return vm, nil
-		}
+// findDeployedVM resolves the VM created by deploy from message.targetId
+// only (vm/detail/{id} → GetInstance by uuid). A missing targetId is an
+// error: name-scan adoption is unsafe (can attach ExternalId to a leftover
+// VM with the same name). UNVERIFIED: whether real CAS always sets targetId
+// on deploy completion.
+func (self *SRegion) findDeployedVM(msg *SMessage) (*SInstance, error) {
+	if msg == nil || msg.TargetId == 0 {
+		return nil, errors.Errorf("deploy finished without message.targetId; refusing name-scan adoption")
 	}
-	vms, err := self.cli.GetInstances(nil)
+	detail, err := self.cli.GetInstanceDetail(msg.TargetId)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "GetInstanceDetail %d after deploy", msg.TargetId)
 	}
-	var match *SInstance
-	for i := range vms {
-		if vms[i].Name == name || vms[i].Title == name {
-			if match != nil {
-				return nil, errors.Errorf("multiple VMs named %q after deploy; targetId missing from task message", name)
-			}
-			match = &vms[i]
-		}
+	vm, err := self.cli.GetInstance(detail.Uuid)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetInstance %s after deploy", detail.Uuid)
 	}
-	if match == nil {
-		tid := int64(0)
-		if msg != nil {
-			tid = msg.TargetId
-		}
-		return nil, errors.Errorf("deploy finished (targetId=%d) but VM %q not found in vm/vmList", tid, name)
-	}
-	match.region = self
-	return match, nil
+	vm.region = self
+	return vm, nil
 }
