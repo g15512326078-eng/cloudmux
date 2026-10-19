@@ -159,6 +159,18 @@ func TestRequestErrors(t *testing.T) {
 			w.Write([]byte(`<list><host><id>1</id></host></list>`))
 		case "/cas/casrs/missing":
 			w.WriteHeader(http.StatusNotFound)
+		case "/cas/casrs/conflict-notfound":
+			w.Header().Set("Error-Code", "5001")
+			w.Header().Set("Error-Message", "虚拟机不存在。")
+			w.WriteHeader(http.StatusConflict)
+		case "/cas/casrs/forbidden":
+			w.WriteHeader(http.StatusForbidden)
+		case "/cas/casrs/empty":
+			w.WriteHeader(http.StatusOK)
+		case "/cas/casrs/vm/detail/1":
+			w.Write([]byte(`{}`))
+		case "/cas/casrs/host/id/1":
+			w.Write([]byte(`{}`))
 		}
 	}))
 	defer srv.Close()
@@ -176,6 +188,26 @@ func TestRequestErrors(t *testing.T) {
 	err = cli.get("missing", nil, nil)
 	if errors.Cause(err) != cloudprovider.ErrNotFound {
 		t.Errorf("404: err = %v, want ErrNotFound", err)
+	}
+	err = cli.get("conflict-notfound", nil, nil)
+	if errors.Cause(err) != cloudprovider.ErrNotFound {
+		t.Errorf("409 not-exist: err = %v, want ErrNotFound", err)
+	}
+	err = cli.get("forbidden", nil, nil)
+	if errors.Cause(err) != cloudprovider.ErrNoPermission {
+		t.Errorf("403: err = %v, want ErrNoPermission", err)
+	}
+
+	// an empty 200 must be an error, never a zero-value object
+	err = cli.get("empty", nil, nil)
+	if errors.Cause(err) != ErrEmptyBody {
+		t.Errorf("empty 200: err = %v, want ErrEmptyBody", err)
+	}
+	if detail, err := cli.GetInstanceDetail(1); errors.Cause(err) != ErrEmptyBody {
+		t.Errorf("{} vm detail: %+v, %v, want ErrEmptyBody", detail, err)
+	}
+	if host, err := cli.GetHost("1"); errors.Cause(err) != ErrEmptyBody {
+		t.Errorf("{} host detail: %+v, %v, want ErrEmptyBody", host, err)
 	}
 }
 

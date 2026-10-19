@@ -134,6 +134,9 @@ func parseInstanceDetail(resp jsonutils.JSONObject) (*SInstanceDetail, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "Unmarshal detail")
 	}
+	if len(detail.Uuid) == 0 {
+		return nil, errors.Wrapf(ErrEmptyBody, "vm detail without uuid")
+	}
 	err = unmarshalList(resp, "storage", &detail.disks)
 	if err != nil {
 		return nil, errors.Wrapf(err, "storage")

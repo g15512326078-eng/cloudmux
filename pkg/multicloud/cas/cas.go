@@ -132,6 +132,25 @@ func (e *SCasError) Error() string {
 	return jsonutils.Marshal(e).String()
 }
 
+// ErrEmptyBody is returned for a 2xx response without a body.
+const ErrEmptyBody = errors.Error("EmptyResponseBody")
+
+// notFoundErrorCodes are 409 Error-Code values meaning "object does not
+// exist". api.yaml documents none (and the review lists none), so this is
+// empty until confirmed on a real CAS; see isNotFound.
+var notFoundErrorCodes = map[string]bool{}
+
+// isNotFound reports whether a 409 business error means the target does
+// not exist: either a known Error-Code, or an Error-Message containing
+// "不存在" ("does not exist"), the wording api.yaml uses in its error
+// message examples (e.g. "子网“suet_post”不存在。").
+func (e *SCasError) isNotFound() bool {
+	if notFoundErrorCodes[e.ErrorCode] {
+		return true
+	}
+	return strings.Contains(e.ErrorMessage, "不存在")
+}
+
 func (cli *SCasClient) url(res string, params url.Values) string {
 	u := fmt.Sprintf("%s%s/%s", cli.accessUrl, API_PREFIX, strings.TrimPrefix(res, "/"))
 	if len(params) > 0 {
@@ -182,14 +201,22 @@ func (cli *SCasClient) request(method httputils.THttpMethod, res string, params 
 		switch resp.StatusCode {
 		case http.StatusNotFound:
 			return nil, errors.Wrap(cloudprovider.ErrNotFound, ce.Error())
-		case http.StatusUnauthorized, http.StatusForbidden:
+		case http.StatusUnauthorized:
 			return nil, errors.Wrap(cloudprovider.ErrInvalidAccessKey, ce.Error())
+		case http.StatusForbidden:
+			return nil, errors.Wrap(cloudprovider.ErrNoPermission, ce.Error())
+		case http.StatusConflict:
+			if ce.isNotFound() {
+				return nil, errors.Wrap(cloudprovider.ErrNotFound, ce.Error())
+			}
 		}
 		return nil, ce
 	}
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
-		return jsonutils.NewDict(), nil
+		// Never turn an empty 200 into {}: a zero-value VM detail would make
+		// cloudpods detach every disk and NIC.
+		return nil, errors.Wrapf(ErrEmptyBody, "%s %s", method, u)
 	}
 	if data[0] == '<' {
 		// We ask for JSON; an XML answer means this CAS build ignores Accept.

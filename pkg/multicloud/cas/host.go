@@ -76,7 +76,14 @@ func (cli *SCasClient) GetHostBriefs() ([]SHostBrief, error) {
 
 func (cli *SCasClient) GetHost(id string) (*SHost, error) {
 	host := &SHost{}
-	return host, cli.get(fmt.Sprintf("host/id/%s", id), nil, host)
+	err := cli.get(fmt.Sprintf("host/id/%s", id), nil, host)
+	if err != nil {
+		return nil, err
+	}
+	if host.Id == 0 {
+		return nil, errors.Wrapf(ErrEmptyBody, "host/id/%s returned no host id", id)
+	}
+	return host, nil
 }
 
 // GetHosts lists hosts and fetches the detail of each one (N+1 requests).
