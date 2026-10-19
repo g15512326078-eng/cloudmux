@@ -517,15 +517,31 @@ func (self *SInstance) RestartVM(ctx context.Context) error {
 	return err
 }
 
-// DeleteVM is DELETE /cas/casrs/vm/delete/uuid/{uuid} with type=1 (删除数据
-// 存储) and isWipeVolume=true. The id-only delete path has no wipe flags;
-// the uuid path documents type 0=keep storage, 1=delete storage, 3=recycle
-// bin. UNVERIFIED on real CAS: default when type is omitted, delBase0
-// meaning, and whether a running VM must be stopped first.
+// DELETE_VM_TYPE is the api.yaml "type" query on DELETE
+// /vm/delete/uuid/{uuid}: 0=keep storage, 1=delete storage, 3=recycle bin.
+// P1 defaults to recycle bin so a mistaken delete is reversible on CAS.
+// Flip to "1" (and optionally set DELETE_VM_WIPE_VOLUME) only after a real
+// CAS confirms wipe/delete-storage behaviour.
+const DELETE_VM_TYPE = "3"
+
+// DELETE_VM_WIPE_VOLUME is api.yaml isWipeVolume ("彻底删除数据"). Kept
+// false for P1; never combine with type=3 unless real CAS requires it.
+const DELETE_VM_WIPE_VOLUME = "false"
+
+// DeleteVM stops a running/paused guest first (force powerOff), then
+// DELETE /cas/casrs/vm/delete/uuid/{uuid} with DELETE_VM_TYPE /
+// DELETE_VM_WIPE_VOLUME. UNVERIFIED: whether CAS rejects delete while
+// running, delBase0, and recycle-bin restore.
 func (self *SInstance) DeleteVM(ctx context.Context) error {
+	status := self.GetStatus()
+	if status == api.VM_RUNNING || status == api.VM_SUSPEND {
+		if err := self.StopVM(ctx, &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
+			return errors.Wrapf(err, "StopVM before DeleteVM (status was %s)", status)
+		}
+	}
 	params := url.Values{}
-	params.Set("type", "1")
-	params.Set("isWipeVolume", "true")
+	params.Set("type", DELETE_VM_TYPE)
+	params.Set("isWipeVolume", DELETE_VM_WIPE_VOLUME)
 	_, err := self.region.cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
 	return err
 }
