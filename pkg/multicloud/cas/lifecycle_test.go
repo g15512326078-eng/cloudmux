@@ -45,7 +45,11 @@ type lifeFake struct {
 	messages map[int64]*SMessage
 	polls    map[int64]int // times GetMessage called before flipping completed
 
-	deployBody string
+	// delayNotFound: first N GetMessage polls for msgId return 404
+	delayNotFound map[int64]int
+
+	deployBody     string
+	deployVmStatus string // vmList/detail status after deploy; default shutOff
 }
 
 func (f *lifeFake) record(r *http.Request) {
@@ -62,7 +66,17 @@ func (f *lifeFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPut && len(parts) == 3 && parts[0] == "vm" &&
 		(parts[1] == "start" || parts[1] == "stop" || parts[1] == "powerOff" || parts[1] == "restart"):
 		ids := map[string]int64{"start": 1001, "stop": 1002, "powerOff": 1003, "restart": 1004}
-		reply(w, dict{"msgId": ids[parts[1]], "completed": false, "progress": 0, "targetId": 9, "targetName": "vm9"})
+		if parts[1] == "stop" || parts[1] == "powerOff" {
+			f.deployVmStatus = "shutOff"
+		}
+		if parts[1] == "start" {
+			f.deployVmStatus = "running"
+		}
+		tid := int64(9)
+		if len(parts[2]) > 0 {
+			fmt.Sscanf(parts[2], "%d", &tid)
+		}
+		reply(w, dict{"msgId": ids[parts[1]], "completed": false, "progress": 0, "targetId": tid, "targetName": "vm9"})
 	case r.Method == http.MethodDelete && strings.HasPrefix(path, "vm/delete/uuid/"):
 		reply(w, dict{"msgId": 1005, "completed": false, "targetId": 9})
 	case r.Method == http.MethodPost && path == "vm/deploy":
@@ -78,6 +92,12 @@ func (f *lifeFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.lock.Lock()
 		f.polls[id]++
 		n := f.polls[id]
+		if delay := f.delayNotFound[id]; delay > 0 && n <= delay {
+			f.lock.Unlock()
+			w.Header().Set("Error-Code", "404")
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		msg, ok := f.messages[id]
 		if !ok {
 			f.lock.Unlock()
@@ -85,22 +105,36 @@ func (f *lifeFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out := *msg
-		if !out.Completed && n >= 2 {
+		// count polls after the delayed 404s toward completion
+		effective := n - f.delayNotFound[id]
+		if effective < 1 {
+			effective = n
+		}
+		if !out.Completed && effective >= 2 {
 			out.Completed = true
-			if out.Result == 0 && out.FailMsg == "FAIL" {
-				// leave result as set by test
-			}
 		}
 		f.lock.Unlock()
 		reply(w, out)
 	case r.Method == http.MethodGet && path == "vmvnc/vnc/9":
 		reply(w, dict{"ip": "10.0.0.9", "port": 5909, "password": "VNC-SECRET"})
 	case r.Method == http.MethodGet && path == "vm/detail/42":
-		reply(w, dict{"id": 42, "uuid": "uuid-new", "name": "newvm", "status": "shutOff", "storage": []dict{}, "network": []dict{}})
+		st := f.deployVmStatus
+		if len(st) == 0 {
+			st = "shutOff"
+		}
+		reply(w, dict{"id": 42, "uuid": "uuid-new", "name": "newvm", "status": st, "storage": []dict{}, "network": []dict{}})
 	case r.Method == http.MethodGet && path == "vm/detail/uuid/uuid-new":
-		reply(w, dict{"id": 42, "uuid": "uuid-new", "name": "newvm", "status": "shutOff", "storage": []dict{}, "network": []dict{}})
+		st := f.deployVmStatus
+		if len(st) == 0 {
+			st = "shutOff"
+		}
+		reply(w, dict{"id": 42, "uuid": "uuid-new", "name": "newvm", "status": st, "storage": []dict{}, "network": []dict{}})
 	case r.Method == http.MethodGet && path == "vm/vmList":
-		reply(w, dict{"domain": []dict{{"id": 42, "uuid": "uuid-new", "name": "newvm", "title": "newvm", "hostId": 1, "hostPoolId": 1, "cpu": 2, "memory": 2048, "vmStatus": "shutOff", "system": 1}}})
+		st := f.deployVmStatus
+		if len(st) == 0 {
+			st = "shutOff"
+		}
+		reply(w, dict{"domain": []dict{{"id": 42, "uuid": "uuid-new", "name": "newvm", "title": "newvm", "hostId": 1, "hostPoolId": 1, "cpu": 2, "memory": 2048, "vmStatus": st, "system": 1}}})
 	case r.Method == http.MethodGet && path == "hostpool/all":
 		reply(w, dict{"hostPool": []dict{{"id": 1, "name": "hp1"}}})
 	default:
@@ -115,6 +149,9 @@ func newLifeClient(t *testing.T, f *lifeFake) *SCasClient {
 	}
 	if f.polls == nil {
 		f.polls = map[int64]int{}
+	}
+	if f.delayNotFound == nil {
+		f.delayNotFound = map[int64]int{}
 	}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
@@ -187,7 +224,7 @@ func TestLifecycleOps(t *testing.T) {
 		"GET /cas/casrs/message/1003",
 		"PUT /cas/casrs/vm/restart/9",
 		"GET /cas/casrs/message/1004",
-		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?isWipeVolume=true&type=1",
+		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?isWipeVolume=false&type=3",
 		"GET /cas/casrs/message/1005",
 	}
 	f.lock.Lock()
@@ -245,7 +282,7 @@ func TestCreateVMDeploy(t *testing.T) {
 	checks := map[string]interface{}{
 		"id": int64(11), "domainName": "newvm", "title": "newvm", "deployType": int64(1),
 		"deployMode": int64(0), "targetHostId": int64(7), "cpuSocket": int64(4), "cpuCore": int64(1),
-		"memory": int64(4096), "desc": "p1 test",
+		"memory": int64(4096), "memoryUnit": "MB", "desc": "p1 test",
 	}
 	for k, want := range checks {
 		got, _ := obj.Get(k)
@@ -360,5 +397,116 @@ func TestCapabilitiesWritableCompute(t *testing.T) {
 	}
 	if !strings.Contains(joined, cloudprovider.CLOUD_CAPABILITY_NETWORK+cloudprovider.READ_ONLY_SUFFIX) {
 		t.Errorf("network should stay read-only: %v", caps)
+	}
+}
+
+func TestWaitTaskRetriesNotFound(t *testing.T) {
+	f := &lifeFake{t: t, messages: map[int64]*SMessage{
+		2001: {MsgId: 2001, Result: TASK_RESULT_SUCCESS},
+	}, delayNotFound: map[int64]int{2001: 2}}
+	cli := newLifeClient(t, f)
+	msg, err := cli.waitTask(2001)
+	if err != nil || msg == nil || !msg.Completed {
+		t.Fatalf("waitTask after delayed 404: msg=%v err=%v", msg, err)
+	}
+	if f.polls[2001] < 4 { // 2x 404 + 2x real polls
+		t.Errorf("polls=%d, want >=4", f.polls[2001])
+	}
+}
+
+func TestDeleteVMRecycleAndStopFirst(t *testing.T) {
+	f := &lifeFake{t: t, messages: map[int64]*SMessage{
+		1003: {MsgId: 1003, Result: TASK_RESULT_SUCCESS, TargetId: 9},
+		1005: {MsgId: 1005, Result: TASK_RESULT_SUCCESS, TargetId: 9},
+	}}
+	cli := newLifeClient(t, f)
+	vm := &SInstance{Id: 9, Uuid: "uuid-9", VmStatus: "running", region: &SRegion{cli: cli}}
+	if err := vm.DeleteVM(context.Background()); err != nil {
+		t.Fatalf("DeleteVM: %v", err)
+	}
+	compact := []string{}
+	seen := map[string]bool{}
+	for _, h := range f.hits {
+		if strings.HasPrefix(h, "GET /cas/casrs/message/") {
+			if seen[h] {
+				continue
+			}
+			seen[h] = true
+		}
+		compact = append(compact, h)
+	}
+	want := []string{
+		"PUT /cas/casrs/vm/powerOff/9",
+		"GET /cas/casrs/message/1003",
+		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?isWipeVolume=false&type=3",
+		"GET /cas/casrs/message/1005",
+	}
+	if strings.Join(compact, "\n") != strings.Join(want, "\n") {
+		t.Errorf("hits:\n%s\nwant:\n%s", strings.Join(compact, "\n"), strings.Join(want, "\n"))
+	}
+	if DELETE_VM_TYPE != "3" || DELETE_VM_WIPE_VOLUME != "false" {
+		t.Errorf("constants = %s/%s", DELETE_VM_TYPE, DELETE_VM_WIPE_VOLUME)
+	}
+}
+
+func TestCreateVMRequiresTargetId(t *testing.T) {
+	f := &lifeFake{t: t, messages: map[int64]*SMessage{
+		1006: {MsgId: 1006, Result: TASK_RESULT_SUCCESS, TargetId: 0, TargetName: "newvm"},
+	}}
+	cli := newLifeClient(t, f)
+	region := &SRegion{cli: cli}
+	zone := &SZone{SHostPool: SHostPool{Id: 1}, region: region}
+	host := &SHost{Id: 7, HostPoolId: 1, zone: zone}
+	_, err := host.CreateVM(&cloudprovider.SManagedVMCreateConfig{
+		Name: "newvm", ExternalImageId: "11", Cpu: 1, MemoryMB: 512,
+	})
+	if err == nil || !strings.Contains(err.Error(), "targetId") {
+		t.Fatalf("CreateVM without targetId: %v", err)
+	}
+	for _, h := range f.hits {
+		if strings.Contains(h, "vm/vmList") {
+			t.Errorf("must not name-scan: %s", h)
+		}
+	}
+}
+
+func TestCreateVMStopsIfRunning(t *testing.T) {
+	f := &lifeFake{t: t, messages: map[int64]*SMessage{
+		1006: {MsgId: 1006, Result: TASK_RESULT_SUCCESS, TargetId: 42, TargetName: "newvm"},
+		1003: {MsgId: 1003, Result: TASK_RESULT_SUCCESS, TargetId: 42},
+	}, deployVmStatus: "running"}
+	cli := newLifeClient(t, f)
+	region := &SRegion{cli: cli}
+	zone := &SZone{SHostPool: SHostPool{Id: 1}, region: region}
+	host := &SHost{Id: 7, HostPoolId: 1, zone: zone}
+	vm, err := host.CreateVM(&cloudprovider.SManagedVMCreateConfig{
+		Name: "newvm", ExternalImageId: "11", Cpu: 2, MemoryMB: 1024,
+	})
+	if err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	foundPowerOff := false
+	for _, h := range f.hits {
+		if h == "PUT /cas/casrs/vm/powerOff/42" {
+			foundPowerOff = true
+		}
+	}
+	if !foundPowerOff {
+		t.Errorf("expected post-deploy powerOff: %v", f.hits)
+	}
+	if vm.GetStatus() != api.VM_READY {
+		t.Errorf("after CreateVM status=%s, want VM_READY", vm.GetStatus())
+	}
+}
+
+func TestCreateVMRejectsDataDisks(t *testing.T) {
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig("http://127.0.0.1", "u", "p")}
+	host := &SHost{Id: 1, zone: &SZone{region: &SRegion{cli: cli}}}
+	_, err := host.CreateVM(&cloudprovider.SManagedVMCreateConfig{
+		Name: "x", ExternalImageId: "1", Cpu: 1, MemoryMB: 512,
+		DataDisks: []cloudprovider.SDiskInfo{{SizeGB: 10}},
+	})
+	if errors.Cause(err) != cloudprovider.ErrNotImplemented {
+		t.Errorf("DataDisks: %v", err)
 	}
 }
