@@ -1,0 +1,36 @@
+{
+  "clusterId": 1,
+  "cpuCores": 10,
+  "cpuCount": 40,
+  "cpuFrequence": 2772,
+  "cpuModel": "Intel(R) Xeon(R) CPU E5-2630 v4 @ 2.20GHz",
+  "cpuSockets": 2,
+  "cvkMaintain": 0,
+  "diskSize": 994485,
+  "enableBackupNetwork": false,
+  "enableStorNode": false,
+  "hostPoolId": 1,
+  "hostType": 16,
+  "iLOs": "10.99.219.105",
+  "id": 1,
+  "ip": "10.125.35.186",
+  "maintainMode": 0,
+  "mask": "255.255.252.0",
+  "memorySize": 128554,
+  "model": "UIS R390X G2",
+  "name": "cvknode186",
+  "pNIC": [
+    {
+      "description": "Intel Corporation I350 Gigabit Network Connection",
+      "macAddr": "60:da:83:3d:54:79",
+      "name": "eth4",
+      "status": 0
+    }
+  ],
+  "pwd": "1w4c",
+  "serialNumber": "210200A00DN177000200",
+  "status": 1,
+  "type": "kvm",
+  "user": "root",
+  "vendor": "New H3C Technologies Co., Ltd."
+}

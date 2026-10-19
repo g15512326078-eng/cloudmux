@@ -1,0 +1,16 @@
+{
+  "storagePool": [
+    {
+      "allocation": 396.123046875,
+      "autoStart": false,
+      "freeSize": 69985,
+      "name": "isopool",
+      "path": "/vms/isos",
+      "status": 1,
+      "symbolic": false,
+      "title": "isopool",
+      "totalSize": 74456,
+      "type": "dir"
+    }
+  ]
+}

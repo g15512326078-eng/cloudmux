@@ -1,0 +1,46 @@
+{
+  "vSwitch": [
+    {
+      "address": "10.125.31.121",
+      "bondMode": "aada",
+      "clusterId": 1,
+      "enableDpdk": false,
+      "enableLacp": false,
+      "flag": 0,
+      "gateway": "10.121.21.0",
+      "haStatus": 1,
+      "hostId": 1,
+      "id": 6,
+      "internalPorts": [
+        {
+          "bandwidthRatio": 100,
+          "description": "daa",
+          "id": 1,
+          "ip": "10.23.131.131",
+          "ipv6": "2001:3CA1:010F:001A:121B:0000:0000:0010",
+          "mask": "255.0.0.0",
+          "maskIpv6": "2001:3CA1:010F:001A:121B:0000:daa:0010",
+          "name": "aa",
+          "networkType": 1,
+          "vlan": 12,
+          "vswitchId": 1
+        }
+      ],
+      "isManage": 1,
+      "isRuningVmUseVSwitch": false,
+      "isVxlanScopeUseVSwitch": false,
+      "mode": 0,
+      "mtu": 1500,
+      "multicast": false,
+      "name": "test",
+      "netmask": "255.255.212.0",
+      "networkType": 1,
+      "pnic": "eth0",
+      "portNum": 32,
+      "reselect": false,
+      "status": 1,
+      "storageNodeSetted": 0,
+      "vlanId": 2
+    }
+  ]
+}
