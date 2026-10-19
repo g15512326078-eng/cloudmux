@@ -17,6 +17,9 @@ package provider
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -44,8 +47,15 @@ func (self *SCasProviderFactory) ValidateChangeBandwidth(instanceId string, band
 	return fmt.Errorf("Changing %s bandwidth is not supported", cas.CLOUD_PROVIDER_CAS)
 }
 
-// ValidateCreateCloudaccountData requires host and port: the CAS REST port
-// differs between deployments and is not documented, so there is no default.
+// DEFAULT_SCHEME is used when only host/port are given. api.yaml declares
+// "schemes: [http]" (api.yaml:99-100) and nothing else, so http is the
+// documented default; deployments serving https must pass a full URL.
+const DEFAULT_SCHEME = "http"
+
+// ValidateCreateCloudaccountData accepts either a full URL in AuthUrl
+// (scheme://host:port, scheme http or https) or Host + Port with
+// DEFAULT_SCHEME. The port is required either way: the CAS REST port is
+// not documented and differs between deployments.
 func (self *SCasProviderFactory) ValidateCreateCloudaccountData(ctx context.Context, input cloudprovider.SCloudaccountCredential) (cloudprovider.SCloudaccount, error) {
 	output := cloudprovider.SCloudaccount{}
 	if len(input.Username) == 0 {
@@ -54,19 +64,51 @@ func (self *SCasProviderFactory) ValidateCreateCloudaccountData(ctx context.Cont
 	if len(input.Password) == 0 {
 		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "password")
 	}
-	if len(input.Host) == 0 {
-		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "host")
+	accessUrl, err := buildAccessUrl(input)
+	if err != nil {
+		return output, err
 	}
-	if !regutils.MatchIPAddr(input.Host) && !regutils.MatchDomainName(input.Host) {
-		return output, errors.Wrap(cloudprovider.ErrInputParameter, "host should be ip or domain name")
-	}
-	if input.Port <= 0 || input.Port > 65535 {
-		return output, errors.Wrap(cloudprovider.ErrMissingParameter, "port")
-	}
-	output.AccessUrl = fmt.Sprintf("https://%s:%d", input.Host, input.Port)
+	output.AccessUrl = accessUrl
 	output.Account = input.Username
 	output.Secret = input.Password
 	return output, nil
+}
+
+func buildAccessUrl(input cloudprovider.SCloudaccountCredential) (string, error) {
+	scheme, host, port := DEFAULT_SCHEME, input.Host, input.Port
+	if len(input.AuthUrl) > 0 {
+		u, err := url.Parse(input.AuthUrl)
+		if err != nil {
+			return "", errors.Wrapf(cloudprovider.ErrInputParameter, "auth_url %q: %v", input.AuthUrl, err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return "", errors.Wrapf(cloudprovider.ErrInputParameter, "auth_url scheme must be http or https, got %q", u.Scheme)
+		}
+		if len(strings.Trim(u.Path, "/")) > 0 {
+			return "", errors.Wrapf(cloudprovider.ErrInputParameter, "auth_url must not have a path (/cas/casrs is added by the client)")
+		}
+		scheme, host = u.Scheme, u.Hostname()
+		port = 0
+		if len(u.Port()) > 0 {
+			port, err = strconv.Atoi(u.Port())
+			if err != nil {
+				return "", errors.Wrapf(cloudprovider.ErrInputParameter, "auth_url port %q", u.Port())
+			}
+		}
+	}
+	if len(host) == 0 {
+		return "", errors.Wrap(cloudprovider.ErrMissingParameter, "host")
+	}
+	if !regutils.MatchIPAddr(host) && !regutils.MatchDomainName(host) {
+		return "", errors.Wrap(cloudprovider.ErrInputParameter, "host should be ip or domain name")
+	}
+	if port == 0 {
+		return "", errors.Wrap(cloudprovider.ErrMissingParameter, "port")
+	}
+	if port < 0 || port > 65535 {
+		return "", errors.Wrapf(cloudprovider.ErrInputParameter, "port %d out of range", port)
+	}
+	return fmt.Sprintf("%s://%s:%d", scheme, host, port), nil
 }
 
 func (self *SCasProviderFactory) ValidateUpdateCloudaccountCredential(ctx context.Context, input cloudprovider.SCloudaccountCredential, cloudaccount string) (cloudprovider.SCloudaccount, error) {
