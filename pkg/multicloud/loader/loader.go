@@ -23,6 +23,7 @@ import (
 	_ "yunion.io/x/cloudmux/pkg/multicloud/azure/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/baidu/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/bingocloud/provider" // private clouds
+	_ "yunion.io/x/cloudmux/pkg/multicloud/cas/provider"        // private clouds (H3C CAS)
 	_ "yunion.io/x/cloudmux/pkg/multicloud/cephfs/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/ctyun/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/cucloud/provider"
@@ -44,7 +45,7 @@ import (
 	_ "yunion.io/x/cloudmux/pkg/multicloud/qcloud/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/qingcloud/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/remotefile/provider" // private clouds
-	_ "yunion.io/x/cloudmux/pkg/multicloud/ucloud/provider" // object storages
+	_ "yunion.io/x/cloudmux/pkg/multicloud/ucloud/provider"     // object storages
 	_ "yunion.io/x/cloudmux/pkg/multicloud/volcengine/provider"
 	_ "yunion.io/x/cloudmux/pkg/multicloud/zstack/provider" // private clouds
 )
