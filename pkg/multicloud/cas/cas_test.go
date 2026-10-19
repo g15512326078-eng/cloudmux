@@ -424,9 +424,10 @@ func TestSyncMapping(t *testing.T) {
 		t.Errorf("nic = %s %s %s %s", vnics[0].GetMAC(), vnics[0].GetIP(), vnics[0].GetDriver(), vnics[0].GetINetworkId())
 	}
 
-	// writes are stubbed
-	if err := vm.(*SInstance).StartVM(nil); errors.Cause(err) != cloudprovider.ErrNotImplemented {
-		t.Errorf("StartVM = %v", err)
+	// P1 writes (start/stop/delete/deploy) are covered by lifecycle_test.go;
+	// ChangeConfig remains stubbed.
+	if err := vm.(*SInstance).ChangeConfig(nil, nil); errors.Cause(err) != cloudprovider.ErrNotImplemented {
+		t.Errorf("ChangeConfig = %v", err)
 	}
 
 	// templates -> images
