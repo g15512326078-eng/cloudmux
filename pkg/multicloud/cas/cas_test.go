@@ -164,6 +164,13 @@ func TestRequestErrors(t *testing.T) {
 			w.Header().Set("Error-Code", "1234")
 			w.Header().Set("Error-Message", "busy")
 			w.WriteHeader(http.StatusConflict)
+		case "/cas/casrs/more":
+			w.Write([]byte(`{"hostPwd":"S3CR3T-hostPwd","vncPwd":"S3CR3T-vncPwd","cephPwd":"S3CR3T-cephPwd",` +
+				`"slavePwd":"S3CR3T-slavePwd","arbitrationHostPwd":"S3CR3T-arb","encryptPw":"S3CR3T-encryptPw",` +
+				`"netconfPw":"S3CR3T-netconfPw","vncPassword":"S3CR3T-vncPassword","loginPassword":"S3CR3T-login",` +
+				`"passwd":"S3CR3T-passwd","secretKey":"S3CR3T-secretKey","productKey":"S3CR3T-productKey",` +
+				`"auth":{"token":"S3CR3T-token","authKey":"S3CR3T-authKey"},"list":[{"Password":"S3CR3T-Password"}],` +
+				`"hostKey":"KEEP-hostKey","domainKey":"KEEP-domainKey","authType":"KEEP-authType"}`))
 		case "/cas/casrs/xml":
 			w.Write([]byte(`<list><host><id>1</id></host></list>`))
 		case "/cas/casrs/missing":
@@ -480,6 +487,13 @@ func TestNoSecretsInLogsOrErrors(t *testing.T) {
 			w.Header().Set("Error-Code", "1")
 			w.WriteHeader(http.StatusConflict)
 			w.Write([]byte(`{"host":{"pwd":"S3CR3T-ERR"}}`))
+		case "/cas/casrs/more":
+			w.Write([]byte(`{"hostPwd":"S3CR3T-hostPwd","vncPwd":"S3CR3T-vncPwd","cephPwd":"S3CR3T-cephPwd",` +
+				`"slavePwd":"S3CR3T-slavePwd","arbitrationHostPwd":"S3CR3T-arb","encryptPw":"S3CR3T-encryptPw",` +
+				`"netconfPw":"S3CR3T-netconfPw","vncPassword":"S3CR3T-vncPassword","loginPassword":"S3CR3T-login",` +
+				`"passwd":"S3CR3T-passwd","secretKey":"S3CR3T-secretKey","productKey":"S3CR3T-productKey",` +
+				`"auth":{"token":"S3CR3T-token","authKey":"S3CR3T-authKey"},"list":[{"Password":"S3CR3T-Password"}],` +
+				`"hostKey":"KEEP-hostKey","domainKey":"KEEP-domainKey","authType":"KEEP-authType"}`))
 		case "/cas/casrs/xml":
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(`<host><pwd>S3CR3T-XML</pwd></host>`))
@@ -504,6 +518,9 @@ func TestNoSecretsInLogsOrErrors(t *testing.T) {
 	if _, err := cli.GetInstanceDetail(4); err != nil {
 		t.Fatalf("GetInstanceDetail: %v", err)
 	}
+	if err := cli.get("more", nil, nil); err != nil {
+		t.Fatalf("more: %v", err)
+	}
 	errText := ""
 	for _, res := range []string{"conflict", "xml"} {
 		if err := cli.get(res, nil, nil); err == nil {
@@ -516,9 +533,13 @@ func TestNoSecretsInLogsOrErrors(t *testing.T) {
 	if !strings.Contains(buf.String(), "host/id/1") || !strings.Contains(out, redacted) {
 		t.Fatalf("debug log missing expected lines: %s", out)
 	}
-	for _, secret := range []string{"S3CR3T-HOST", "S3CR3T-IPMI", "S3CR3T-VNC", "S3CR3T-ERR", "S3CR3T-XML"} {
-		if strings.Contains(out, secret) {
-			t.Errorf("secret %s leaked: %s", secret, out)
+	if strings.Contains(out, "S3CR3T") {
+		t.Errorf("secret leaked: %s", out)
+	}
+	// identifiers that merely contain "key"/"auth" stay readable in debug logs
+	for _, keep := range []string{"KEEP-hostKey", "KEEP-domainKey", "KEEP-authType"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("%s was redacted", keep)
 		}
 	}
 }

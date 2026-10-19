@@ -23,15 +23,33 @@ import (
 
 const redacted = "******"
 
-// isSecretKey matches the credential fields CAS returns, e.g. host/id/{id}
-// "pwd", vm/detail graphics[].password, host/list "ipmiPw", host/all "pw".
+// isSecretKey matches credential-looking keys, case-insensitively. It was
+// derived from every property/parameter name in api.yaml matching
+// pwd|passw|token|secret|key|auth:
+//   - ends in "pw"/"pwd": pw, pwd, ipmiPw, encryptPw, netconfPw, hostPwd,
+//     vncPwd, cephPwd, slavePwd, arbitrationHostPwd;
+//   - contains "password"/"passwd"/"secret": password, vncPassword,
+//     loginPassword, passwd, secretKey (also masks the harmless isSecret,
+//     secretLevel, diskSecret, passwdMode);
+//   - ends in "token" or "authkey": token, authKey;
+//   - productKey (a licence key).
+//
+// Not masked: identifier keys (hostKey, clusterKey, domainKey are "unique
+// identifier" per api.yaml), key, keyValue, pageKey, descPropertyKey,
+// authType.
 func isSecretKey(key string) bool {
 	k := strings.ToLower(key)
-	switch k {
-	case "pw", "pwd", "passwd", "password", "ipmipw":
-		return true
+	for _, suffix := range []string{"pw", "pwd", "token", "authkey"} {
+		if strings.HasSuffix(k, suffix) {
+			return true
+		}
 	}
-	return strings.Contains(k, "password") || strings.Contains(k, "passwd") || strings.Contains(k, "secret")
+	for _, sub := range []string{"password", "passwd", "secret"} {
+		if strings.Contains(k, sub) {
+			return true
+		}
+	}
+	return k == "productkey"
 }
 
 func redactJSON(obj jsonutils.JSONObject) jsonutils.JSONObject {
