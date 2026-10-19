@@ -542,8 +542,11 @@ func (self *SInstanceNic) GetIP() string {
 	return self.IpAddr
 }
 
+// GetIP6 is always "": the placeholder network (network.go) has no IPv6
+// range, and cloudpods fails the whole NIC attach when it is asked to place
+// a v6 address on a network without one. The v4 address and MAC still sync.
 func (self *SInstanceNic) GetIP6() string {
-	return self.Ipv6
+	return ""
 }
 
 func (self *SInstanceNic) GetMAC() string {

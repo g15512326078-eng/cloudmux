@@ -547,3 +547,17 @@ func TestCheapFixes(t *testing.T) {
 		}
 	}
 }
+
+func TestNicIPv6NotReported(t *testing.T) {
+	nic := &SInstanceNic{SInstanceNetwork: SInstanceNetwork{IpAddr: "10.0.0.5", Ipv6: "fd00::5", VsName: "vswitch0"}, ins: &SInstance{HostPoolId: 1}}
+	if nic.GetIP6() != "" {
+		t.Errorf("GetIP6 = %q, want \"\" (placeholder network has no v6 range)", nic.GetIP6())
+	}
+	if nic.GetIP() != "10.0.0.5" || nic.GetINetworkId() != "vswitch/vswitch0/hostpool/1/default" {
+		t.Errorf("v4 part changed: %s %s", nic.GetIP(), nic.GetINetworkId())
+	}
+	net := &SNetwork{wire: &SWire{vpc: &SVpc{VSwitchName: "vswitch0"}, zone: &SZone{SHostPool: SHostPool{Id: 1}}}}
+	if net.GetIp6Start() != "" {
+		t.Errorf("placeholder network unexpectedly has a v6 range %q; GetIP6 could be re-enabled", net.GetIp6Start())
+	}
+}
