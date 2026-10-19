@@ -15,6 +15,7 @@
 package cas
 
 import (
+	"bytes"
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
@@ -24,7 +25,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sirupsen/logrus"
+
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
@@ -446,5 +450,59 @@ func TestSharedStorageId(t *testing.T) {
 	want := "hostpool/7/share2|fs,host/3/defaultpool|local"
 	if strings.Join(got, ",") != want {
 		t.Errorf("got %v, want %s", got, want)
+	}
+}
+
+func TestNoSecretsInLogsOrErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/cas/casrs/host/id/1":
+			w.Write([]byte(`{"id":1,"name":"cvk1","user":"root","pwd":"S3CR3T-HOST","ipmiPw":"S3CR3T-IPMI"}`))
+		case "/cas/casrs/vm/detail/4":
+			w.Write([]byte(`{"id":4,"uuid":"u4","graphics":[{"type":"vnc","port":5908,"password":"S3CR3T-VNC"}],"storage":[],"network":[]}`))
+		case "/cas/casrs/conflict":
+			w.Header().Set("Error-Code", "1")
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte(`{"host":{"pwd":"S3CR3T-ERR"}}`))
+		case "/cas/casrs/xml":
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`<host><pwd>S3CR3T-XML</pwd></host>`))
+		}
+	}))
+	defer srv.Close()
+
+	logger := log.Logger()
+	buf := &bytes.Buffer{}
+	oldOut, oldLevel := logger.Out, logger.GetLevel()
+	logger.SetOutput(buf)
+	logger.SetLevel(logrus.DebugLevel)
+	defer func() {
+		logger.SetOutput(oldOut)
+		logger.SetLevel(oldLevel)
+	}()
+
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig(srv.URL, testUser, testPass).Debug(true)}
+	if _, err := cli.GetHost("1"); err != nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if _, err := cli.GetInstanceDetail(4); err != nil {
+		t.Fatalf("GetInstanceDetail: %v", err)
+	}
+	errText := ""
+	for _, res := range []string{"conflict", "xml"} {
+		if err := cli.get(res, nil, nil); err == nil {
+			t.Fatalf("%s: expected error", res)
+		} else {
+			errText += err.Error()
+		}
+	}
+	out := buf.String() + errText
+	if !strings.Contains(buf.String(), "host/id/1") || !strings.Contains(out, redacted) {
+		t.Fatalf("debug log missing expected lines: %s", out)
+	}
+	for _, secret := range []string{"S3CR3T-HOST", "S3CR3T-IPMI", "S3CR3T-VNC", "S3CR3T-ERR", "S3CR3T-XML"} {
+		if strings.Contains(out, secret) {
+			t.Errorf("secret %s leaked: %s", secret, out)
+		}
 	}
 }

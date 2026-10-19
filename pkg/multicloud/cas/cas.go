@@ -118,7 +118,7 @@ func (cli *SCasClient) getDefaultClient() *http.Client {
 }
 
 // SCasError carries the business error headers CAS documents for HTTP 409
-// (Error-Code / Error-Message) plus the raw body.
+// (Error-Code / Error-Message) plus the body with secrets redacted.
 type SCasError struct {
 	Method       string
 	Url          string
@@ -187,7 +187,7 @@ func (cli *SCasClient) request(method httputils.THttpMethod, res string, params 
 		return nil, errors.Wrapf(err, "read body %s %s", method, u)
 	}
 	if cli.debug {
-		log.Debugf("%s %s -> %d %s", method, u, resp.StatusCode, string(data))
+		log.Debugf("%s %s -> %d %s", method, u, resp.StatusCode, redactBody(data))
 	}
 	if resp.StatusCode >= 300 {
 		ce := &SCasError{
@@ -196,7 +196,7 @@ func (cli *SCasClient) request(method httputils.THttpMethod, res string, params 
 			StatusCode:   resp.StatusCode,
 			ErrorCode:    resp.Header.Get("Error-Code"),
 			ErrorMessage: resp.Header.Get("Error-Message"),
-			Body:         string(data),
+			Body:         redactBody(data),
 		}
 		switch resp.StatusCode {
 		case http.StatusNotFound:
