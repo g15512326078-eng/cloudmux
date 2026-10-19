@@ -100,23 +100,70 @@ type SInstanceNetwork struct {
 	ProfileName string `json:"profileName"`
 }
 
+// GetInstances pages through vm/vmList (see listPaged) and returns every VM.
 func (cli *SCasClient) GetInstances(params url.Values) ([]SInstance, error) {
-	ret := []SInstance{}
-	return ret, cli.list("vm/vmList", params, "domain", &ret)
-}
-
-// GetInstance looks a VM up by uuid (its external id) in the full vmList.
-func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
-	vms, err := cli.GetInstances(nil)
+	items, err := cli.listPaged("vm/vmList", params, "domain", "uuid")
 	if err != nil {
 		return nil, err
 	}
-	for i := range vms {
-		if vms[i].Uuid == uuid {
-			return &vms[i], nil
+	ret := []SInstance{}
+	return ret, jsonutils.NewArray(items...).Unmarshal(&ret)
+}
+
+// GetInstance looks a VM up by uuid (its external id):
+//  1. GET vm/list/detail?vmUuids=<uuid>: no element -> ErrNotFound;
+//  2. GET vm/vmList?domainIdList=<id> for the list fields (hostId, ...);
+//  3. if the filter was not honoured, fall back to the full paged list.
+//
+// If the detail exists but the list does not have it, that is an error,
+// not ErrNotFound, so cloudpods does not mark the VM lost.
+func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
+	params := url.Values{}
+	params.Set("vmUuids", uuid)
+	resp, err := cli.request(httputils.GET, "vm/list/detail", params, nil)
+	if err != nil {
+		return nil, err
+	}
+	details, err := parseInstanceDetails(resp)
+	if err != nil {
+		return nil, err
+	}
+	var detail *SInstanceDetail
+	for i := range details {
+		if details[i].Uuid == uuid {
+			detail = &details[i]
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vm %s", uuid)
+	if detail == nil {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vm %s", uuid)
+	}
+	find := func(vms []SInstance) *SInstance {
+		for i := range vms {
+			if vms[i].Uuid == uuid {
+				vms[i].detail = detail
+				return &vms[i]
+			}
+		}
+		return nil
+	}
+	params = url.Values{}
+	params.Set("domainIdList", fmt.Sprintf("%d", detail.Id))
+	vms := []SInstance{}
+	err = cli.list("vm/vmList", params, "domain", &vms)
+	if err != nil {
+		return nil, err
+	}
+	if vm := find(vms); vm != nil {
+		return vm, nil
+	}
+	vms, err = cli.GetInstances(nil)
+	if err != nil {
+		return nil, err
+	}
+	if vm := find(vms); vm != nil {
+		return vm, nil
+	}
+	return nil, errors.Errorf("vm %s has a detail (id %d) but is not in vm/vmList", uuid, detail.Id)
 }
 
 func (cli *SCasClient) GetInstanceDetail(id int64) (*SInstanceDetail, error) {
@@ -125,6 +172,24 @@ func (cli *SCasClient) GetInstanceDetail(id int64) (*SInstanceDetail, error) {
 		return nil, err
 	}
 	return parseInstanceDetail(resp)
+}
+
+// parseInstanceDetails decodes a {"domain": [VMRsDomainDetail]} list as
+// returned by vm/list/detail and vm/detail/all.
+func parseInstanceDetails(resp jsonutils.JSONObject) ([]SInstanceDetail, error) {
+	items, err := listItems(resp, "domain")
+	if err != nil {
+		return nil, err
+	}
+	ret := []SInstanceDetail{}
+	for i := range items {
+		detail, err := parseInstanceDetail(items[i])
+		if err != nil {
+			return nil, errors.Wrapf(err, "domain[%d]", i)
+		}
+		ret = append(ret, *detail)
+	}
+	return ret, nil
 }
 
 func parseInstanceDetail(resp jsonutils.JSONObject) (*SInstanceDetail, error) {

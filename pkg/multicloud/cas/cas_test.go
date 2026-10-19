@@ -370,12 +370,7 @@ func TestSyncMapping(t *testing.T) {
 	if vm.GetCreatedAt().IsZero() {
 		t.Errorf("vm createdAt not parsed")
 	}
-	if _, err := region.GetIVMById("3a07b70f-085a-4558-ab22-fd1db6bcb4f3"); err != nil {
-		t.Errorf("GetIVMById: %v", err)
-	}
-	if _, err := region.GetIVMById("nope"); errors.Cause(err) != cloudprovider.ErrNotFound {
-		t.Errorf("GetIVMById(nope) = %v", err)
-	}
+	// lookup by uuid is covered by TestGetInstanceByUuid (sync_test.go)
 
 	disks, err := vm.GetIDisks()
 	if err != nil || len(disks) != 1 {

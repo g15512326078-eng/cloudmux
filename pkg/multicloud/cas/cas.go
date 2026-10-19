@@ -51,6 +51,9 @@ type CasClientConfig struct {
 	username  string
 	password  string
 
+	// pageSize is the limit used by listPaged (DEFAULT_PAGE_SIZE if 0).
+	pageSize int
+
 	debug bool
 }
 
@@ -266,32 +269,110 @@ func unwrapRoot(obj jsonutils.JSONObject) jsonutils.JSONObject {
 	return obj
 }
 
-// unmarshalList decodes obj[key] into retVal (pointer to slice). It
-// tolerates the shapes JAXB-to-JSON bridges commonly emit for a repeated
-// XML element: a JSON array, a bare object when there is exactly one
-// element, and a missing key / null / "" when there are none.
-func unmarshalList(obj jsonutils.JSONObject, key string, retVal interface{}) error {
+// listItems returns the elements of obj[key]. It tolerates the shapes
+// JAXB-to-JSON bridges commonly emit for a repeated XML element: a JSON
+// array, a bare object when there is exactly one element, and a missing
+// key / null / "" when there are none.
+func listItems(obj jsonutils.JSONObject, key string) ([]jsonutils.JSONObject, error) {
 	obj = unwrapRoot(obj)
 	if arr, ok := obj.(*jsonutils.JSONArray); ok {
-		return arr.Unmarshal(retVal)
+		return arr.GetArray()
 	}
 	if !obj.Contains(key) {
-		return nil
+		return nil, nil
 	}
 	v, err := obj.Get(key)
 	if err != nil {
-		return errors.Wrapf(err, "get %s", key)
+		return nil, errors.Wrapf(err, "get %s", key)
 	}
 	switch vv := v.(type) {
 	case *jsonutils.JSONArray:
-		return vv.Unmarshal(retVal)
+		return vv.GetArray()
 	case *jsonutils.JSONDict:
-		return jsonutils.NewArray(vv).Unmarshal(retVal)
+		return []jsonutils.JSONObject{vv}, nil
 	}
 	if v.IsZero() || v == jsonutils.JSONNull {
-		return nil
+		return nil, nil
 	}
-	return errors.Errorf("unexpected %s value: %s", key, v.String())
+	return nil, errors.Errorf("unexpected %s value type %T", key, v)
+}
+
+// unmarshalList decodes obj[key] (see listItems) into retVal, a pointer to
+// a slice.
+func unmarshalList(obj jsonutils.JSONObject, key string, retVal interface{}) error {
+	items, err := listItems(obj, key)
+	if err != nil {
+		return err
+	}
+	return jsonutils.NewArray(items...).Unmarshal(retVal)
+}
+
+const (
+	DEFAULT_PAGE_SIZE = 100
+	// MAX_PAGES bounds listPaged so a misbehaving server cannot loop it
+	// forever (100 * 10000 = 1M records).
+	MAX_PAGES = 10000
+)
+
+// listPaged walks an offset/limit list endpoint (offset is taken as a
+// record offset: page N is offset=N*limit) and returns every element,
+// de-duplicated by idKey. Stop conditions:
+//   - a page shorter than limit: that was the last page, done;
+//   - the first page is longer than limit: the server ignores limit and
+//     returned everything, done;
+//   - a page that is full but adds no new id: the server ignores offset,
+//     so completeness cannot be proven -> error (never a short list);
+//   - MAX_PAGES reached -> error.
+//
+// Returning an error instead of a partial list matters: cloudpods marks
+// VMs missing from a successful list as lost.
+func (cli *SCasClient) listPaged(res string, params url.Values, key, idKey string) ([]jsonutils.JSONObject, error) {
+	limit := cli.pageSize
+	if limit <= 0 {
+		limit = DEFAULT_PAGE_SIZE
+	}
+	seen := map[string]bool{}
+	ret := []jsonutils.JSONObject{}
+	for page := 0; page < MAX_PAGES; page++ {
+		query := url.Values{}
+		for k, v := range params {
+			query[k] = v
+		}
+		query.Set("offset", fmt.Sprintf("%d", page*limit))
+		query.Set("limit", fmt.Sprintf("%d", limit))
+		resp, err := cli.request(httputils.GET, res, query, nil)
+		if err != nil {
+			return nil, err
+		}
+		items, err := listItems(resp, key)
+		if err != nil {
+			return nil, err
+		}
+		added := 0
+		for i := range items {
+			id, _ := items[i].GetString(idKey)
+			if len(id) > 0 {
+				if seen[id] {
+					continue
+				}
+				seen[id] = true
+			}
+			ret = append(ret, items[i])
+			added++
+		}
+		switch {
+		case len(items) < limit:
+			return ret, nil
+		case len(items) > limit:
+			if page == 0 {
+				return ret, nil
+			}
+			return nil, errors.Errorf("%s: page %d returned %d items for limit %d", res, page, len(items), limit)
+		case added == 0:
+			return nil, errors.Errorf("%s: page %d (offset %d) repeated earlier items, server seems to ignore offset; refusing a possibly truncated list", res, page, page*limit)
+		}
+	}
+	return nil, errors.Errorf("%s: more than %d pages of %d", res, MAX_PAGES, limit)
 }
 
 func (cli *SCasClient) GetAccountId() string {
