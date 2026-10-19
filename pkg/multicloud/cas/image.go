@@ -63,8 +63,11 @@ func (self *SImage) GetId() string {
 	return fmt.Sprintf("%d", self.Id)
 }
 
+// GetGlobalId is prefixed with the region global id (CAS/<cloudprovider
+// id>) because cloudpods looks cached images up by external id without
+// scoping by account, and template ids are small integers on every CAS.
 func (self *SImage) GetGlobalId() string {
-	return self.GetId()
+	return fmt.Sprintf("%s/template/%d", self.cache.region.GetGlobalId(), self.Id)
 }
 
 func (self *SImage) GetName() string {

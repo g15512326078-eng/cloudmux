@@ -416,7 +416,7 @@ func TestSyncMapping(t *testing.T) {
 		t.Fatalf("GetICloudImages = %v, %v", images, err)
 	}
 	img := images[0]
-	if img.GetGlobalId() != "1" || img.GetName() != "sdfsdf" || img.GetSizeByte() != 1024*1024*1024 ||
+	if img.GetGlobalId() != "CAS/acc1/template/1" || img.GetName() != "sdfsdf" || img.GetSizeByte() != 1024*1024*1024 ||
 		img.GetOsType() != cloudprovider.OsTypeWindows || img.GetImageStatus() != cloudprovider.IMAGE_STATUS_ACTIVE {
 		t.Errorf("image = %s %s %d %s", img.GetGlobalId(), img.GetName(), img.GetSizeByte(), img.GetOsType())
 	}
@@ -504,5 +504,21 @@ func TestNoSecretsInLogsOrErrors(t *testing.T) {
 		if strings.Contains(out, secret) {
 			t.Errorf("secret %s leaked: %s", secret, out)
 		}
+	}
+}
+
+func TestImageGlobalIdIsAccountScoped(t *testing.T) {
+	ids := map[string]bool{}
+	for _, acc := range []string{"acc1", "acc2"} {
+		cli := &SCasClient{CasClientConfig: NewCasClientConfig("http://x:1", testUser, testPass).CloudproviderConfig(cloudprovider.ProviderConfig{Id: acc})}
+		img := &SImage{SVmTemplate: SVmTemplate{Id: 1}, cache: cli.GetRegion().getStoragecache()}
+		want := fmt.Sprintf("CAS/%s/template/1", acc)
+		if img.GetGlobalId() != want {
+			t.Errorf("image id = %s, want %s", img.GetGlobalId(), want)
+		}
+		ids[img.GetGlobalId()] = true
+	}
+	if len(ids) != 2 {
+		t.Errorf("template 1 on two accounts collides: %v", ids)
 	}
 }
