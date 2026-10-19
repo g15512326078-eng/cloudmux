@@ -48,12 +48,13 @@ type fakeCloud struct {
 }
 
 type fakeVM struct {
-	id     int
-	hostId int
-	uuid   string
-	ip     string // guest IP in vm/detail; default 10.0.0.<id>
-	hidden bool   // has a detail but is missing from vm/vmList
-	cpu    int    // vmList cpu; default 2
+	id      int
+	hostId  int
+	uuid    string
+	ip      string // guest IP in vm/detail; default 10.0.0.<id>
+	hidden  bool   // has a detail but is missing from vm/vmList
+	cpu     int    // vmList cpu; default 2
+	delTime string // non-empty => recycle bin
 }
 
 // updateVM changes a VM between requests (under the lock the handler uses).
@@ -94,8 +95,12 @@ func (f *fakeCloud) vmList(vm fakeVM) dict {
 	if cpu == 0 {
 		cpu = 2
 	}
-	return dict{"id": vm.id, "uuid": vm.uuid, "name": fmt.Sprintf("vm%d", vm.id), "title": fmt.Sprintf("VM %d", vm.id),
+	d := dict{"id": vm.id, "uuid": vm.uuid, "name": fmt.Sprintf("vm%d", vm.id), "title": fmt.Sprintf("VM %d", vm.id),
 		"hostId": vm.hostId, "hostPoolId": 1, "clusterId": 1, "cpu": cpu, "memory": 2048, "vmStatus": "running", "system": 1}
+	if len(vm.delTime) > 0 {
+		d["delTime"] = vm.delTime
+	}
+	return d
 }
 
 func (f *fakeCloud) vmDetail(vm fakeVM) dict {
@@ -641,5 +646,50 @@ func TestRefreshUpdatesDetail(t *testing.T) {
 	cached, _ := region.cachedHostDetails(1)
 	if cached["uuid-1"].nics[0].IpAddr != "10.0.0.1" {
 		t.Errorf("test premise: cache should still be stale")
+	}
+}
+
+func TestRecycleBinFilteredEverywhere(t *testing.T) {
+	f := newFakeCloud(t, 1, 3)
+	f.vms[1].delTime = "2020-10-29T22:54:10+08:00" // uuid-2 recycled
+	cli, _ := f.start()
+	cli.pageSize = 10
+
+	vms, err := cli.GetInstances(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := uuids(vms)
+	if got != "uuid-1,uuid-3" {
+		t.Errorf("GetInstances = %s, recycled uuid-2 must be absent", got)
+	}
+
+	if _, err := cli.GetInstance("uuid-2"); errors.Cause(err) != cloudprovider.ErrNotFound {
+		t.Errorf("GetInstance(recycled) = %v, want ErrNotFound", err)
+	}
+
+	region := cli.GetRegion()
+	ivms, err := region.GetIVMs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ivms) != 2 {
+		t.Errorf("GetIVMs = %d, want 2", len(ivms))
+	}
+	hosts, err := region.GetIHosts()
+	if err != nil || len(hosts) != 1 {
+		t.Fatalf("hosts = %v, %v", hosts, err)
+	}
+	hivms, err := hosts[0].GetIVMs()
+	if err != nil || len(hivms) != 2 {
+		t.Errorf("host GetIVMs = %d, %v", len(hivms), err)
+	}
+	// bulk details must not keep the recycled uuid
+	details, err := region.cachedHostDetails(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := details["uuid-2"]; ok {
+		t.Errorf("cachedHostDetails still has recycled uuid-2: %v", details)
 	}
 }

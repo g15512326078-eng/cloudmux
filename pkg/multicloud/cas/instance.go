@@ -60,6 +60,10 @@ type SInstance struct {
 	OsDesc       string  `json:"osDesc"`
 	CreateDate   string  `json:"createDate"`
 	Type         int     `json:"type"` // 0 CAS, 1 VMware
+	// DelTime is DomainRsDomainvmList.delTime ("虚拟机逻辑回收时间"), a
+	// date string (api.yaml type=string, format=date). Non-empty means the
+	// VM is in the recycle bin (POST /vm/restoreVm can restore it).
+	DelTime string `json:"delTime"`
 }
 
 // SInstanceDetail is the subset of VMRsDomainDetail used for P0.
@@ -100,12 +104,24 @@ type SInstanceNetwork struct {
 	ProfileName string `json:"profileName"`
 }
 
-// GetInstances pages through vm/vmList (see listPaged) and returns every VM.
 // VM_TYPE_VMWARE is vmList "type" 1 ("VMware虚拟机"), a VM CAS manages on a
 // VMware host; those are not CAS-hypervisor guests and are not synced.
 const VM_TYPE_VMWARE = 1
 
-// GetInstances is the paged vm/vmList without VMware-type VMs.
+// isRecycled reports whether the VM is in the CAS recycle bin. api.yaml
+// DomainRsDomainvmList.delTime is a date string; any non-empty value means
+// recycled. UNVERIFIED: exact string CAS sends (RFC3339 vs "2020-10-29").
+func (self *SInstance) isRecycled() bool {
+	return len(strings.TrimSpace(self.DelTime)) > 0
+}
+
+// isLiveGuest is true for CAS-hypervisor VMs that are not in the recycle bin.
+func (self *SInstance) isLiveGuest() bool {
+	return self.Type != VM_TYPE_VMWARE && !self.isRecycled()
+}
+
+// GetInstances is the paged vm/vmList without VMware-type or recycled VMs.
+// cachedInstances / host.GetIVMs / storage disk scans all go through this.
 func (cli *SCasClient) GetInstances(params url.Values) ([]SInstance, error) {
 	vms, err := cli.listInstances(params)
 	if err != nil {
@@ -113,7 +129,7 @@ func (cli *SCasClient) GetInstances(params url.Values) ([]SInstance, error) {
 	}
 	ret := []SInstance{}
 	for i := range vms {
-		if vms[i].Type != VM_TYPE_VMWARE {
+		if vms[i].isLiveGuest() {
 			ret = append(ret, vms[i])
 		}
 	}
@@ -127,6 +143,45 @@ func (cli *SCasClient) listInstances(params url.Values) ([]SInstance, error) {
 	}
 	ret := []SInstance{}
 	return ret, jsonutils.NewArray(items...).Unmarshal(&ret)
+}
+
+// waitVMNotLive polls the raw vm/vmList until uuid is missing or recycled
+// (delTime set). Uses the same poll interval/timeout as waitTask.
+func (cli *SCasClient) waitVMNotLive(uuid string) error {
+	interval, timeout := cli.taskPollInterval, cli.taskTimeout
+	if interval <= 0 {
+		interval = DEFAULT_TASK_POLL_INTERVAL
+	}
+	if timeout <= 0 {
+		timeout = DEFAULT_TASK_TIMEOUT
+	}
+	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		live, err := cli.vmIsLiveInList(uuid)
+		if err != nil {
+			return false, err
+		}
+		return !live, nil
+	})
+	if err != nil {
+		return errors.Wrapf(err, "waitVMNotLive %s (still present as a live guest after delete)", uuid)
+	}
+	return nil
+}
+
+// vmIsLiveInList reports whether uuid appears in vm/vmList as a live
+// (non-VMware, non-recycled) guest. Uses the unfiltered list so a recycled
+// entry with delTime is visible and treated as not live.
+func (cli *SCasClient) vmIsLiveInList(uuid string) (bool, error) {
+	vms, err := cli.listInstances(nil)
+	if err != nil {
+		return false, err
+	}
+	for i := range vms {
+		if vms[i].Uuid == uuid {
+			return vms[i].isLiveGuest(), nil
+		}
+	}
+	return false, nil
 }
 
 // GetInstance looks a VM up by uuid (its external id):
@@ -160,8 +215,12 @@ func (cli *SCasClient) GetInstance(uuid string) (*SInstance, error) {
 	find := func(vms []SInstance) *SInstance {
 		for i := range vms {
 			if vms[i].Uuid == uuid {
-				if vms[i].Type == VM_TYPE_VMWARE {
-					notFound = errors.Wrapf(cloudprovider.ErrNotFound, "vm %s is a VMware VM", uuid)
+				if !vms[i].isLiveGuest() {
+					if vms[i].isRecycled() {
+						notFound = errors.Wrapf(cloudprovider.ErrNotFound, "vm %s is in the recycle bin (delTime=%s)", uuid, vms[i].DelTime)
+					} else {
+						notFound = errors.Wrapf(cloudprovider.ErrNotFound, "vm %s is a VMware VM", uuid)
+					}
 					return nil
 				}
 				vms[i].detail = detail
@@ -530,8 +589,12 @@ const DELETE_VM_WIPE_VOLUME = "false"
 
 // DeleteVM stops a running/paused guest first (force powerOff), then
 // DELETE /cas/casrs/vm/delete/uuid/{uuid} with DELETE_VM_TYPE /
-// DELETE_VM_WIPE_VOLUME. UNVERIFIED: whether CAS rejects delete while
-// running, delBase0, and recycle-bin restore.
+// DELETE_VM_WIPE_VOLUME, then waits until the VM is absent from the live
+// vmList (missing, or present with delTime set). waitTask completion alone
+// is not enough: type=3 leaves the domain in the recycle bin and it can
+// still appear in vm/vmList until delTime is set / it disappears.
+// UNVERIFIED: whether CAS rejects delete while running, delBase0, and
+// recycle-bin restore.
 func (self *SInstance) DeleteVM(ctx context.Context) error {
 	status := self.GetStatus()
 	if status == api.VM_RUNNING || status == api.VM_SUSPEND {
@@ -543,7 +606,10 @@ func (self *SInstance) DeleteVM(ctx context.Context) error {
 	params.Set("type", DELETE_VM_TYPE)
 	params.Set("isWipeVolume", DELETE_VM_WIPE_VOLUME)
 	_, err := self.region.cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
-	return err
+	if err != nil {
+		return err
+	}
+	return self.region.cli.waitVMNotLive(self.Uuid)
 }
 
 func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {

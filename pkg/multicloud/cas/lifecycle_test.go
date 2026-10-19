@@ -234,6 +234,9 @@ func TestLifecycleOps(t *testing.T) {
 	compact := []string{}
 	seenMsg := map[string]bool{}
 	for _, h := range hits {
+		if strings.HasPrefix(h, "GET /cas/casrs/vm/vmList") {
+			continue // DeleteVM waitVMNotLive
+		}
 		if strings.HasPrefix(h, "GET /cas/casrs/message/") {
 			if seenMsg[h] {
 				continue
@@ -427,6 +430,9 @@ func TestDeleteVMRecycleAndStopFirst(t *testing.T) {
 	compact := []string{}
 	seen := map[string]bool{}
 	for _, h := range f.hits {
+		if strings.HasPrefix(h, "GET /cas/casrs/vm/vmList") {
+			continue // DeleteVM waitVMNotLive
+		}
 		if strings.HasPrefix(h, "GET /cas/casrs/message/") {
 			if seen[h] {
 				continue
@@ -443,6 +449,15 @@ func TestDeleteVMRecycleAndStopFirst(t *testing.T) {
 	}
 	if strings.Join(compact, "\n") != strings.Join(want, "\n") {
 		t.Errorf("hits:\n%s\nwant:\n%s", strings.Join(compact, "\n"), strings.Join(want, "\n"))
+	}
+	hasList := false
+	for _, h := range f.hits {
+		if strings.Contains(h, "vm/vmList") {
+			hasList = true
+		}
+	}
+	if !hasList {
+		t.Errorf("DeleteVM must poll vmList until gone/recycled")
 	}
 	if DELETE_VM_TYPE != "3" || DELETE_VM_WIPE_VOLUME != "false" {
 		t.Errorf("constants = %s/%s", DELETE_VM_TYPE, DELETE_VM_WIPE_VOLUME)

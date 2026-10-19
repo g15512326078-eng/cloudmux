@@ -145,9 +145,24 @@ func (self *SRegion) cachedHostDetails(hostId int64) (map[string]*SInstanceDetai
 		if err != nil {
 			return nil, err
 		}
+		// Drop details for VMs that are not live in vmList (recycle bin /
+		// VMware). Detail schema has no delTime, so we intersect with the
+		// filtered instance list.
+		live, err := self.cachedInstances()
+		if err != nil {
+			return nil, err
+		}
+		liveSet := map[string]bool{}
+		for i := range live {
+			if live[i].HostId == hostId {
+				liveSet[live[i].Uuid] = true
+			}
+		}
 		ret := map[string]*SInstanceDetail{}
 		for i := range details {
-			ret[details[i].Uuid] = &details[i]
+			if liveSet[details[i].Uuid] {
+				ret[details[i].Uuid] = &details[i]
+			}
 		}
 		return ret, nil
 	})
