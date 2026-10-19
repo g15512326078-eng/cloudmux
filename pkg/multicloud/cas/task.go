@@ -124,6 +124,15 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
 		msg, err := cli.GetMessage(msgId)
 		if err != nil {
+			// CAS may not publish the message immediately after submit.
+			// NotFound (and transient 5xx) keep polling until timeout;
+			// other errors abort.
+			if errors.Cause(err) == cloudprovider.ErrNotFound {
+				return false, nil
+			}
+			if ce, ok := errors.Cause(err).(*SCasError); ok && ce.StatusCode >= 500 {
+				return false, nil
+			}
 			return false, err
 		}
 		last = msg
