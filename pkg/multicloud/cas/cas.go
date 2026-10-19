@@ -156,6 +156,10 @@ func (cli *SCasClient) request(method httputils.THttpMethod, res string, params 
 	}
 	resp, err := cli.getDefaultClient().Do(req)
 	if err != nil {
+		// unwrap *url.Error so causes such as ErrAccountReadOnly survive
+		if ue, ok := err.(*url.Error); ok {
+			err = ue.Err
+		}
 		return nil, errors.Wrapf(err, "%s %s", method, u)
 	}
 	defer resp.Body.Close()
