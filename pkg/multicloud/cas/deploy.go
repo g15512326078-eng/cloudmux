@@ -12,12 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package cas implements a read-only (P0) cloudmux provider for H3C CAS
-// (CVM/CVK) virtualization, talking to the CAS REST API under
-// {AccessUrl}/cas/casrs/ with HTTP Digest authentication.
-//
-// This is not the H3C public/CloudOS provider (pkg/multicloud/h3c) and has
-// nothing to do with the Keystone CAS SSO driver.
 package cas
 
 import (
