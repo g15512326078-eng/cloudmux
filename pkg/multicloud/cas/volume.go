@@ -105,6 +105,9 @@ type SStorageVolumeCreate struct {
 	Format   string `json:"format"`
 	// Mode: 0 lazy zero, 1 zero, other thin. We send thin (2).
 	Mode int `json:"mode"`
+	// BaseFile is api.yaml "基础镜像文件，可选": the backing file of a new
+	// qcow2 overlay. Only the image import sets it.
+	BaseFile string `json:"baseFile,omitempty"`
 }
 
 const VOLUME_MODE_THIN = 2
