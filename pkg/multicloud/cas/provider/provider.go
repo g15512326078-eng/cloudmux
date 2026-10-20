@@ -240,3 +240,8 @@ func (self *SCasProvider) GetObjectCannedAcls(regionId string) []string {
 func (self *SCasProvider) GetCapabilities() []string {
 	return self.client.GetCapabilities()
 }
+
+var (
+	_ cloudprovider.ICloudProvider        = (*SCasProvider)(nil)
+	_ cloudprovider.ICloudProviderFactory = (*SCasProviderFactory)(nil)
+)

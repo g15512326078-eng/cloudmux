@@ -226,7 +226,7 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d := dict{"id": 50, "name": winTempVM, "uuid": "uuid-win", "status": "shutOff", "uptime": f.running, "title": "",
 			"cpu": dict{"cpuSockets": 1, "cpuCores": 2}, "memory": dict{"size": 4096, "unit": "MB"},
 			"network":  []dict{{"mac": "0c:da:41:1d:00:01", "vsName": "vswitch0", "deviceModel": "virtio"}},
-			"graphics": dict{"type": "vnc", "password": "vnc-secret-xyz"},
+			"graphics": []dict{{"type": "vnc", "port": 5908, "address": "0.0.0.0", "password": "vnc-secret-xyz"}}, // array (A:61493)
 			"bootDev":  dict{},
 			"storage":  append(append([]dict{}, f.storage...), f.extraStorage...)}
 		if f.autoStart != nil {
@@ -1315,8 +1315,10 @@ func TestWindowsImportBootChangeSideEffects(t *testing.T) {
 		}, "storage"},
 		"description": {func(f *winFake) { f.bootSideEffect = func(d dict) { d["title"] = "changed" } }, "title"},
 		"console pw": {func(f *winFake) {
-			f.bootSideEffect = func(d dict) { d["graphics"] = dict{"type": "vnc", "password": "other-secret"} }
-		}, "graphics.password"},
+			f.bootSideEffect = func(d dict) {
+				d["graphics"] = []dict{{"type": "vnc", "port": 5908, "address": "0.0.0.0", "password": "other-secret"}}
+			}
+		}, "graphics[0].password"},
 		"autostart":      {func(f *winFake) { f.bootSideEffect = func(d dict) { d["bootDev"] = dict{"autoStart": 1} } }, "bootDev.autoStart"},
 		"firmware flip":  {func(f *winFake) { f.firmware, f.firmwareAfter = 1, 0 }, "boot.detail.bootFirmware (1 -> 0)"},
 		"firmware gone":  {func(f *winFake) { f.firmware = nil }, "no boot.detail.bootFirmware"},
