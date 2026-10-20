@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"yunion.io/x/jsonutils"
-	"yunion.io/x/pkg/errors"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -42,6 +41,9 @@ type SVmTemplate struct {
 	CreateDate         string  `json:"createDate"`
 	StorageCapacity    int64   `json:"storageCapacity"` // MB (assumed, see report)
 	TempletStoragePath string  `json:"templetStoragePath"`
+	// Deployed is "是否快速部署过" (the template has been used for a
+	// fast/linked deploy). Delete and rename refuse such a template.
+	Deployed bool `json:"deployed"`
 }
 
 func (cli *SCasClient) GetVmTemplates() ([]SVmTemplate, error) {
@@ -162,6 +164,20 @@ func (self *SImage) GetBios() cloudprovider.TBiosType {
 	return cloudprovider.BIOS
 }
 
+// Delete removes the template with DELETE vmTemplate/deleteVmTemplateInfo
+// after the in-use checks in SCasClient.DeleteVmTemplate. A template that
+// is already gone counts as deleted.
 func (self *SImage) Delete(ctx context.Context) error {
-	return errors.Wrap(cloudprovider.ErrNotImplemented, "Delete")
+	return self.cache.region.cli.DeleteVmTemplate(self.Id)
+}
+
+// Rename changes only the template name (and description when desc is
+// not nil); see SCasClient.RenameVmTemplate.
+func (self *SImage) Rename(name string, desc *string) error {
+	tpl, err := self.cache.region.cli.RenameVmTemplate(self.Id, name, desc)
+	if err != nil {
+		return err
+	}
+	self.SVmTemplate = *tpl
+	return nil
 }
