@@ -17,6 +17,7 @@ package cas
 import (
 	"fmt"
 	"net/url"
+	"path"
 	"strings"
 
 	"yunion.io/x/jsonutils"
@@ -201,8 +202,47 @@ func (self *SStorage) IsSysDiskStore() bool {
 	return true
 }
 
+// CreateIDisk creates an empty qcow2 volume in this pool with
+// POST /cas/casrs/storage/volume (capacity MB, thin provisioned) and returns
+// it unattached. The file name is conf.Name plus ".qcow2"; an existing file
+// of that name is an error, never reused or overwritten.
 func (self *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (cloudprovider.ICloudDisk, error) {
-	return nil, errors.Wrap(cloudprovider.ErrNotImplemented, "CreateIDisk")
+	if conf == nil || len(conf.Name) == 0 || conf.SizeGb <= 0 {
+		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "name and positive SizeGb are required")
+	}
+	if len(conf.SnapshotId) > 0 || len(conf.ImageId) > 0 {
+		return nil, errors.Wrap(cloudprovider.ErrNotSupported, "CAS CreateIDisk from snapshot or image")
+	}
+	volName := conf.Name
+	if strings.ContainsAny(volName, "/\\") {
+		return nil, errors.Wrapf(cloudprovider.ErrInputParameter, "disk name %q must not contain a path separator", volName)
+	}
+	if !strings.HasSuffix(volName, ".qcow2") {
+		volName += ".qcow2"
+	}
+	cli := self.host.zone.region.cli
+	if _, err := cli.GetStorageVolume(self.host.Id, self.Name, volName); err == nil {
+		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "volume %s already exists in pool %s", volName, self.Name)
+	} else if errors.Cause(err) != cloudprovider.ErrNotFound {
+		return nil, errors.Wrapf(err, "GetStorageVolume")
+	}
+	body := &SStorageVolumeCreate{
+		HostId:   self.host.Id,
+		SpName:   self.Name,
+		VolName:  volName,
+		Capacity: int64(conf.SizeGb) * 1024,
+		Format:   "qcow2",
+		Mode:     VOLUME_MODE_THIN,
+	}
+	if err := cli.CreateStorageVolume(body); err != nil {
+		return nil, errors.Wrapf(err, "CreateStorageVolume %s", volName)
+	}
+	vol, err := cli.GetStorageVolume(self.host.Id, self.Name, volName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetStorageVolume %s after create", volName)
+	}
+	disk := volumeDisk(self, vol)
+	return &disk, nil
 }
 
 // contains reports whether a volume path lives in this pool.
@@ -213,8 +253,10 @@ func (self *SStorage) contains(path string) bool {
 	return strings.HasPrefix(path, strings.TrimSuffix(self.Path, "/")+"/")
 }
 
-// GetIDisks walks the VMs that can use this pool (the host for a local pool,
-// the host pool for a shared one) and keeps the disks whose path is in it.
+// GetIDisks returns the VM disks in this pool (walking the VMs that can
+// use it: the host for a local pool, the host pool for a shared one) plus
+// the unattached data volumes of the pool (GET storage/volume: leaf
+// qcow2/raw files with no users; ISOs and base files are skipped).
 func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 	region := self.host.zone.region
 	vms, err := region.cachedInstances()
@@ -222,6 +264,7 @@ func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 		return nil, err
 	}
 	ret := []cloudprovider.ICloudDisk{}
+	inUse := map[string]bool{}
 	for i := range vms {
 		if self.shared && vms[i].HostPoolId != self.host.HostPoolId {
 			continue
@@ -236,9 +279,21 @@ func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 		for j := range disks {
 			if self.contains(disks[j].Path) {
 				disks[j].storage = self
+				inUse[path.Base(disks[j].Path)] = true
 				ret = append(ret, &disks[j])
 			}
 		}
+	}
+	vols, err := region.cli.GetStorageVolumes(self.host.Id, self.Name, "")
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetStorageVolumes %s", self.Name)
+	}
+	for i := range vols {
+		if !vols[i].isDataVolume() || vols[i].isAttached() || inUse[vols[i].Name] {
+			continue
+		}
+		disk := volumeDisk(self, &vols[i])
+		ret = append(ret, &disk)
 	}
 	return ret, nil
 }

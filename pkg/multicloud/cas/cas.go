@@ -379,6 +379,12 @@ const (
 // Returning an error instead of a partial list matters: cloudpods marks
 // VMs missing from a successful list as lost.
 func (cli *SCasClient) listPaged(res string, params url.Values, key, idKey string) ([]jsonutils.JSONObject, error) {
+	return cli.listPagedBy(res, params, key, idKey, "limit")
+}
+
+// listPagedBy is listPaged with the page-size query name given: most CAS
+// lists take offset+limit, GET /storage/volume takes offset+pageSize.
+func (cli *SCasClient) listPagedBy(res string, params url.Values, key, idKey, limitParam string) ([]jsonutils.JSONObject, error) {
 	limit := cli.pageSize
 	if limit <= 0 {
 		limit = DEFAULT_PAGE_SIZE
@@ -391,7 +397,7 @@ func (cli *SCasClient) listPaged(res string, params url.Values, key, idKey strin
 			query[k] = v
 		}
 		query.Set("offset", fmt.Sprintf("%d", page*limit))
-		query.Set("limit", fmt.Sprintf("%d", limit))
+		query.Set(limitParam, fmt.Sprintf("%d", limit))
 		resp, err := cli.request(httputils.GET, res, query, nil)
 		if err != nil {
 			return nil, err

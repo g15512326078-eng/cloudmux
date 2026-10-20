@@ -183,6 +183,9 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			{"name": "defaultpool", "type": "dir", "path": "/vms/images", "status": 1, "totalSize": 500, "freeSize": 100},
 			{"name": "share1", "type": "fs", "path": "/vms/share1", "status": 1, "totalSize": 1000, "freeSize": 400},
 		}})
+	case path == "storage/volume":
+		// no unattached volumes: every file is a VM disk
+		reply(w, dict{"storageVolume": []dict{}})
 	case path == "vm/vmList":
 		match := []dict{}
 		for _, vm := range vms {
@@ -443,8 +446,9 @@ func TestSyncRequestCount(t *testing.T) {
 	const nHosts = 2
 	// hostpool/all + host + vmTemplate/all + one vm/vmList page, plus per
 	// host: host/id/{id}, storage/pool, host/id/{id}/storage,
-	// host/id/{id}/vswitch, vm/detail/all?hostId=.
-	want := 4 + 5*nHosts
+	// host/id/{id}/vswitch, vm/detail/all?hostId=, and one storage/volume
+	// per pool (2 pools) for unattached volumes.
+	want := 4 + 7*nHosts
 	for _, nVMs := range []int{6, 60} {
 		f := newFakeCloud(t, nHosts, nVMs)
 		cli, _ := f.start()
