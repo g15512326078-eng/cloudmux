@@ -15,6 +15,7 @@
 package cas
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,18 +52,19 @@ type impFake struct {
 	refreshed int
 
 	// failure injection
-	failVolumeHTTP bool   // POST storage/volume -> 500
-	badBacking     string // overlay reports this backing store
-	vmAddCreates   bool   // vm/add task fails but the VM exists
-	vmStatus       string // status of the new VM (default shutOff)
-	srcHidden      bool   // source not listed until refresh
-	poolPath       string // default /vms/images
-	vmAddStatus    int    // vm/add -> this HTTP status (no task)
-	vmAddStCreates bool   // ... and the VM was created anyway
-	failVMDelete   bool   // DELETE vm/delete/uuid -> 409
-	vmAdd500       bool   // vm/add -> 500 without creating a VM (ambiguous)
-	dupVMOnAdd     bool   // vm/add: a foreign VM with the same name appears too
-	vmListFail     bool   // vm/vmList -> 500 once vm/add was received
+	failVolumeHTTP bool        // POST storage/volume -> 500
+	badBacking     string      // overlay reports this backing store
+	vmAddCreates   bool        // vm/add task fails but the VM exists
+	vmStatus       string      // status of the new VM (default shutOff)
+	srcHidden      bool        // source not listed until refresh
+	srcOnDisk      func() bool // if set, a refresh lists the source only when this is true
+	poolPath       string      // default /vms/images
+	vmAddStatus    int         // vm/add -> this HTTP status (no task)
+	vmAddStCreates bool        // ... and the VM was created anyway
+	failVMDelete   bool        // DELETE vm/delete/uuid -> 409
+	vmAdd500       bool        // vm/add -> 500 without creating a VM (ambiguous)
+	dupVMOnAdd     bool        // vm/add: a foreign VM with the same name appears too
+	vmListFail     bool        // vm/vmList -> 500 once vm/add was received
 	vmAdded        bool
 	overlayUsers   string // users reported on the overlay
 	tplNever       bool   // addVmTemplate task never completes
@@ -70,6 +72,7 @@ type impFake struct {
 	tplBacking     string // backingStore of the template's disk volume
 	tplStorageFail bool   // GET vmTemplate/storage -> 500
 	tplNoBackKey   bool   // template volume JSON has no backingStore key
+	tplBackRaw     string // raw JSON value of backingStore (e.g. null)
 
 	// extra, when set, handles a request first (true = handled); called
 	// with f.lock held.
@@ -158,8 +161,15 @@ func (f *impFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.tplNoBackKey {
 			delete(v, "backingStore")
 		}
+
 		if name := q.Get("volumeName"); len(name) > 0 && name != v["name"] {
 			reply(w, dict{"storageVolume": []dict{}})
+			return
+		}
+		if len(f.tplBackRaw) > 0 {
+			// written by hand: the dict marshaller cannot emit null
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"storageVolume":[{"name":"ubuntu-2204.qcow2","format":"qcow2","size":3072,"backingStore":%s}]}`, f.tplBackRaw)
 			return
 		}
 		reply(w, dict{"storageVolume": []dict{v}})
@@ -179,7 +189,7 @@ func (f *impFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, dict{"storageVolume": out})
 	case r.Method == "GET" && path == "storage/refresh":
 		f.refreshed++
-		f.srcHidden = false
+		f.srcHidden = f.srcOnDisk != nil && !f.srcOnDisk()
 		reply(w, dict{"state": 0, "errorCode": 0, "message": "ok"})
 	case r.Method == "POST" && path == "storage/volume":
 		if f.failVolumeHTTP {
@@ -704,6 +714,38 @@ func TestImportQcow2TemplateBackingKeyMissing(t *testing.T) {
 	}
 	if w := f.writes(); hasDelete(w) {
 		t.Fatalf("temp VM must stay live: %v", w)
+	}
+}
+
+// N-R2: a non-string backingStore is Unverified (with the raw value),
+// not a backing file named "null".
+func TestImportQcow2TemplateBackingNonString(t *testing.T) {
+	for _, raw := range []string{"null", "0", "[]", "{}"} {
+		f := newImpFake(t)
+		f.tplBackRaw = raw
+		_, err := f.client(t).ImportQcow2AsTemplate(impOpts())
+		if err == nil || !strings.Contains(err.Error(), "TemplateBackingUnverified") || !strings.Contains(err.Error(), "non-string backingStore ("+raw+")") || strings.Contains(err.Error(), "has backing file") {
+			t.Fatalf("%s: err = %v", raw, err)
+		}
+		if w := f.writes(); hasDelete(w) {
+			t.Fatalf("%s: temp VM must stay live: %v", raw, w)
+		}
+	}
+}
+
+// Ctrl-C (Context cancelled) before the run: nothing is written.
+func TestImportQcow2InterruptedBeforeWrites(t *testing.T) {
+	f := newImpFake(t)
+	o := impOpts()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	o.Context = ctx
+	_, err := f.client(t).ImportQcow2AsTemplate(o)
+	if errors.Cause(err) != context.Canceled || !strings.Contains(err.Error(), "interrupted before") {
+		t.Fatalf("err = %v", err)
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Fatalf("writes %v", w)
 	}
 }
 

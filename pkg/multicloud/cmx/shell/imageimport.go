@@ -15,9 +15,13 @@
 package shell
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"yunion.io/x/pkg/errors"
 
@@ -58,6 +62,7 @@ type ImageImportTemplateOptions struct {
 	ServeAddr        string `help:"Mode http: host:port the stub listens on, only while the import runs"`
 	ServeAdvertise   string `help:"Mode http: host:port CAS is told to fetch from (default --serve-addr); must be reachable from the CAS node"`
 	HttpSkipChecksum bool   `help:"Mode http: do not send the md5 checksum to nova/download and ifExists"`
+	ServeAnyAddr     bool   `help:"Mode http: allow --serve-addr 0.0.0.0, [::] or an empty host (listen on every interface); off by default"`
 }
 
 func (o *ImageImportTemplateOptions) uploadMode() (string, error) {
@@ -79,7 +84,7 @@ func (o *ImageImportTemplateOptions) uploadMode() (string, error) {
 		sshSet = sshSet || len(s) > 0
 	}
 	sshSet = sshSet || o.SshInsecureIgnoreHostKey
-	httpSet := len(o.HttpUpload) > 0 || len(o.ServeAddr) > 0 || len(o.ServeAdvertise) > 0 || o.HttpSkipChecksum
+	httpSet := len(o.HttpUpload) > 0 || len(o.ServeAddr) > 0 || len(o.ServeAdvertise) > 0 || o.HttpSkipChecksum || o.ServeAnyAddr
 	switch mode {
 	case "pool-file":
 		if sshSet || httpSet {
@@ -121,6 +126,7 @@ func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, e
 	case "http":
 		ret.Stager = cas.NewHTTPStager(cas.SHTTPUploadOptions{
 			LocalPath: o.HttpUpload, ServeAddr: o.ServeAddr, AdvertiseAddr: o.ServeAdvertise, SkipChecksum: o.HttpSkipChecksum,
+			AllowAnyAddr: o.ServeAnyAddr,
 		})
 		return ret, nil
 	}
@@ -150,6 +156,9 @@ func init() {
 			// before anything connects, not only in the result
 			fmt.Fprintln(os.Stderr, "WARNING: "+w)
 		}
+		ctx, stop := interruptContext()
+		defer stop()
+		opts.Context = ctx
 		res, err := p.GetClient().ImportQcow2AsTemplate(opts)
 		if res != nil {
 			enc := json.NewEncoder(os.Stdout)
@@ -165,4 +174,35 @@ func init() {
 		// created but failed the backing-file check
 		return err
 	})
+}
+
+// interruptContext is cancelled by the first SIGINT/SIGTERM: the import
+// stops before its next step, the HTTP stub stops at once, and cleanup
+// runs under the usual keep-on-ambiguity rules (a CAS task already sent
+// is still waited for). The handler is then removed, so a second Ctrl-C
+// kills cmx immediately (skipping that cleanup). (signal.Notify rather
+// than signal.NotifyContext, so a normal stop() is not reported as an
+// interrupt.)
+func interruptContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case sig := <-ch:
+			signal.Stop(ch)
+			fmt.Fprintf(os.Stderr, "%s: stopping after the current CAS call and cleaning up; press Ctrl-C again to exit at once (no cleanup)\n", sig)
+			cancel()
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			signal.Stop(ch)
+			close(done)
+			cancel()
+		})
+	}
 }

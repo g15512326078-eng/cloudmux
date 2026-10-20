@@ -287,6 +287,10 @@ func impSSHFake(t *testing.T, dir string) *impFake {
 	f := newImpFake(t)
 	f.poolPath = dir
 	f.srcHidden = true // CAS lists the file only after refresh
+	f.srcOnDisk = func() bool {
+		_, err := os.Stat(filepath.Join(dir, impSource))
+		return err == nil
+	}
 	return f
 }
 
@@ -302,7 +306,7 @@ func TestImportQcow2WithSSHUpload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Steps[0].Step != "ssh-upload" || res.Steps[1].Step != "refresh-pool" || res.Steps[2].Step != "create-overlay" {
+	if res.Steps[0].Step != "refresh-pool-before-upload" || res.Steps[1].Step != "ssh-upload" || res.Steps[2].Step != "refresh-pool" || res.Steps[3].Step != "create-overlay" {
 		t.Fatalf("steps = %+v", res.Steps)
 	}
 	if got, _ := os.ReadFile(filepath.Join(dir, "cloud.qcow2")); string(got) != "cloud image" {
@@ -324,7 +328,7 @@ func TestImportQcow2SSHDryRunAndReadOnlyNoConnection(t *testing.T) {
 			cli.cpcfg.ReadOnly = true
 		}
 		res, err := cli.ImportQcow2AsTemplate(o)
-		if mode == "dry-run" && (err != nil || res.Steps[0].Step != "ssh-upload" || res.Steps[0].Done) {
+		if mode == "dry-run" && (err != nil || res.Steps[1].Step != "ssh-upload" || res.Steps[1].Done || res.Steps[0].Done) {
 			t.Fatalf("%s: %v %+v", mode, err, res)
 		}
 		if mode == "read-only" && errors.Cause(err) != cloudprovider.ErrAccountReadOnly {

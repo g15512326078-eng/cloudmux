@@ -51,6 +51,10 @@
 //     CAS pull it with POST nova/download (PUT cinder/download only on a
 //     404) into /vms/nova/<uuid>, then cinder/volume/createFromImage copies
 //     it into the pool. Dry-run and read-only accounts never start the stub.
+//     The stub refuses a wildcard bind (0.0.0.0, ::, empty host) unless
+//     AllowAnyAddr (cmx --serve-any-addr) is set, caps connections and
+//     stalled writes, and stops at once when Context is cancelled (cmx:
+//     Ctrl-C); cleanup then follows the usual keep-on-ambiguity rules.
 //
 // Storagecache.UploadImage (cloudpods image upload), ISO installs and
 // template storage pool management are not implemented.
