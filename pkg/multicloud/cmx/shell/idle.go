@@ -46,6 +46,12 @@ type InstanceIdleListOptions struct {
 	ActiveNet      float64 `help:"Active net KB/s" default:"50"`
 	ActiveDisk     float64 `help:"Active disk KB/s" default:"200"`
 	ActiveIops     float64 `help:"Active IOPS" default:"20"`
+	IdlePeakCpu    float64 `help:"Strict idle gate: max hourly CPU % (any hour at/above → not 闲置)" default:"20"`
+	IdlePeakNet    float64 `help:"Strict idle gate: max hourly net KB/s (1024 = 1 MB/s)" default:"1024"`
+	IdlePeakDisk   float64 `help:"Strict idle gate: max hourly disk KB/s (5120 = 5 MB/s)" default:"5120"`
+	SpikeCpu       float64 `help:"Same-hour veto spike: CPU %" default:"50"`
+	SpikeNet       float64 `help:"Same-hour veto spike: net KB/s" default:"1024"`
+	SpikeDisk      float64 `help:"Same-hour veto spike: disk KB/s" default:"5120"`
 	BaselineMult   float64 `help:"Adaptive baseline multiplier" default:"3"`
 	PatternMinProb float64 `help:"Min hour probability for window" default:"0.5"`
 	ScheduleMargin string  `help:"Schedule suggestion margin" default:"30m"`
@@ -53,6 +59,9 @@ type InstanceIdleListOptions struct {
 	Output         string  `help:"table|json" default:"table"`
 	Fixture        string  `help:"JSON fixture path (offline; no credentials needed)"`
 }
+
+// OfflineFixturePath implements OfflineFixtureOptions.
+func (o *InstanceIdleListOptions) OfflineFixturePath() string { return o.Fixture }
 
 func init() {
 	cmd := NewCommand("instance-idle")
@@ -117,6 +126,12 @@ func idleOptionsToConfig(args *InstanceIdleListOptions) (idle.Config, error) {
 	cfg.ActiveNetKBps = args.ActiveNet
 	cfg.ActiveDiskKBps = args.ActiveDisk
 	cfg.ActiveIops = args.ActiveIops
+	cfg.IdlePeakCPU = args.IdlePeakCpu
+	cfg.IdlePeakNetKBps = args.IdlePeakNet
+	cfg.IdlePeakDiskKBps = args.IdlePeakDisk
+	cfg.SpikeCPU = args.SpikeCpu
+	cfg.SpikeNetKBps = args.SpikeNet
+	cfg.SpikeDiskKBps = args.SpikeDisk
 	cfg.BaselineMult = args.BaselineMult
 	cfg.PatternMinProb = args.PatternMinProb
 	cfg.NoPrefilter = args.NoPrefilter

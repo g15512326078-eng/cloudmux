@@ -239,19 +239,19 @@ func iterResources[T cloudprovider.ICloudResource](
 // 	hostR(opts, command, desc, true, cb)
 // }
 
-// ArgsHaveFixture reports whether argv requests an offline --fixture run
-// (no cloud credentials required).
-func ArgsHaveFixture(args []string) bool {
-	for i, a := range args {
-		if a == "--fixture" {
-			return true
-		}
-		if len(a) > 10 && a[:10] == "--fixture=" {
-			return true
-		}
-		_ = i
-	}
-	return false
+// OfflineFixtureOptions is implemented by subcommand options that support an
+// offline --fixture run (currently only instance-idle-list).
+type OfflineFixtureOptions interface {
+	OfflineFixturePath() string
+}
+
+// WantsOfflineFixture reports whether the parsed options of the selected
+// subcommand request an offline --fixture run (no cloud credentials). Only
+// that subcommand's own parsed flag counts; other argv tokens are ignored
+// (N-d).
+func WantsOfflineFixture(suboptions interface{}) bool {
+	o, ok := suboptions.(OfflineFixtureOptions)
+	return ok && len(o.OfflineFixturePath()) > 0
 }
 
 type offlineProvider struct{}

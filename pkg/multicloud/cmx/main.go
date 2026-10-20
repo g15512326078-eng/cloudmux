@@ -86,7 +86,7 @@ func Main() {
 		return
 	}
 	var provider shell.ICloudProvider
-	if shell.ArgsHaveFixture(os.Args[1:]) {
+	if shell.WantsOfflineFixture(suboptions) {
 		provider = shell.NewOfflineProvider()
 	} else {
 		provider, e = shell.NewCloudProvider(options)
