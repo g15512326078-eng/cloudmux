@@ -56,8 +56,20 @@
 //     stalled writes, and stops at once when Context is cancelled (cmx:
 //     Ctrl-C); cleanup then follows the usual keep-on-ambiguity rules.
 //
-// Storagecache.UploadImage (cloudpods image upload), ISO installs and
-// template storage pool management are not implemented.
+//   - Windows ISO install (windowsimport.go, cmx
+//     image-import-windows-template): the install ISO (staged with the
+//     same stagers, ISOs only) and a generated answer ISO (unattend.go:
+//     autounattend.xml with virtio driver paths on the autoVirtio floppy,
+//     a disk-0 wipe of the new disk only, encoded Administrator password,
+//     Sysprep /generalize /oobe /shutdown; isowriter.go: pure-Go ISO 9660
+//     with Joliet) boot a temporary VM; once it shut itself off its media are
+//     disconnected and it is cloned with addVmTemplate opType=1, checked
+//     flat and recycled. Secrets never reach logs, plans or errors. From
+//     the start on a failure keeps the VM. The floppy layout, boot-order
+//     behaviour, firmware and disconnect bodies are UNVERIFIED on CAS.
+//
+// Storagecache.UploadImage (cloudpods image upload) and template storage
+// pool management are not implemented.
 //
 // A read-only cloud account (ProviderConfig.ReadOnly) is enforced in the
 // HTTP transport: every request other than GET/HEAD fails with
