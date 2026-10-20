@@ -116,6 +116,12 @@ type SHTTPUploadOptions struct {
 	// AllowAnyAddr permits a wildcard or empty serve host (0.0.0.0, ::,
 	// ":port"), which exposes the stub on every interface. Off by default.
 	AllowAnyAddr bool
+	// Sensitive marks a file that holds secrets (the Windows answer ISO).
+	// After createFromImage succeeded and the pool copy is listed, the
+	// staging copy /vms/nova/<uuid> is deleted (B-W3); whenever it has to
+	// be kept, the warning says it holds secrets and is also logged as an
+	// error at once.
+	Sensitive bool
 }
 
 func (o *SHTTPUploadOptions) String() string {
@@ -229,6 +235,9 @@ func (s *SHTTPStager) Plan(t SImportTarget) (*SImportStagePlan, error) {
 		"GET nova/image/ifExists; POST nova/download destFile=%s<uuid> (on HTTP 404: PUT cinder/download); GET nova/image/ifExists; "+
 		"POST cinder/volume/createFromImage name=%s location=%s",
 		s.Options.LocalPath, size, h, sum, s.Options.ServeAddr, s.Options.advertise(), NOVA_IMAGE_DIR, t.FileName, t.PoolName)
+	if s.Options.Sensitive {
+		detail += "; then (file holds secrets) GET storage/refresh + storage/volume to confirm the pool copy, DELETE nova/image/<uuid>, GET nova/image/ifExists to confirm it is gone"
+	}
 	return &SImportStagePlan{Step: "http-upload", Method: "HTTP-PULL", Detail: detail, Warnings: []string{
 		fmt.Sprintf("http mode: the CAS node must reach http://%s; the image is served over plain HTTP (Glance V1), protected only by a one-run token", s.Options.advertise()),
 	}}, nil
@@ -620,6 +629,9 @@ func (s *SHTTPStager) pull(ctx context.Context, t SImportTarget, stub *glanceStu
 	cli := t.cli
 	destFile := NOVA_IMAGE_DIR + stub.uuid
 	keepMsg := func(why string) string {
+		if s.Options.Sensitive {
+			return sensitiveStagingMsg(destFile, why)
+		}
 		return fmt.Sprintf("staging file %s was kept (%s); remove it on the CAS node by hand when no task uses it", destFile, why)
 	}
 
@@ -697,5 +709,42 @@ func (s *SHTTPStager) pull(ctx context.Context, t SImportTarget, stub *glanceStu
 	if _, err := cli.doAsync(httputils.POST, "cinder/volume/createFromImage", nil, jsonutils.Marshal(cfi)); err != nil {
 		return []string{keepMsg("createFromImage was sent; the pool copy may still read it")}, errors.Wrapf(err, "cinder/volume/createFromImage %s into %s", t.FileName, t.PoolName)
 	}
+	if s.Options.Sensitive {
+		return s.deleteSensitiveStaging(t, stub.uuid, destFile, checksum), nil
+	}
 	return []string{keepMsg("it is the source of createFromImage; once " + t.Path() + " is confirmed it is no longer needed")}, nil
+}
+
+// sensitiveStagingMsg is the loud form of the keep warning; it is logged
+// as an error right away (cmx: stderr) as well as returned.
+func sensitiveStagingMsg(destFile, why string) string {
+	msg := fmt.Sprintf("SECRET LEFT ON THE CAS NODE: staging file %s holds the encoded Administrator password and was NOT deleted (%s); delete it on the CAS node now (rm -f %s)", destFile, why, destFile)
+	log.Errorf("cas http upload: %s", msg)
+	return msg
+}
+
+// deleteSensitiveStaging removes /vms/nova/<uuid> after a successful
+// createFromImage (its task ended with success, so nothing reads the
+// staging file any more: the T1 rule "task ended, file is ours") once
+// the pool copy is listed, and checks it is gone.
+func (s *SHTTPStager) deleteSensitiveStaging(t SImportTarget, uuid, destFile, checksum string) []string {
+	cli := t.cli
+	if err := cli.RefreshStoragePool(t.HostId, t.PoolName); err != nil {
+		return []string{sensitiveStagingMsg(destFile, fmt.Sprintf("the pool copy %s could not be confirmed: refresh failed: %v", t.Path(), err))}
+	}
+	if _, err := cli.GetStorageVolume(t.HostId, t.PoolName, t.FileName); err != nil {
+		return []string{sensitiveStagingMsg(destFile, fmt.Sprintf("the pool copy %s is not listed (%v)", t.Path(), err))}
+	}
+	if err := cli.DeleteNovaImage(uuid); err != nil && errors.Cause(err) != cloudprovider.ErrNotFound {
+		return []string{sensitiveStagingMsg(destFile, fmt.Sprintf("DELETE nova/image/%s failed: %v", uuid, err))}
+	}
+	st, err := cli.NovaImageExists(uuid, s.size, checksum)
+	if err != nil {
+		return []string{sensitiveStagingMsg(destFile, fmt.Sprintf("DELETE nova/image/%s was sent but ifExists failed: %v", uuid, err))}
+	}
+	if st != NOVA_IMAGE_ABSENT {
+		return []string{sensitiveStagingMsg(destFile, fmt.Sprintf("ifExists still returns %d after DELETE nova/image/%s", st, uuid))}
+	}
+	log.Infof("cas http upload: deleted the staging copy %s (it held secrets)", destFile)
+	return nil
 }

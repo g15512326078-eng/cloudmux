@@ -55,6 +55,9 @@ type httpCAS struct {
 	beforeFetch        func(host string, port int) // runs before "CAS" fetches
 	afterExists        func()                      // runs after an ifExists that found the file
 	fetchQuiet         bool                        // a failed dial is expected
+	novaDeleteFail     bool                        // DELETE nova/image -> 500
+	novaDeleteNoop     bool                        // DELETE nova/image "succeeds" but keeps the file
+	cfiNoVolume        bool                        // createFromImage succeeds but lists no pool copy
 }
 
 func newHTTPCAS(t *testing.T) *httpCAS {
@@ -93,8 +96,19 @@ func (h *httpCAS) serve(w http.ResponseWriter, r *http.Request, path string, q u
 	case r.Method == "GET" && path == "hostpool/all":
 		reply(w, dict{"hostPool": []dict{{"id": 1, "name": "hp1"}}})
 	case r.Method == "GET" && path == "nova/image/ifExists":
-		// api.yaml A:45267: the file size if it exists, 0 otherwise
+		// api.yaml A:45267: the file size if it exists, 0 otherwise. N-A1:
+		// like the real call, it identifies the image by uuid, size and
+		// (when sent) checksum: a file that does not match is "absent".
 		data, ok := h.nova[q.Get("uuid")]
+		if ok {
+			sum := md5.Sum(data)
+			if q.Get("size") != fmt.Sprint(len(data)) || (q.Has("checksum") && q.Get("checksum") != "" && q.Get("checksum") != hex.EncodeToString(sum[:])) {
+				ok = false
+			}
+		}
+		if len(q.Get("uuid")) == 0 || len(q.Get("size")) == 0 {
+			h.t.Errorf("ifExists without uuid/size: %s", r.URL.RawQuery)
+		}
 		switch {
 		case h.existsAfter != nil && ok:
 			w.Write([]byte(*h.existsAfter))
@@ -159,7 +173,7 @@ func (h *httpCAS) serve(w http.ResponseWriter, r *http.Request, path string, q u
 		name, _ := obj.GetString("name")
 		if h.cfiFail || h.nova[img] == nil {
 			h.failTask[8012] = true
-		} else {
+		} else if !h.cfiNoVolume {
 			h.volumes = append(h.volumes, dict{"name": name, "format": "qcow2", "size": 2252.5, "storagePoolName": "defaultpool"})
 		}
 		h.task(w, 8012)
@@ -169,7 +183,14 @@ func (h *httpCAS) serve(w http.ResponseWriter, r *http.Request, path string, q u
 			w.WriteHeader(http.StatusNotFound)
 			return true
 		}
-		delete(h.nova, uuid)
+		if h.novaDeleteFail {
+			w.Header().Set("Error-Code", "999")
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+		if !h.novaDeleteNoop {
+			delete(h.nova, uuid)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case strings.HasPrefix(path, "message/"):
 		if id := strings.TrimPrefix(path, "message/"); id == "8010" && h.novaNever {
@@ -728,5 +749,99 @@ func TestGlanceStubWriteStall(t *testing.T) {
 	defer g.lock.Unlock()
 	if g.served != 0 {
 		t.Fatalf("served = %d", g.served)
+	}
+}
+
+// B-W3: a Sensitive file (the Windows answer ISO) does not stay in
+// /vms/nova/<uuid> once the pool copy is listed.
+func TestHTTPStagerSensitiveDeletesStaging(t *testing.T) {
+	h := newHTTPCAS(t)
+	var listens int32
+	st := httpStager(t, []byte("answer iso bytes"), &listens, nil)
+	st.Options.Sensitive = true
+	o := impOpts()
+	o.Stager = st
+	res, err := h.client(t).ImportQcow2AsTemplate(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := h.nova[h.lastUuid]; ok || !h.hasWrite("DELETE /cas/casrs/nova/image/"+h.lastUuid) {
+		t.Fatal("staging copy not deleted")
+	}
+	// order: createFromImage, refresh (confirm the copy), DELETE
+	w := strings.Join(h.writes(), "\n")
+	if strings.Index(w, "createFromImage") > strings.Index(w, "DELETE /cas/casrs/nova/image/") {
+		t.Fatalf("deleted before the copy:\n%s", w)
+	}
+	for _, wn := range res.Warnings {
+		if strings.Contains(wn, "/vms/nova/") {
+			t.Fatalf("unexpected staging warning %s", wn)
+		}
+	}
+	if p, _ := st.Plan(SImportTarget{FileName: "a.iso", PoolName: "p"}); !strings.Contains(p.Detail, "DELETE nova/image/<uuid>") {
+		t.Error("plan does not mention the deletion")
+	}
+}
+
+func TestHTTPStagerSensitiveLoudWhenKept(t *testing.T) {
+	for name, setup := range map[string]func(h *httpCAS){
+		"delete fails":          func(h *httpCAS) { h.novaDeleteFail = true },
+		"delete ineffective":    func(h *httpCAS) { h.novaDeleteNoop = true },
+		"pool copy missing":     func(h *httpCAS) { h.cfiNoVolume = true },
+		"createFromImage fails": func(h *httpCAS) { h.cfiFail = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHTTPCAS(t)
+			setup(h)
+			var listens int32
+			st := httpStager(t, []byte("answer iso bytes"), &listens, nil)
+			st.Options.Sensitive = true
+			o := impOpts()
+			o.Stager = st
+			res, _ := h.client(t).ImportQcow2AsTemplate(o)
+			found := false
+			for _, wn := range res.Warnings {
+				found = found || (strings.Contains(wn, "SECRET LEFT ON THE CAS NODE") && strings.Contains(wn, "/vms/nova/"+h.lastUuid))
+			}
+			if !found {
+				t.Fatalf("no loud warning naming the path: %v", res.Warnings)
+			}
+			if name == "pool copy missing" && h.hasWrite("DELETE /cas/casrs/nova/image/") {
+				t.Fatal("deleted the only copy")
+			}
+		})
+	}
+}
+
+// N-A1: the fake ifExists only matches the planned size and checksum, so
+// a wrong checksum after the download is caught (kept, not deleted).
+func TestHTTPStagerChecksumMismatchDetected(t *testing.T) {
+	for name, mutate := range map[string]func(s *SHTTPStager){
+		"checksum": func(s *SHTTPStager) { s.md5 = strings.Repeat("0", 32) },
+		"size":     func(s *SHTTPStager) { s.size++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHTTPCAS(t)
+			cli := h.client(t)
+			var listens int32
+			st := httpStager(t, []byte("image bytes"), &listens, nil)
+			target := SImportTarget{HostId: 1, HostIp: "127.0.0.1", HostPoolId: 1, PoolName: "defaultpool", PoolPath: "/vms/images", FileName: "x.qcow2", cli: cli}
+			if _, err := st.Plan(target); err != nil {
+				t.Fatal(err)
+			}
+			mutate(st)
+			h.fetchQuiet = true
+			warns, err := st.Stage(target)
+			if err == nil {
+				t.Fatal("want error")
+			}
+			if name == "checksum" && (!strings.Contains(err.Error(), "ifExists") || h.hasWrite("POST /cas/casrs/cinder/volume/createFromImage")) {
+				t.Fatalf("err %v", err)
+			}
+			if h.hasWrite("POST /cas/casrs/cinder/volume/createFromImage") {
+				t.Fatal("copied a mismatching file")
+			}
+			_ = warns
+		})
 	}
 }
