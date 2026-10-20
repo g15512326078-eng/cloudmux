@@ -60,6 +60,25 @@ type SMessage struct {
 	Result     int    `json:"result"`
 	FailMsg    string `json:"failMsg"`
 	EventType  int    `json:"eventType"`
+	// KeyValue carries extra failure context (H3C's nova plugin reads it
+	// next to failMsg when result != 0).
+	KeyValue []SMessageKeyValue `json:"keyValue"`
+}
+
+type SMessageKeyValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func (msg *SMessage) failText() string {
+	text := msg.FailMsg
+	if len(text) == 0 {
+		text = msg.Detail
+	}
+	for _, kv := range msg.KeyValue {
+		text += fmt.Sprintf(" [%s=%s]", kv.Key, kv.Value)
+	}
+	return text
 }
 
 const (
@@ -130,6 +149,12 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 			if errors.Cause(err) == cloudprovider.ErrNotFound {
 				return false, nil
 			}
+			// H3C's own clients keep polling on 403 (nova plugin
+			// wait_for_task, and its HTTP client retries 403): CAS returns
+			// it transiently, e.g. while the Digest nonce rolls over.
+			if errors.Cause(err) == cloudprovider.ErrNoPermission {
+				return false, nil
+			}
 			if ce, ok := errors.Cause(err).(*SCasError); ok && ce.StatusCode >= 500 {
 				return false, nil
 			}
@@ -145,11 +170,7 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 		case TASK_RESULT_SUCCESS:
 			return true, nil
 		case TASK_RESULT_FAILURE, TASK_RESULT_PARTIAL_SUCCESS:
-			text := msg.FailMsg
-			if len(text) == 0 {
-				text = msg.Detail
-			}
-			return false, errors.Errorf("cas task %d result=%d: %s", msg.MsgId, msg.Result, text)
+			return false, errors.Errorf("cas task %d result=%d: %s", msg.MsgId, msg.Result, msg.failText())
 		default:
 			return false, errors.Errorf("cas task %d unknown result=%d detail=%q", msg.MsgId, msg.Result, msg.Detail)
 		}
@@ -160,9 +181,15 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 	return last, nil
 }
 
+// MSG_ID_NO_TASK is the msgId CAS returns when a write finished inline
+// and no task was created (H3C's nova plugin skips waiting on "-1" after
+// PUT /vm/modify).
+const MSG_ID_NO_TASK = -1
+
 // doAsync issues a write that returns RsTaskMsg and waits for the task.
-// If the ack already has completed=true and msgId==0, it returns without
-// polling (UNVERIFIED sync path). Otherwise it requires a non-zero msgId.
+// msgId -1 means "done, no task" and returns at once. If the ack has
+// completed=true and msgId==0 it also returns without polling (UNVERIFIED
+// sync path). Otherwise it requires a positive msgId and polls it.
 func (cli *SCasClient) doAsync(method httputils.THttpMethod, res string, params url.Values, body jsonutils.JSONObject) (*SMessage, error) {
 	resp, err := cli.request(method, res, params, body)
 	if err != nil {
@@ -171,6 +198,12 @@ func (cli *SCasClient) doAsync(method httputils.THttpMethod, res string, params 
 	ack, err := parseTaskMsg(resp)
 	if err != nil {
 		return nil, err
+	}
+	if ack.MsgId == MSG_ID_NO_TASK {
+		return &SMessage{MsgId: ack.MsgId, Completed: true, Result: TASK_RESULT_SUCCESS, TargetId: ack.TargetId, TargetName: ack.TargetName}, nil
+	}
+	if ack.MsgId < 0 {
+		return nil, errors.Errorf("%s %s returned RsTaskMsg with msgId %d", method, res, ack.MsgId)
 	}
 	if ack.MsgId == 0 {
 		if ack.Completed {
