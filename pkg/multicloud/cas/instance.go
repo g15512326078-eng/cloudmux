@@ -672,14 +672,6 @@ func (self *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudpr
 	}, nil
 }
 
-func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
-	return errors.Wrap(cloudprovider.ErrNotImplemented, "AttachDisk")
-}
-
-func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
-	return errors.Wrap(cloudprovider.ErrNotImplemented, "DetachDisk")
-}
-
 // vm/detail network[].netType: 0 bridge, 1 NAT, 2 none, 3 passthrough,
 // 4 SR-IOV. Only "none" is skipped; 3/4 are kept unverified.
 const NIC_NET_TYPE_NONE = 2

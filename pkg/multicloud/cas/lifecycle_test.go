@@ -513,15 +513,3 @@ func TestCreateVMStopsIfRunning(t *testing.T) {
 		t.Errorf("after CreateVM status=%s, want VM_READY", vm.GetStatus())
 	}
 }
-
-func TestCreateVMRejectsDataDisks(t *testing.T) {
-	cli := &SCasClient{CasClientConfig: NewCasClientConfig("http://127.0.0.1", "u", "p")}
-	host := &SHost{Id: 1, zone: &SZone{region: &SRegion{cli: cli}}}
-	_, err := host.CreateVM(&cloudprovider.SManagedVMCreateConfig{
-		Name: "x", ExternalImageId: "1", Cpu: 1, MemoryMB: 512,
-		DataDisks: []cloudprovider.SDiskInfo{{SizeGB: 10}},
-	})
-	if errors.Cause(err) != cloudprovider.ErrNotImplemented {
-		t.Errorf("DataDisks: %v", err)
-	}
-}

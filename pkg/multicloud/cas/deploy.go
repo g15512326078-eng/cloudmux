@@ -119,10 +119,8 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 	if opts.Cpu <= 0 || opts.MemoryMB <= 0 {
 		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "Cpu and MemoryMB are required")
 	}
-	if len(opts.DataDisks) > 0 {
-		// VMRsDomainDeploy has no clear data-disk size mapping; cloudpods
-		// expects len(DataDisks)+1 disks after create and would fail later.
-		return nil, errors.Wrapf(cloudprovider.ErrNotImplemented, "CAS CreateVM does not support DataDisks (%d requested)", len(opts.DataDisks))
+	if _, err := dataDiskPlan(opts); err != nil {
+		return nil, err
 	}
 	body := &SDomainDeploy{
 		Id:           tplId,
@@ -176,6 +174,34 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 	return body, nil
 }
 
+type dataDiskSpec struct {
+	pool   string
+	sizeMB int64
+}
+
+// dataDiskPlan validates DataDisks before anything is deployed: each needs
+// a positive size and a pool (its own StorageExternalId, else the system
+// disk's). VMRsDomainDeploy has no data-disk size field, so data disks are
+// added after deploy with vm/addDevice (new file), the way H3C's nova
+// plugin attaches block devices after its deploy call.
+func dataDiskPlan(opts *cloudprovider.SManagedVMCreateConfig) ([]dataDiskSpec, error) {
+	ret := []dataDiskSpec{}
+	for i, d := range opts.DataDisks {
+		if d.SizeGB <= 0 {
+			return nil, errors.Wrapf(cloudprovider.ErrInputParameter, "data disk %d: SizeGB %d", i, d.SizeGB)
+		}
+		storageId := d.StorageExternalId
+		if len(storageId) == 0 {
+			storageId = opts.SysDisk.StorageExternalId
+		}
+		if len(storageId) == 0 {
+			return nil, errors.Wrapf(cloudprovider.ErrMissingParameter, "data disk %d: no storage", i)
+		}
+		ret = append(ret, dataDiskSpec{pool: storagePoolNameFromId(storageId), sizeMB: int64(d.SizeGB) * 1024})
+	}
+	return ret, nil
+}
+
 // DeployVM is POST /cas/casrs/vm/deploy. Returns the finished SMessage
 // (targetId is the new domain id when CAS fills it).
 func (cli *SCasClient) DeployVM(body *SDomainDeploy) (*SMessage, error) {
@@ -199,6 +225,32 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	}
 	vm.host = self
 	vm.region = self.zone.region
+	plan, _ := dataDiskPlan(opts)
+	if len(plan) > 0 && (vm.GetStatus() == api.VM_RUNNING || vm.GetStatus() == api.VM_SUSPEND) {
+		// add disks to a stopped guest only
+		if err := vm.StopVM(context.Background(), &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
+			return nil, errors.Wrapf(err, "StopVM before adding data disks (status was %s)", vm.GetStatus())
+		}
+	}
+	for i, d := range plan {
+		// On failure the deployed VM is left in place (never deleted
+		// here); the error names it so it can be cleaned up.
+		if err := vm.createDataDisk(d.pool, dataDiskFileName(opts.Name, i+1), d.sizeMB); err != nil {
+			return nil, errors.Wrapf(err, "vm %s (%s) deployed, but adding data disk %d (%d MB in %s) failed", vm.GetName(), vm.Uuid, i+1, d.sizeMB, d.pool)
+		}
+	}
+	if len(plan) > 0 {
+		if err := vm.Refresh(); err != nil {
+			return nil, errors.Wrapf(err, "Refresh after adding data disks")
+		}
+		disks, err := vm.getDisks()
+		if err != nil {
+			return nil, errors.Wrapf(err, "getDisks after adding data disks")
+		}
+		if len(disks) < len(plan)+1 {
+			return nil, errors.Errorf("vm %s has %d disks after adding %d data disks, want %d", vm.Uuid, len(disks), len(plan), len(plan)+1)
+		}
+	}
 	// cloudpods CAS guest driver expects VM_READY (shutOff) after create.
 	// api.yaml is silent on whether deploy leaves the guest running; if it
 	// does, stop so the initial-state wait succeeds.
