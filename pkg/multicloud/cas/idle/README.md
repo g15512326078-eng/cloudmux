@@ -6,8 +6,8 @@ Read-only scoring of CAS VMs into 闲置 / 定时使用 / 间歇使用 / 活跃.
 
 | Field | Meaning |
 |---|---|
-| `idle_score` (SCORE) | Headline score. Shown only for 闲置 / 闲置(关机). Other classes set `score_hidden=true` and render as `-` so a raw ~98 never sits next to 间歇使用. Rule: `IdleClassMinScore` in `score.go`. |
-| `raw_idle_score` (RAW) | Always the weighted 0–100 computation, regardless of class. Present in **both** table (RAW column) and JSON. |
+| `idle_score` (SCORE) | Headline score in the table. Shown only for 闲置 / 闲置(关机). Other classes set `score_hidden=true` and render as `-` so a raw ~98 never sits next to 间歇使用. Rule: `IdleClassMinScore` in `score.go`. |
+| `raw_idle_score` | Always the weighted 0–100 computation, regardless of class. **JSON only** (not a table column). |
 
 间歇使用 suggestion is always `保留/核实` (print-only) — never downsize or release.
 

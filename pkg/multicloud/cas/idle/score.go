@@ -27,7 +27,7 @@ import (
 // RawIdleScore always keeps the weighted computation.
 //   - 闲置 / 闲置(关机): IdleScore = RawIdleScore (ScoreHidden=false)
 //   - 间歇使用 / 定时使用 / 活跃 / 跳过 / 数据不足: IdleScore left unused,
-//     ScoreHidden=true → table and JSON consumers render SCORE as "-"
+//     ScoreHidden=true → table SCORE renders as "-"; JSON keeps raw_idle_score
 //     so a raw 98 never sits next to 间歇使用.
 const IdleClassMinScore = 80
 

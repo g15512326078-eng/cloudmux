@@ -33,12 +33,13 @@ func AnalyzeOne(vm VmInventory, b HourlyBundle, cfg Config, now time.Time) (Resu
 }
 
 // FormatTable renders a simple ASCII table for CLI output.
-// SCORE is the headline (hidden as "-" for non-idle classes); RAW is raw_idle_score.
+// SCORE is the headline (hidden as "-" for non-idle classes).
+// raw_idle_score is JSON-only (not a table column).
 func FormatTable(rows []Result) string {
 	if len(rows) == 0 {
 		return "(no VMs)\n"
 	}
-	hdr := "NAME\tUUID\tSTATUS\tCLASS\tSCORE\tRAW\tCONF\tCPU_AVG\tCPU_P95\tNET_P95\tWINDOW\tSUGGESTION\tREASONS\n"
+	hdr := "NAME\tUUID\tSTATUS\tCLASS\tSCORE\tCONF\tCPU_AVG\tCPU_P95\tNET_P95\tWINDOW\tSUGGESTION\tREASONS\n"
 	body := ""
 	for _, r := range rows {
 		reason := ""
@@ -46,8 +47,8 @@ func FormatTable(rows []Result) string {
 			reason = r.Reasons[0]
 		}
 		score := formatHeadlineScore(r)
-		body += fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%.0f\t%s\t%.1f\t%.1f\t%.1f\t%s\t%s\t%s\n",
-			r.Name, short(r.Uuid, 8), r.Status, r.Class, score, r.RawIdleScore, r.Confidence,
+		body += fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s\t%.1f\t%.1f\t%.1f\t%s\t%s\t%s\n",
+			r.Name, short(r.Uuid, 8), r.Status, r.Class, score, r.Confidence,
 			r.CpuAvg, r.CpuP95, r.NetP95, r.DetectedWindow, r.Suggestion, reason)
 	}
 	return hdr + body
