@@ -221,3 +221,40 @@ func TestAnswerISOContent(t *testing.T) {
 		t.Fatal("the answer ISO must carry the encoded secrets")
 	}
 }
+
+// N-W4: cached answer files and autologon are removed before Sysprep,
+// after CAStools.
+func TestUnattendCleansUpBeforeSysprep(t *testing.T) {
+	o := testUnattend()
+	data, err := o.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wellFormed(t, data)
+	s := string(data)
+	order := []string{
+		"CAS_tools_setup.exe /S",
+		`del /f /q C:\Windows\Panther\unattend*.xml C:\Windows\Panther\autounattend*.xml C:\Windows\Panther\Unattend\*.xml C:\Windows\System32\Sysprep\unattend.xml`,
+		`/v AutoAdminLogon /t REG_SZ /d 0 /f`,
+		`/v DefaultPassword /f`,
+		`/v AutoLogonCount /f`,
+		UNATTEND_SYSPREP_COMMAND,
+	}
+	last := -1
+	for _, want := range order {
+		i := strings.Index(s, want)
+		if i < 0 || i < last {
+			t.Fatalf("%q missing or out of order", want)
+		}
+		last = i
+	}
+	if !strings.Contains(s, `&#34;HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon&#34;`) {
+		t.Error("Winlogon key not quoted/escaped")
+	}
+	// orders are 1..n without gaps
+	for i := 1; i <= 6; i++ {
+		if !strings.Contains(s, fmt.Sprintf("<Order>%d</Order>", i)) {
+			t.Errorf("order %d missing", i)
+		}
+	}
+}

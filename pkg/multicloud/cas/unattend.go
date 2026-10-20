@@ -147,6 +147,18 @@ type SUnattendOptions struct {
 	ComputerName string
 }
 
+const unattendWinlogonKey = `"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"`
+
+// unattendCleanupCommands run after CAStools and right before Sysprep.
+// A failing command (e.g. a value that does not exist) does not stop the
+// following ones.
+var unattendCleanupCommands = []unattendCommand{
+	{Line: `cmd /c del /f /q C:\Windows\Panther\unattend*.xml C:\Windows\Panther\autounattend*.xml C:\Windows\Panther\Unattend\*.xml C:\Windows\System32\Sysprep\unattend.xml C:\Windows\System32\Sysprep\autounattend.xml`, Description: "Delete cached answer files (they hold the encoded password)"},
+	{Line: `reg add ` + unattendWinlogonKey + ` /v AutoAdminLogon /t REG_SZ /d 0 /f`, Description: "Disable autologon"},
+	{Line: `reg delete ` + unattendWinlogonKey + ` /v DefaultPassword /f`, Description: "Clear the autologon password"},
+	{Line: `reg delete ` + unattendWinlogonKey + ` /v AutoLogonCount /f`, Description: "Clear the autologon count"},
+}
+
 const (
 	DEFAULT_UNATTEND_LOCALE   = "en-US"
 	DEFAULT_UNATTEND_TIMEZONE = "China Standard Time"
@@ -402,6 +414,15 @@ func (o *SUnattendOptions) data(redact bool) *unattendData {
 		inst := strings.TrimLeft(o.CastoolsInstaller, `\`)
 		line := fmt.Sprintf(`cmd /c for %%d in (D E F G H I J K) do if exist %%d:\%s start "" /wait %%d:\%s %s`, inst, inst, o.CastoolsArgs)
 		d.Commands = append(d.Commands, unattendCommand{Order: order, Line: strings.TrimSpace(line), Description: "Install CAStools from the CAStools CD if mounted"})
+		order++
+	}
+	// N-W4: before Sysprep, remove the cached answer files (they carry the
+	// encoded password and would land in the template) and turn
+	// autologon off. UNVERIFIED (lab L-W5): that nothing else keeps a copy
+	// (Setup keeps the AutoLogon password as an LSA secret, cleared by
+	// Windows once LogonCount is used up).
+	for _, c := range unattendCleanupCommands {
+		d.Commands = append(d.Commands, unattendCommand{Order: order, Line: c.Line, Description: c.Description})
 		order++
 	}
 	d.Commands = append(d.Commands, unattendCommand{Order: order, Line: UNATTEND_SYSPREP_COMMAND, Description: "Generalize and shut down (CAS sees the VM shut off)"})
