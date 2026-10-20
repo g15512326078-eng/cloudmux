@@ -23,9 +23,11 @@ import (
 	"strings"
 
 	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/httputils"
 
+	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
 
@@ -385,13 +387,62 @@ func (cli *SCasClient) DeleteVmTemplate(id int64) error {
 
 // SaveImage clones the VM into a CAS template (opType 1, the VM is kept).
 // opts.Name is the template name, opts.Notes its description.
+//
+// S-3: the same rules as the import pipelines. The VM is re-read from
+// vm/vmList and must be shut off (a running guest gives an inconsistent
+// disk; a VM whose status cannot be read is refused). After the clone,
+// checkTemplateFlat must prove that no template disk has a backingStore
+// (a template from a linked-clone or overlay VM would depend on a file it
+// does not own). If it cannot, an error is returned and the template is
+// kept and named in it, never deleted.
 func (self *SInstance) SaveImage(opts *cloudprovider.SaveImageOptions) (cloudprovider.ICloudImage, error) {
 	if opts == nil {
 		return nil, errors.Wrap(cloudprovider.ErrMissingParameter, "SaveImageOptions")
 	}
-	tpl, err := self.region.cli.CreateVmTemplateFromVM(self, opts.Name, opts.Notes)
+	cli := self.region.cli
+	if err := cli.checkWritable("SaveImage"); err != nil {
+		return nil, err
+	}
+	cur, err := cli.findVMByUuid(self.Uuid)
+	if err != nil {
+		return nil, errors.Wrapf(err, "re-read VM %s before saving it as a template", self.Uuid)
+	}
+	if !cur.isLiveGuest() {
+		return nil, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s (%s) is recycled or not a CAS guest", cur.Name, cur.Uuid)
+	}
+	if cur.GetStatus() != api.VM_READY {
+		return nil, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s (%s) is %q; shut it off before saving it as a template", cur.Name, cur.Uuid, cur.VmStatus)
+	}
+	if cur.HostId == 0 {
+		return nil, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s (%s) lists no host; its template disks could not be checked", cur.Name, cur.Uuid)
+	}
+	tpl, err := cli.CreateVmTemplateFromVM(cur, opts.Name, opts.Notes)
 	if err != nil {
 		return nil, err
 	}
+	src := fmt.Sprintf("the disks of VM %s", cur.Name)
+	flat, err := cli.checkTemplateFlat(cur.HostId, tpl, src, src)
+	if err != nil {
+		return nil, errors.Wrap(err, "SaveImage")
+	}
+	log.Infof("cas SaveImage: template %d %q from VM %s: %s", tpl.Id, tpl.Name, cur.Uuid, flat)
 	return &SImage{SVmTemplate: *tpl, cache: self.region.getStoragecache()}, nil
+}
+
+// findVMByUuid re-reads one VM from the unfiltered vm/vmList.
+func (cli *SCasClient) findVMByUuid(uuid string) (*SInstance, error) {
+	if len(uuid) == 0 {
+		return nil, errors.Wrap(cloudprovider.ErrMissingParameter, "vm uuid")
+	}
+	vms, err := cli.listInstances(nil)
+	if err != nil {
+		return nil, err
+	}
+	for i := range vms {
+		if vms[i].Uuid == uuid {
+			vm := vms[i]
+			return &vm, nil
+		}
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "vm %s not in vm/vmList", uuid)
 }

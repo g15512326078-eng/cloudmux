@@ -51,6 +51,9 @@ type tplFake struct {
 	// infoRaw, when set, is the literal vmTemplateInfo body (for shapes
 	// such as "storages": null that dict marshalling cannot express).
 	infoRaw string
+	// S-3: the new template's disk (vmTemplate/storage + storage/volume)
+	tplBacking     interface{} // backingStore of the template disk ("" = flat; nil omits the key)
+	tplStorageFail bool
 }
 
 func (f *tplFake) writes() []string {
@@ -100,6 +103,25 @@ func (f *tplFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reply(w, tpl)
 	case r.Method == http.MethodGet && path == "vm/vmList":
 		reply(w, dict{"domain": append([]dict{}, f.vms...)})
+	case r.Method == http.MethodGet && path == "vmTemplate/storage":
+		if f.tplStorageFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		reply(w, dict{"data": []dict{
+			{"id": 1, "storeFile": "/vms/template/golden.qcow2", "device": "vda", "diskDevice": "disk", "driveType": "qcow2"},
+			{"id": 2, "storeFile": "/vms/isos/castools.iso", "device": "hdc", "diskDevice": "cdrom"},
+		}})
+	case r.Method == http.MethodGet && path == "storage/pool":
+		reply(w, dict{"storagePool": []dict{{"name": "defaultpool", "type": "dir", "path": "/vms/images"}}})
+	case r.Method == http.MethodGet && path == "host/id/1/storage":
+		reply(w, dict{"storagePool": []dict{{"name": "tplpool", "type": "netfs", "path": "/vms/template/"}}})
+	case r.Method == http.MethodGet && path == "storage/volume" && q.Get("poolName") == "tplpool":
+		v := dict{"name": "golden.qcow2", "format": "qcow2", "size": 20480}
+		if f.tplBacking != nil {
+			v["backingStore"] = f.tplBacking
+		}
+		reply(w, dict{"storageVolume": []dict{v}})
 	case r.Method == http.MethodPost && path == "vmTemplate/addVmTemplate":
 		f.templates = append(f.templates, dict{"id": 77, "name": q.Get("domainName"), "description": q.Get("desc"),
 			"cpu": 2, "memory": 2048, "system": 1, "storageCapacity": 20480, "deployed": false})
@@ -168,7 +190,8 @@ func jsonEqual(t *testing.T, a, b string) bool {
 }
 
 func newTplFake(t *testing.T) (*tplFake, *SRegion) {
-	f := &tplFake{t: t, polls: map[int64]int{}}
+	f := &tplFake{t: t, polls: map[int64]int{}, tplBacking: ""}
+	f.vms = []dict{{"id": 9, "uuid": "uuid-9", "name": "vm9", "vmStatus": "shutOff", "hostId": 1}}
 	f.templates = []dict{
 		{"id": 4, "name": "tmpName", "title": "tmpName", "description": "desc", "deployed": false,
 			"cpuSockets": 2, "cpuCores": 2, "memory": 4096, "memoryInit": 4, "memoryUnit": "GB", "system": 1,
@@ -431,5 +454,61 @@ func TestDeleteTemplateNotFoundMidFlight(t *testing.T) {
 	err := region.cli.DeleteVmTemplate(5)
 	if err == nil || !strings.Contains(err.Error(), "does not confirm it is gone") {
 		t.Fatalf("still listed after 404: err = %v, want error", err)
+	}
+}
+
+// S-3: SaveImage needs a shut-off VM, re-read from vm/vmList, and proves
+// the new template flat; otherwise it fails and keeps the template.
+func TestSaveImageRefusesUnlessShutOff(t *testing.T) {
+	for name, mod := range map[string]func(f *tplFake){
+		"running":  func(f *tplFake) { f.vms[0]["vmStatus"] = "running" },
+		"paused":   func(f *tplFake) { f.vms[0]["vmStatus"] = "paused" },
+		"unknown":  func(f *tplFake) { f.vms[0]["vmStatus"] = "ha_exception" },
+		"recycled": func(f *tplFake) { f.vms[0]["delTime"] = "2026-10-20T12:00:00+08:00" },
+		"gone":     func(f *tplFake) { f.vms = nil },
+		"no host":  func(f *tplFake) { delete(f.vms[0], "hostId") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, region := newTplFake(t)
+			mod(f)
+			// the cached object says shut off; only the fresh read counts
+			vm := &SInstance{Id: 9, Uuid: "uuid-9", Name: "vm9", VmStatus: "shutOff", HostId: 1, region: region}
+			if _, err := vm.SaveImage(&cloudprovider.SaveImageOptions{Name: "golden"}); err == nil {
+				t.Fatal("saved")
+			}
+			if w := f.writes(); len(w) != 0 {
+				t.Fatalf("writes %v", w)
+			}
+		})
+	}
+}
+
+func TestSaveImageChecksTemplateFlat(t *testing.T) {
+	for name, c := range map[string]struct {
+		mod  func(f *tplFake)
+		want error
+	}{
+		"backing file":   {func(f *tplFake) { f.tplBacking = "/vms/images/base.qcow2" }, ErrTemplateHasBackingFile},
+		"no key":         {func(f *tplFake) { f.tplBacking = nil }, ErrTemplateUnverified},
+		"non-string":     {func(f *tplFake) { f.tplBacking = 0 }, ErrTemplateUnverified},
+		"storage failed": {func(f *tplFake) { f.tplStorageFail = true }, ErrTemplateUnverified},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, region := newTplFake(t)
+			c.mod(f)
+			vm := &SInstance{Id: 9, Uuid: "uuid-9", Name: "vm9", region: region}
+			img, err := vm.SaveImage(&cloudprovider.SaveImageOptions{Name: "golden"})
+			if img != nil || errors.Cause(err) != c.want {
+				t.Fatalf("img %v err %v, want %v", img, err, c.want)
+			}
+			if !strings.Contains(err.Error(), `template 77 "golden" was created and is kept`) {
+				t.Fatalf("template not named: %v", err)
+			}
+			for _, w := range f.writes() {
+				if strings.HasPrefix(w, "DELETE") {
+					t.Fatalf("template deleted: %v", f.writes())
+				}
+			}
+		})
 	}
 }
