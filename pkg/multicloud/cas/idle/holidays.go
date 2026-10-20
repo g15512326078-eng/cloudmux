@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"os"
 	"time"
+
+	"yunion.io/x/log"
 )
 
 // holidayFileJSON is the schema for --holiday-file.
@@ -42,10 +44,12 @@ func loadHolidayCalendar(path string) holidayCalendar {
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		log.Warningf("cas idle: holiday file %q: %v (continuing without holidays)", path, err)
 		return nil
 	}
 	var raw holidayFileJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
+		log.Warningf("cas idle: holiday file %q: parse error: %v", path, err)
 		return nil
 	}
 	return &mapCalendar{days: raw}

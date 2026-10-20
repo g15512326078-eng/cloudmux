@@ -238,3 +238,26 @@ func iterResources[T cloudprovider.ICloudResource](
 // func HostR[T IHostBaseOptions](opts T, command string, desc string, cb func(cloudprovider.ICloudHost, T) error) {
 // 	hostR(opts, command, desc, true, cb)
 // }
+
+// ArgsHaveFixture reports whether argv requests an offline --fixture run
+// (no cloud credentials required).
+func ArgsHaveFixture(args []string) bool {
+	for i, a := range args {
+		if a == "--fixture" {
+			return true
+		}
+		if len(a) > 10 && a[:10] == "--fixture=" {
+			return true
+		}
+		_ = i
+	}
+	return false
+}
+
+type offlineProvider struct{}
+
+// NewOfflineProvider is a no-op ICloudProvider wrapper for --fixture runs.
+func NewOfflineProvider() ICloudProvider { return offlineProvider{} }
+
+func (offlineProvider) GetProvider() cloudprovider.ICloudProvider { return nil }
+func (offlineProvider) GetDefaultRegionId() string                { return "" }

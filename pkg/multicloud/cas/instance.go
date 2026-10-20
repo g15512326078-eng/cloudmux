@@ -61,7 +61,10 @@ type SInstance struct {
 	System       int     `json:"system"` // 0 Windows, 1 Linux, 2 BSD
 	OsDesc       string  `json:"osDesc"`
 	CreateDate   string  `json:"createDate"`
-	Type         int     `json:"type"` // 0 CAS, 1 VMware
+	// LastOffTime is epoch seconds (example 1608551670) when present.
+	// UNVERIFIED whether vmList returns it; summary/new does (api.yaml).
+	LastOffTime int64 `json:"lastOffTime"`
+	Type        int   `json:"type"` // 0 CAS, 1 VMware
 	// DelTime is DomainRsDomainvmList.delTime ("虚拟机逻辑回收时间").
 	// api.yaml types it as a date string; observed CAS returns integer 0
 	// (or "0") for live VMs. See isRecycled. POST /vm/restoreVm restores

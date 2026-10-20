@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -115,12 +116,8 @@ func TestIntermittentVM(t *testing.T) {
 	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
 	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
 	r := ScoreAndClassify(f, cfg, now, loc)
-	if r.Class != ClassIntermittent && r.Class != ClassIdle {
-		// low total activity may classify idle; with 2 busy hours over 14d R_total is tiny
-		t.Logf("class=%s (acceptable for near-idle burst)", r.Class)
-	}
-	if r.Class == ClassActive {
-		t.Fatalf("unexpected active: %v", r)
+	if r.Class != ClassIntermittent {
+		t.Fatalf("burst hours want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
 	}
 }
 
@@ -248,5 +245,137 @@ func TestResultJSONRoundTrip(t *testing.T) {
 	var back Result
 	if err := json.Unmarshal(raw, &back); err != nil || back.Class != ClassIdle {
 		t.Fatalf("%s %v", raw, err)
+	}
+}
+
+func TestWeeklySundayBatchNotIdle(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	// Weekly Sunday 02:00-04:00 at 90% CPU
+	b := synthHours(loc, 14, func(d, h int) (float64, float64, float64, float64) {
+		day := time.Date(2026, 3, 2+d, 0, 0, 0, 0, loc)
+		if day.Weekday() == time.Sunday && h >= 2 && h < 4 {
+			return 90, 5, 5, 1
+		}
+		return 0.4, 0.1, 0.1, 0
+	})
+	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	r := ScoreAndClassify(f, cfg, now, loc)
+	if r.Class != ClassIntermittent {
+		t.Fatalf("weekly batch want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
+	}
+}
+
+func TestMonthlySixHourBurstNotIdle(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	b := synthHours(loc, 14, func(d, h int) (float64, float64, float64, float64) {
+		if d == 5 && h >= 1 && h < 7 {
+			return 95, 10, 10, 2
+		}
+		return 0.3, 0.1, 0.1, 0
+	})
+	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	r := ScoreAndClassify(f, cfg, now, loc)
+	if r.Class != ClassIntermittent {
+		t.Fatalf("monthly burst want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
+	}
+}
+
+func TestSingleTwoHourBurstNotIdle(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	b := synthHours(loc, 14, func(d, h int) (float64, float64, float64, float64) {
+		if d == 8 && (h == 3 || h == 4) {
+			return 95, 8, 8, 1
+		}
+		return 0.3, 0.1, 0.1, 0
+	})
+	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	r := ScoreAndClassify(f, cfg, now, loc)
+	if r.Class != ClassIntermittent {
+		t.Fatalf("2h burst want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
+	}
+}
+
+func TestMissingCPUSeriesNotFakedIdle(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	start := time.Date(2026, 3, 2, 0, 0, 0, 0, loc)
+	b := HourlyBundle{}
+	for d := 0; d < 14; d++ {
+		for h := 0; h < 24; h++ {
+			ts := start.AddDate(0, 0, d).Add(time.Duration(h) * time.Hour)
+			b.Net = append(b.Net, HourlyPoint{Time: ts, Value: 0.1})
+			b.Disk = append(b.Disk, HourlyPoint{Time: ts, Value: 0.1})
+		}
+	}
+	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
+	if f.HasCpu {
+		t.Fatal("HasCpu should be false")
+	}
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	r := ScoreAndClassify(f, cfg, now, loc)
+	if r.Class == ClassIdle {
+		t.Fatalf("missing CPU must not be 闲置: %v gaps=%v", r.Reasons, r.DataGaps)
+	}
+	found := false
+	for _, g := range r.DataGaps {
+		if g == "cpu=n/a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected cpu=n/a in data_gaps: %v", r.DataGaps)
+	}
+	for _, reason := range r.Reasons {
+		if len(reason) >= 7 && reason[:7] == "LOW_CPU" {
+			t.Fatalf("must not claim LOW_CPU with faked 0%%: %v", r.Reasons)
+		}
+	}
+}
+
+func TestShutoffUnknownAgeNoRelease(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	vm := baseVM("shutOff")
+	// LastOff zero, not on zombie list
+	f := VmFeatures{Vm: vm, Coverage: 1}
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	r := ScoreAndClassify(f, cfg, now, loc)
+	if r.Class == ClassShutoffIdle {
+		t.Fatalf("unknown age must not be 闲置(关机): %v", r)
+	}
+	if r.Suggestion == "release/回收" {
+		t.Fatalf("suggestion=%q", r.Suggestion)
+	}
+	if r.Suggestion != "核实" {
+		t.Errorf("suggestion=%q want 核实", r.Suggestion)
+	}
+	if r.Confidence != ConfLow {
+		t.Errorf("confidence %s", r.Confidence)
+	}
+}
+
+func TestZombieListWithoutFabricatedLastOff(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	vm := baseVM("shutOff")
+	vm.OnZombieList = true
+	f := VmFeatures{Vm: vm, Coverage: 1}
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	r := ScoreAndClassify(f, cfg, now, loc)
+	if r.Class != ClassShutoffIdle {
+		t.Fatalf("class=%s", r.Class)
+	}
+	joined := strings.Join(r.Reasons, ";")
+	if !strings.Contains(joined, "ZOMBIE_LIST") {
+		t.Fatalf("want ZOMBIE_LIST reason, got %v", r.Reasons)
+	}
+	if strings.Contains(joined, "已关机 31") || strings.Contains(joined, "31 天") {
+		t.Fatalf("must not fabricate day count from zombie list: %v", r.Reasons)
 	}
 }

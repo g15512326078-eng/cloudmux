@@ -100,11 +100,10 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 		return r
 	}
 
-	// SHUTOFF_LONG
+	// SHUTOFF_LONG — only with a real lastOffTime age, or CAS zombie list.
 	if f.Vm.Status == "shutOff" {
-		offDays := 0.0
 		if !f.Vm.LastOff.IsZero() {
-			offDays = now.Sub(f.Vm.LastOff).Hours() / 24
+			offDays := now.Sub(f.Vm.LastOff).Hours() / 24
 			r.OffDays = offDays
 			if offDays >= cfg.OffDays {
 				r.Class = ClassShutoffIdle
@@ -117,13 +116,24 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 				r.Suggestion = "release/回收"
 				return r
 			}
-		} else {
+			// shut off but younger than OffDays — not idle-by-age
+		} else if f.Vm.OnZombieList {
 			r.Class = ClassShutoffIdle
-			r.IdleScore = 90
+			r.IdleScore = 95
 			r.Confidence = ConfMedium
-			r.ConfidenceValue = 0.55
-			r.Reasons = append(r.Reasons, "SHUTOFF_LONG: 已关机，时长未知（无 lastOffTime）")
+			r.ConfidenceValue = 0.7
+			r.Reasons = append(r.Reasons,
+				fmt.Sprintf("ZOMBIE_LIST: oneBtn/zombieVm 命中 (closeTimeout≥%.0fd)，无独立 lastOffTime", cfg.OffDays))
 			r.Suggestion = "release/回收"
+			r.DataGaps = append(r.DataGaps, "lastOffTime=n/a")
+			return r
+		} else {
+			// Unknown age, not on zombie list: never 闲置(关机)/release.
+			r.Class = ClassSkipped
+			r.Confidence = ConfLow
+			r.ConfidenceValue = 0.3
+			r.Reasons = append(r.Reasons, "SHUTOFF_AGE_UNKNOWN: 已关机但无 lastOffTime，且不在 zombieVm 列表 — 请核实")
+			r.Suggestion = "核实"
 			r.DataGaps = append(r.DataGaps, "lastOffTime=n/a")
 			return r
 		}
@@ -146,13 +156,19 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 		ok   bool
 	}
 	parts := []part{}
-	if cfg.Signals["cpu"] {
+	if cfg.Signals["cpu"] && f.HasCpu {
 		parts = append(parts, part{cfg.WeightCPU, subScore(f.CpuP95, cfg.CpuP95), true})
 		if f.CpuAvg < cfg.CpuAvg {
 			r.Reasons = append(r.Reasons, fmt.Sprintf(
 				"LOW_CPU: %.0f 天 CPU 均值 %.1f%% (<%.0f%%, cloudpods SCALE_DOWN 默认)，小时峰值 p95 %.1f%%",
 				cfg.Lookback.Hours()/24, f.CpuAvg, cfg.CpuAvg, f.CpuP95))
 		}
+	} else if cfg.Signals["cpu"] {
+		r.DataGaps = append(r.DataGaps, "cpu=n/a")
+		r.Reasons = append(r.Reasons, "NO_CPU_SERIES: 缺少 CPU 小时序列，不按 0% 计")
+	}
+	if f.DroppedBuckets > 0 {
+		r.DataGaps = append(r.DataGaps, fmt.Sprintf("dropped_buckets=%d", f.DroppedBuckets))
 	}
 	if cfg.Signals["net"] && f.HasNet {
 		parts = append(parts, part{cfg.WeightNet, subScore(f.NetP95, cfg.NetP95KBps), true})
@@ -221,9 +237,21 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 		}
 	}
 
-	// Score thresholds refine class when pattern said idle/intermittent
-	if !veto && r.Class == ClassIdle && r.IdleScore < 80 {
-		r.Class = ClassIntermittent
+	// Missing CPU series: never emit confident 闲置 (would be faking 0% CPU).
+	if cfg.Signals["cpu"] && !f.HasCpu && (r.Class == ClassIdle || r.Class == "") {
+		r.Class = ClassInsufficient
+		r.Suggestion = "keep"
+		r.Reasons = append(r.Reasons, "NO_CPU_SERIES: 无 CPU 数据，不做闲置判定")
+	}
+
+	// Score thresholds refine class when pattern said idle (spec §6.3):
+	// ≥80 idle, 50–80 intermittent, <50 active.
+	if !veto && r.Class == ClassIdle {
+		if r.IdleScore < 50 {
+			r.Class = ClassActive
+		} else if r.IdleScore < 80 {
+			r.Class = ClassIntermittent
+		}
 	}
 	if r.Class == "" {
 		if r.IdleScore >= 80 {
@@ -236,7 +264,7 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 	}
 
 	r.Suggestion = suggestionFor(r.Class, pat.DetectedWindow, cfg)
-	r.ConfidenceValue = confidence(f, cfg, scores)
+	r.ConfidenceValue = confidence(f, cfg, scores, now)
 	r.Confidence = confLabel(r.ConfidenceValue)
 	return r
 }
@@ -274,25 +302,42 @@ func confLabel(v float64) ConfidenceLabel {
 	return ConfLow
 }
 
-func confidence(f VmFeatures, cfg Config, scores []float64) float64 {
+func confidence(f VmFeatures, cfg Config, scores []float64, now time.Time) float64 {
 	coverage := clamp01(f.Coverage)
 	// signal completeness vs full weight set
-	full := cfg.WeightCPU + cfg.WeightNet + cfg.WeightDisk + cfg.WeightIops + cfg.WeightConn
+	// Denominator: enabled signals only (conn/pps/proc/lifecycle stubs that
+	// are off add no weight — D3/D4). Missing series reduce `have`.
+	full := 0.0
 	have := 0.0
 	if cfg.Signals["cpu"] {
-		have += cfg.WeightCPU
+		full += cfg.WeightCPU
+		if f.HasCpu {
+			have += cfg.WeightCPU
+		}
 	}
-	if cfg.Signals["net"] && f.HasNet {
-		have += cfg.WeightNet
+	if cfg.Signals["net"] {
+		full += cfg.WeightNet
+		if f.HasNet {
+			have += cfg.WeightNet
+		}
 	}
-	if cfg.Signals["disk"] && f.HasDisk {
-		have += cfg.WeightDisk
+	if cfg.Signals["disk"] {
+		full += cfg.WeightDisk
+		if f.HasDisk {
+			have += cfg.WeightDisk
+		}
 	}
-	if cfg.Signals["iops"] && f.HasIops {
-		have += cfg.WeightIops
+	if cfg.Signals["iops"] {
+		full += cfg.WeightIops
+		if f.HasIops {
+			have += cfg.WeightIops
+		}
 	}
-	if cfg.Signals["conn"] && f.HasConn {
-		have += cfg.WeightConn
+	if cfg.Signals["conn"] {
+		full += cfg.WeightConn
+		if f.HasConn {
+			have += cfg.WeightConn
+		}
 	}
 	completeness := 0.0
 	if full > 0 {
@@ -315,14 +360,19 @@ func confidence(f VmFeatures, cfg Config, scores []float64) float64 {
 	}
 	age := 1.0
 	if !f.Vm.CreateDate.IsZero() && cfg.Lookback > 0 {
-		age = clamp01(float64(time.Since(f.Vm.CreateDate)) / float64(cfg.Lookback))
+		age = clamp01(float64(now.Sub(f.Vm.CreateDate)) / float64(cfg.Lookback))
 	}
 	return coverage * completeness * agreement * age
 }
 
-// recurringSpikeVeto: true when ≥3 distinct calendar days show a
-// high-load spike hour (CPU≥50% or net≥1 MB/s), recorded in f.spike.
+// recurringSpikeVeto: true when the same clock-hour shows a high-load
+// spike (CPU≥50% or net≥1 MB/s) on ≥3 distinct calendar days (spec §6.2).
 func recurringSpikeVeto(f VmFeatures, cfg Config, loc *time.Location) bool {
+	for _, days := range f.spikeByHour {
+		if len(days) >= 3 {
+			return true
+		}
+	}
 	return len(f.spike) >= 3
 }
 

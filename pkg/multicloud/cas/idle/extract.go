@@ -20,22 +20,28 @@ import (
 )
 
 // HourlyBundle is the per-VM hourly series used for feature extraction.
+// Prefer hourly *max* when the API exposes it; otherwise the single rate
+// field (UNVERIFIED whether reports return avg or max — research §3.5).
 type HourlyBundle struct {
-	CPU  []HourlyPoint // prefer hourly max when available
+	CPU  []HourlyPoint
 	Mem  []HourlyPoint
 	Net  []HourlyPoint // rx+tx KB/s
 	Disk []HourlyPoint // r+w KB/s
 	Iops []HourlyPoint
 	Conn []HourlyPoint // flowLink; may be empty
+
+	// DroppedBuckets counts report points whose time label failed to parse.
+	DroppedBuckets int
 }
 
 // ExtractFeatures builds VmFeatures from inventory + hourly series.
 func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Location) VmFeatures {
-	f := VmFeatures{Vm: vm}
-	cpuVals := values(b.CPU)
-	f.CpuAvg, f.CpuP95, f.CpuMax = stats(cpuVals)
-	// For CPU avg matching cloudpods SCALE_DOWN, also accept mean of points
-	if len(cpuVals) > 0 {
+	f := VmFeatures{Vm: vm, DroppedBuckets: b.DroppedBuckets}
+
+	if len(b.CPU) > 0 {
+		f.HasCpu = true
+		cpuVals := values(b.CPU)
+		f.CpuAvg, f.CpuP95, f.CpuMax = stats(cpuVals)
 		sum := 0.0
 		for _, v := range cpuVals {
 			sum += v
@@ -53,8 +59,7 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 	}
 	if len(b.Iops) > 0 {
 		f.HasIops = true
-		f.IopsP95, _ = p95max(values(b.Iops))
-		_, f.IopsMax = p95max(values(b.Iops))
+		f.IopsP95, f.IopsMax = p95max(values(b.Iops))
 	}
 	if len(b.Conn) > 0 {
 		f.HasConn = true
@@ -63,21 +68,26 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 		f.ConnMax = -1
 	}
 
-	// Align hours on CPU series (primary); fall back to net/disk
-	base := b.CPU
-	if len(base) == 0 {
-		base = b.Net
+	// Align on the union of all series hours (spec D14).
+	index := map[int64]int{}
+	addHour := func(pts []HourlyPoint) {
+		for _, p := range pts {
+			h := p.Time.UTC().Truncate(time.Hour)
+			k := h.Unix()
+			if _, ok := index[k]; ok {
+				continue
+			}
+			index[k] = len(f.Hours)
+			f.Hours = append(f.Hours, h)
+			f.Active = append(f.Active, false)
+		}
 	}
-	if len(base) == 0 {
-		base = b.Disk
-	}
-	index := map[int64]int{} // unix hour → idx
-	for _, p := range base {
-		h := p.Time.UTC().Truncate(time.Hour)
-		index[h.Unix()] = len(f.Hours)
-		f.Hours = append(f.Hours, h)
-		f.Active = append(f.Active, false)
-	}
+	addHour(b.CPU)
+	addHour(b.Net)
+	addHour(b.Disk)
+	addHour(b.Iops)
+	addHour(b.Conn)
+
 	lookup := func(series []HourlyPoint, t time.Time) (float64, bool) {
 		for _, p := range series {
 			if p.Time.UTC().Truncate(time.Hour).Equal(t) {
@@ -87,25 +97,27 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 		return 0, false
 	}
 
-	// baseline p20 of CPU for adaptive threshold
-	baseCPU := percentile(sortedCopy(cpuVals), 20)
+	baseCPU := 0.0
+	if f.HasCpu {
+		baseCPU = percentile(sortedCopy(values(b.CPU)), 20)
+	}
 
-	spikeDays := map[string]bool{}
+	// Same clock-hour recurring spikes: hour-of-day → set of calendar days.
+	spikeByHour := map[int]map[string]bool{}
 	for i, h := range f.Hours {
-		cpu, _ := lookup(b.CPU, h)
+		cpu, hasCpu := lookup(b.CPU, h)
 		net, _ := lookup(b.Net, h)
 		disk, _ := lookup(b.Disk, h)
 		iops, _ := lookup(b.Iops, h)
 		conn, hasConn := lookup(b.Conn, h)
 
-		active := cpu >= cfg.ActiveCPU ||
+		active := (hasCpu && cpu >= cfg.ActiveCPU) ||
 			net >= cfg.ActiveNetKBps ||
 			disk >= cfg.ActiveDiskKBps ||
 			iops >= cfg.ActiveIops ||
 			(hasConn && conn >= cfg.ActiveConn)
-		if cfg.BaselineMult > 0 && baseCPU > 0 {
+		if cfg.BaselineMult > 0 && baseCPU > 0 && hasCpu {
 			if cpu < cfg.BaselineMult*baseCPU && net < cfg.ActiveNetKBps && disk < cfg.ActiveDiskKBps {
-				// below adaptive baseline and quiet net/disk → not active
 				if cpu < cfg.ActiveCPU {
 					active = active && (net >= cfg.ActiveNetKBps || disk >= cfg.ActiveDiskKBps || iops >= cfg.ActiveIops)
 				}
@@ -115,17 +127,33 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 		if active {
 			f.LastActive = h
 		}
-		// spike veto day markers
-		if cpu >= 50 || net >= 1024 { // 1 MB/s
-			spikeDays[h.In(loc).Format("2006-01-02")] = true
+		local := h.In(loc)
+		if (hasCpu && cpu >= 50) || net >= 1024 {
+			hod := local.Hour()
+			day := local.Format("2006-01-02")
+			if spikeByHour[hod] == nil {
+				spikeByHour[hod] = map[string]bool{}
+			}
+			spikeByHour[hod][day] = true
 		}
-		_ = index
 	}
-	days := make([]string, 0, len(spikeDays))
-	for d := range spikeDays {
-		days = append(days, d)
+
+	// Record days that participate in a same-hour spike seen on ≥1 day;
+	// veto logic requires ≥3 days for the *same* hour.
+	days := []string{}
+	seenDay := map[string]bool{}
+	for _, dm := range spikeByHour {
+		if len(dm) >= 3 {
+			for d := range dm {
+				if !seenDay[d] {
+					seenDay[d] = true
+					days = append(days, d)
+				}
+			}
+		}
 	}
 	f.SetSpikeDays(days)
+	f.spikeByHour = spikeByHour
 
 	expected := int(cfg.Lookback.Hours())
 	if expected <= 0 {
@@ -134,6 +162,8 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 	if expected > 0 {
 		f.Coverage = math.Min(1, float64(len(f.Hours))/float64(expected))
 	}
+	// Missing CPU does not zero-fill: HasCpu stays false and completeness
+	// / data_gaps handle it in ScoreAndClassify (no fake 0%).
 	return f
 }
 
@@ -147,7 +177,6 @@ func values(pts []HourlyPoint) []float64 {
 
 func sortedCopy(v []float64) []float64 {
 	out := append([]float64{}, v...)
-	// inline sort
 	for i := 1; i < len(out); i++ {
 		j := i
 		for j > 0 && out[j-1] > out[j] {

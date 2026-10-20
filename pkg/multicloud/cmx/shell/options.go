@@ -22,7 +22,7 @@ type GlobalOptions struct {
 
 	CloudEnv  string `help:"Access URL of the CAS CVM, e.g. http://cas.example.com:8080" default:"$CLOUDMUX_CLOUD_ENV" metavar:"CLOUDMUX_CLOUD_ENV"`
 	AccessKey string `help:"Username" default:"$CLOUDMUX_ACCESS_KEY" metavar:"CLOUDMUX_ACCESS_KEY"`
-	Secret    string `help:"Password" default:"$CLOUDMUX_SECRET" metavar:"CLOUDMUX_SECRET"`
+	Secret    string `help:"Password (prefer env CLOUDMUX_SECRET; avoid --secret in ps/history)" default:"$CLOUDMUX_SECRET" metavar:"CLOUDMUX_SECRET"`
 	Region    string `help:"Default region" default:"$CLOUDMUX_REGION" metavar:"CLOUDMUX_REGION" short-token:"r"`
 }
 

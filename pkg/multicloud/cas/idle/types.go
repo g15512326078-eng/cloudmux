@@ -56,19 +56,20 @@ type Series struct {
 
 // VmInventory is the static inventory row used by the analyzer.
 type VmInventory struct {
-	Id         int64     `json:"id"`
-	Uuid       string    `json:"uuid"`
-	Name       string    `json:"name"`
-	Title      string    `json:"title"`
-	Status     string    `json:"status"` // running / shutOff / ...
-	HostId     int64     `json:"host_id"`
-	HostPoolId int64     `json:"host_pool_id"`
-	CpuRate    float64   `json:"cpu_rate"`
-	MemRate    float64   `json:"mem_rate"`
-	UptimeMin  int64     `json:"uptime_min"` // -1 unknown
-	CreateDate time.Time `json:"create_date"`
-	LastOff    time.Time `json:"last_off"` // zero if unknown
-	Castools   string    `json:"castools"`
+	Id           int64     `json:"id"`
+	Uuid         string    `json:"uuid"`
+	Name         string    `json:"name"`
+	Title        string    `json:"title"`
+	Status       string    `json:"status"` // running / shutOff / ...
+	HostId       int64     `json:"host_id"`
+	HostPoolId   int64     `json:"host_pool_id"`
+	CpuRate      float64   `json:"cpu_rate"`
+	MemRate      float64   `json:"mem_rate"`
+	UptimeMin    int64     `json:"uptime_min"` // -1 unknown
+	CreateDate   time.Time `json:"create_date"`
+	LastOff      time.Time `json:"last_off"` // zero if unknown
+	Castools     string    `json:"castools"`
+	OnZombieList bool      `json:"on_zombie_list"` // from oneBtn/zombieVm; not a fabricated lastOff
 }
 
 // VmFeatures holds extracted hourly features for scoring/classification.
@@ -87,10 +88,13 @@ type VmFeatures struct {
 	ConnMax float64 // flowLink if present; -1 if n/a
 
 	Coverage float64 // 0-1 of expected hourly buckets
+	HasCpu   bool
 	HasConn  bool
 	HasIops  bool
 	HasNet   bool
 	HasDisk  bool
+
+	DroppedBuckets int // unparseable report bucket labels
 
 	// Active[i] aligns with Hours[i]
 	Hours  []time.Time
@@ -98,8 +102,10 @@ type VmFeatures struct {
 
 	LastActive time.Time
 
-	// spike marks calendar days (YYYY-MM-DD) with a recurring high-load hour.
-	spike map[string]bool
+	// spike marks calendar days that participate in a same-hour spike
+	// seen on ≥3 distinct days (spec §6.2).
+	spike       map[string]bool
+	spikeByHour map[int]map[string]bool // hour-of-day → days
 }
 
 // Reason is one machine-coded explanation line.
@@ -214,7 +220,10 @@ func DefaultConfig() Config {
 		ReportDiskIsKBps: true,
 		Signals: map[string]bool{
 			"cpu": true, "net": true, "disk": true, "iops": true,
-			"conn": true, "pps": false, "proc": false, "lifecycle": true,
+			// conn off until flowLink semantics verified (spec §6.2 / D3).
+			"conn": false, "pps": false, "proc": false,
+			// lifecycle stub does not count as enabled (D4).
+			"lifecycle": false,
 		},
 	}
 }

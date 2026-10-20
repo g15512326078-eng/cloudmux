@@ -247,8 +247,13 @@ func classifyPattern(f VmFeatures, cfg Config, loc *time.Location) patternStats 
 		ps.Reason = fmt.Sprintf("PATTERN_INTERMITTENT: 活跃占比 %.1f%%，无稳定周期", ps.RTotal*100)
 		return ps
 	}
-	ps.Class = ClassIdle
-	ps.Reason = "PATTERN_IDLE: 低活跃"
+	// Spec §7.3: ClassIdle only from the strict rule above. Anything that
+	// reached here with low R_total failed idle because of a busy day or
+	// peak (batch/burst) → intermittent, never idle.
+	ps.Class = ClassIntermittent
+	ps.Reason = fmt.Sprintf(
+		"PATTERN_INTERMITTENT: 低总活跃(%.1f%%)但有忙日或高峰(peak CPU %.0f%%)，非闲置",
+		ps.RTotal*100, f.CpuMax)
 	return ps
 }
 

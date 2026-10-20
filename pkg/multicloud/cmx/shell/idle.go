@@ -51,27 +51,28 @@ type InstanceIdleListOptions struct {
 	ScheduleMargin string  `help:"Schedule suggestion margin" default:"30m"`
 	NoPrefilter    bool    `help:"Disable oneBtn prefilter"`
 	Output         string  `help:"table|json" default:"table"`
-	Fixture        string  `help:"JSON fixture path (offline; skips live CAS)"`
+	Fixture        string  `help:"JSON fixture path (offline; no credentials needed)"`
 }
 
 func init() {
 	cmd := NewCommand("instance-idle")
 	NewCO[InstanceIdleListOptions](cmd).RawRun("list", "Detect idle/scheduled/intermittent CAS VMs (read-only)", func(cli ICloudProvider, args *InstanceIdleListOptions) error {
-		p, ok := cli.GetProvider().(*casprovider.SCasProvider)
-		if !ok {
-			return errors.Wrap(cloudprovider.ErrNotSupported, "instance-idle-list requires CAS provider")
-		}
 		cfg, err := idleOptionsToConfig(args)
 		if err != nil {
 			return err
 		}
-		ro := p.GetClient().ReadOnlyClone()
-
 		var rows []idle.Result
 		if len(args.Fixture) > 0 {
 			rows, err = analyzeIdleFixture(args.Fixture, cfg)
 		} else {
-			rows, err = idle.AnalyzeLive(ro, cfg, time.Now())
+			if cli == nil || cli.GetProvider() == nil {
+				return errors.Wrap(cloudprovider.ErrMissingParameter, "live scan needs credentials (or pass --fixture)")
+			}
+			p, ok := cli.GetProvider().(*casprovider.SCasProvider)
+			if !ok {
+				return errors.Wrap(cloudprovider.ErrNotSupported, "instance-idle-list requires CAS provider")
+			}
+			rows, err = idle.AnalyzeLive(p.GetClient().ReadOnlyClone(), cfg, time.Now())
 		}
 		if err != nil {
 			return err

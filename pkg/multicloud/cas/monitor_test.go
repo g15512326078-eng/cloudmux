@@ -116,3 +116,72 @@ func TestGetMetricsRequiresResourceId(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestEpochToTimeSecondsAndMillis(t *testing.T) {
+	sec := int64(1607412360) // api.yaml net example
+	got := epochToTime(sec)
+	want := time.Unix(sec, 0)
+	if !got.Equal(want) {
+		t.Fatalf("seconds: got %v want %v", got, want)
+	}
+	ms := int64(1604902850000) // api.yaml disk example
+	got = epochToTime(ms)
+	want = time.UnixMilli(ms)
+	if !got.Equal(want) {
+		t.Fatalf("ms: got %v want %v", got, want)
+	}
+}
+
+func TestGetMetricsTimestampFromSeconds(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cas/casrs/vm/uuid-sec/monitor", func(w http.ResponseWriter, r *http.Request) {
+		reply(w, dict{
+			"cpuRate": 5.0,
+			"net":     []dict{{"mac": "aa", "time": 1607412360, "readFlow": 1, "writeFlow": 1}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig(srv.URL, testUser, testPass)}
+	out, err := cli.GetMetrics(&cloudprovider.MetricListOptions{
+		ResourceType: cloudprovider.METRIC_RESOURCE_TYPE_SERVER,
+		ResourceId:   "uuid-sec",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Unix(1607412360, 0)
+	for _, m := range out {
+		if len(m.Values) == 0 {
+			continue
+		}
+		if !m.Values[0].Timestamp.Equal(want) {
+			t.Fatalf("%s ts=%v want %v (1970 bug?)", m.MetricType, m.Values[0].Timestamp, want)
+		}
+	}
+}
+
+func TestGetMetricsSkipsAbsentCpuMem(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/cas/casrs/vm/uuid-nocpu/monitor", func(w http.ResponseWriter, r *http.Request) {
+		// no cpuRate/memRate keys
+		reply(w, dict{
+			"net": []dict{{"mac": "aa", "time": 1700000000, "readFlow": 1, "writeFlow": 0}},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig(srv.URL, testUser, testPass)}
+	out, err := cli.GetMetrics(&cloudprovider.MetricListOptions{
+		ResourceType: cloudprovider.METRIC_RESOURCE_TYPE_SERVER,
+		ResourceId:   "uuid-nocpu",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range out {
+		if m.MetricType == cloudprovider.VM_METRIC_TYPE_CPU_USAGE || m.MetricType == cloudprovider.VM_METRIC_TYPE_MEM_USAGE {
+			t.Fatalf("must not emit %s when absent", m.MetricType)
+		}
+	}
+}

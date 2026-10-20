@@ -191,3 +191,21 @@ func (cli *SCasClient) GetZombieVms(closeTimeoutDays int) ([]SZombieVm, error) {
 	}
 	return page.Data, nil
 }
+
+// GetVmLastOffTime is GET vm/{id}/summary/new → lastOffTime.
+// Example values are epoch seconds; magnitude detection handles ms too.
+func (cli *SCasClient) GetVmLastOffTime(id int64) (time.Time, error) {
+	if id <= 0 {
+		return time.Time{}, nil
+	}
+	var sum struct {
+		LastOffTime int64 `json:"lastOffTime"`
+	}
+	if err := cli.get(fmt.Sprintf("vm/%d/summary/new", id), nil, &sum); err != nil {
+		return time.Time{}, err
+	}
+	if sum.LastOffTime <= 0 {
+		return time.Time{}, nil
+	}
+	return epochToTime(sum.LastOffTime), nil
+}

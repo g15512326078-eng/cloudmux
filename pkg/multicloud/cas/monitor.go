@@ -42,10 +42,6 @@ const (
 	// assumes the monitor field is already per-second (factor 1).
 	DISK_REQ_TO_IOPS = 1.0
 
-	// MONITOR_TIME_IS_MS: when true, net[].time / disk[].time are epoch
-	// milliseconds; when false, seconds. UNVERIFIED (research §3.5).
-	MONITOR_TIME_IS_MS = true
-
 	// IncludeFlowLinkAsTCPConnections maps flowLink →
 	// vm_netio.tcp_connections. flowLink semantics (host conntrack vs
 	// guest TCP sessions) are UNVERIFIED; set false to omit the metric.
@@ -56,11 +52,12 @@ const (
 // current sample of CPU, mem, NICs, disks and partitions. Units other
 // than cpuRate/memRate/partition.usage (%) are UNVERIFIED.
 type SVmMonitor struct {
-	CpuRate        float64 `json:"cpuRate"`
-	MemRate        float64 `json:"memRate"`
-	Status         string  `json:"status"`
-	Uptime         int64   `json:"uptime"` // minutes; -1 unknown
-	CastoolsStatus string  `json:"castoolsStatus"`
+	// CpuRate / MemRate are pointers so a missing JSON field is not faked as 0.
+	CpuRate        *float64 `json:"cpuRate"`
+	MemRate        *float64 `json:"memRate"`
+	Status         string   `json:"status"`
+	Uptime         int64    `json:"uptime"` // minutes; -1 unknown
+	CastoolsStatus string   `json:"castoolsStatus"`
 	// FlowLink is "虚拟机连接数". Semantics UNVERIFIED.
 	FlowLink float64 `json:"flowLink"`
 
@@ -117,6 +114,20 @@ func (cli *SCasClient) GetVmMonitor(uuid string) (*SVmMonitor, error) {
 	return out, nil
 }
 
+// epochToTime converts a CAS epoch that may be seconds or milliseconds.
+// Values below 1e12 are treated as seconds (e.g. 1607412360); larger as ms
+// (e.g. 1604902850000). api.yaml shows both forms on the same monitor payload.
+func epochToTime(t int64) time.Time {
+	if t <= 0 {
+		return time.Time{}
+	}
+	const msThreshold = int64(1_000_000_000_000) // ~2001-09-09 in ms
+	if t < msThreshold {
+		return time.Unix(t, 0)
+	}
+	return time.UnixMilli(t)
+}
+
 func monitorTimestamp(sample int64, nets []SVmMonitorNet, disks []SVmMonitorDisk) time.Time {
 	t := sample
 	if t == 0 {
@@ -134,12 +145,10 @@ func monitorTimestamp(sample int64, nets []SVmMonitorNet, disks []SVmMonitorDisk
 		}
 	}
 	if t == 0 {
+		// Current-sample endpoint; cloudmon polls every few minutes.
 		return time.Now()
 	}
-	if MONITOR_TIME_IS_MS {
-		return time.UnixMilli(t)
-	}
-	return time.Unix(t, 0)
+	return epochToTime(t)
 }
 
 func onePoint(id string, mt cloudprovider.TMetricType, unit string, ts time.Time, v float64) cloudprovider.MetricValues {
@@ -184,11 +193,11 @@ func (cli *SCasClient) getServerMetrics(opts *cloudprovider.MetricListOptions) (
 		return len(opts.MetricType) == 0 || opts.MetricType == mt
 	}
 
-	if want(cloudprovider.VM_METRIC_TYPE_CPU_USAGE) {
-		ret = append(ret, onePoint(id, cloudprovider.VM_METRIC_TYPE_CPU_USAGE, "%", ts, mon.CpuRate))
+	if want(cloudprovider.VM_METRIC_TYPE_CPU_USAGE) && mon.CpuRate != nil {
+		ret = append(ret, onePoint(id, cloudprovider.VM_METRIC_TYPE_CPU_USAGE, "%", ts, *mon.CpuRate))
 	}
-	if want(cloudprovider.VM_METRIC_TYPE_MEM_USAGE) {
-		ret = append(ret, onePoint(id, cloudprovider.VM_METRIC_TYPE_MEM_USAGE, "%", ts, mon.MemRate))
+	if want(cloudprovider.VM_METRIC_TYPE_MEM_USAGE) && mon.MemRate != nil {
+		ret = append(ret, onePoint(id, cloudprovider.VM_METRIC_TYPE_MEM_USAGE, "%", ts, *mon.MemRate))
 	}
 
 	var rxFlow, txFlow float64

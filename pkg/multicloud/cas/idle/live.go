@@ -35,6 +35,7 @@ func AnalyzeLive(cli *cas.SCasClient, cfg Config, now time.Time) ([]Result, erro
 	if cli == nil {
 		return nil, errors.Wrap(errors.ErrEmpty, "nil CAS client")
 	}
+	cli = cli.ReadOnlyClone()
 	if cfg.Lookback == 0 {
 		cfg = DefaultConfig()
 	}
@@ -85,9 +86,16 @@ func AnalyzeLive(cli *cas.SCasClient, cfg Config, now time.Time) ([]Result, erro
 	rows := make([]Result, 0, len(ins))
 	for i := range ins {
 		vm := inventoryFromInstance(&ins[i], loc)
-		if zombieUUIDs[vm.Uuid] && vm.Status == "shutOff" && vm.LastOff.IsZero() {
-			// no lastOffTime from vmList; treat as shutoff-long via zombie list
-			vm.LastOff = now.Add(-time.Duration(cfg.OffDays+1) * 24 * time.Hour)
+		if zombieUUIDs[vm.Uuid] {
+			vm.OnZombieList = true
+		}
+		// Fetch real lastOffTime for shut-off VMs when list row lacks it.
+		if vm.Status == "shutOff" && vm.LastOff.IsZero() && vm.Id > 0 {
+			if t, e := cli.GetVmLastOffTime(vm.Id); e == nil && !t.IsZero() {
+				vm.LastOff = t
+			} else if e != nil {
+				log.Debugf("cas idle: summary/new lastOffTime domain %d: %v", vm.Id, e)
+			}
 		}
 
 		if preBusy[vm.Uuid] || preBusy[strconv.FormatInt(vm.Id, 10)] {
@@ -130,6 +138,14 @@ func inventoryFromInstance(ins *cas.SInstance, loc *time.Location) VmInventory {
 	if t, e := timeutils.ParseTimeStr(ins.CreateDate); e == nil {
 		vm.CreateDate = t
 	}
+	if ins.LastOffTime > 0 {
+		// Reuse monitor epoch helper via local magnitude rule (seconds vs ms).
+		if ins.LastOffTime < 1_000_000_000_000 {
+			vm.LastOff = time.Unix(ins.LastOffTime, 0)
+		} else {
+			vm.LastOff = time.UnixMilli(ins.LastOffTime)
+		}
+	}
 	return vm
 }
 
@@ -147,6 +163,7 @@ func fetchHourlyBundle(cli *cas.SCasClient, domainId int64, start, end time.Time
 		for _, ev := range raw {
 			t, ok := parseBucketTime(ev.Name, casLoc)
 			if !ok {
+				b.DroppedBuckets++
 				continue
 			}
 			pts = append(pts, HourlyPoint{Time: t, Value: ev.Rate})

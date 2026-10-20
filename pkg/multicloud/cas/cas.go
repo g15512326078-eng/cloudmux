@@ -131,14 +131,18 @@ type SCasClient struct {
 	taskTimeout      time.Duration
 }
 
-// NewCasClient builds a client. Connectivity is checked on the first API
-// call (cloudmon/cmx), not at construction, so offline --fixture runs and
-// account wiring do not require a live CVM.
+// NewCasClient builds a client and probes GET /cas/casrs/host so wrong
+// Digest credentials fail at account create / GetProvider (cloudpods health).
+// Offline cmx --fixture runs must not call NewCasClient; see cmx Main.
 func NewCasClient(cfg *CasClientConfig) (*SCasClient, error) {
 	if cfg == nil {
 		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "nil CasClientConfig")
 	}
-	return &SCasClient{CasClientConfig: cfg}, nil
+	cli := &SCasClient{CasClientConfig: cfg}
+	if err := cli.Probe(); err != nil {
+		return nil, err
+	}
+	return cli, nil
 }
 
 // Probe checks Digest credentials with GET /cas/casrs/host.

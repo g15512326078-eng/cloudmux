@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"os"
 
+	_ "time/tzdata"
+
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/structarg"
 
@@ -83,9 +85,14 @@ func Main() {
 		fmt.Print(subparser.HelpString())
 		return
 	}
-	provider, e := shell.NewCloudProvider(options)
-	if e != nil {
-		showErrorAndExit(e)
+	var provider shell.ICloudProvider
+	if shell.ArgsHaveFixture(os.Args[1:]) {
+		provider = shell.NewOfflineProvider()
+	} else {
+		provider, e = shell.NewCloudProvider(options)
+		if e != nil {
+			showErrorAndExit(e)
+		}
 	}
 
 	if e := subcmd.Invoke(provider, suboptions); e != nil {
