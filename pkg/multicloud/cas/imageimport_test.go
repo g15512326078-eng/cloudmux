@@ -56,7 +56,8 @@ type impFake struct {
 	vmStatus       string // status of the new VM (default shutOff)
 	srcHidden      bool   // source not listed until refresh
 	poolPath       string // default /vms/images
-	failVMAddHTTP  bool   // vm/add -> 409 without creating a VM
+	vmAddStatus    int    // vm/add -> this HTTP status (no task)
+	vmAddStCreates bool   // ... and the VM was created anyway
 	failVMDelete   bool   // DELETE vm/delete/uuid -> 409
 	vmAdd500       bool   // vm/add -> 500 without creating a VM (ambiguous)
 	dupVMOnAdd     bool   // vm/add: a foreign VM with the same name appears too
@@ -67,6 +68,7 @@ type impFake struct {
 	tplLeftOnFail  bool   // addVmTemplate fails but leaves a template row
 	tplBacking     string // backingStore of the template's disk volume
 	tplStorageFail bool   // GET vmTemplate/storage -> 500
+	tplNoBackKey   bool   // template volume JSON has no backingStore key
 }
 
 func newImpFake(t *testing.T) *impFake {
@@ -139,11 +141,15 @@ func (f *impFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.t.Errorf("vmTemplate/storage vmId=%s", q.Get("vmId"))
 		}
 		reply(w, dict{"data": []dict{
-			{"id": 1, "storeFile": "/vms/template/ubuntu-2204.qcow2", "device": "disk", "format": "qcow2"},
-			{"id": 2, "storeFile": "", "device": "cdrom"},
+			// api.yaml RsTemplateStorage shape
+			{"id": 1, "storeFile": "/vms/template/ubuntu-2204.qcow2", "device": "vda", "diskDevice": "disk", "driveType": "qcow2", "format": "Read-Write"},
+			{"id": 2, "storeFile": "/vms/isos/castools.iso", "device": "hdc", "diskDevice": "cdrom", "format": "Read-Only"},
 		}})
 	case r.Method == "GET" && path == "storage/volume" && q.Get("poolName") == "tplpool":
 		v := dict{"name": "ubuntu-2204.qcow2", "format": "qcow2", "size": 3072, "backingStore": f.tplBacking}
+		if f.tplNoBackKey {
+			delete(v, "backingStore")
+		}
 		if name := q.Get("volumeName"); len(name) > 0 && name != v["name"] {
 			reply(w, dict{"storageVolume": []dict{}})
 			return
@@ -180,9 +186,12 @@ func (f *impFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.volumes = append(f.volumes, dict{"name": name, "format": "qcow2", "size": 3072, "backingStore": base, "users": f.overlayUsers})
 		f.task(w, 8001)
-	case r.Method == "POST" && path == "vm/add" && f.failVMAddHTTP:
+	case r.Method == "POST" && path == "vm/add" && f.vmAddStatus != 0:
+		if f.vmAddStCreates {
+			f.vms = append(f.vms, dict{"id": 50, "uuid": "uuid-tmp", "name": "tplimp-ubuntu-2204", "vmStatus": "shutOff", "hostId": 1})
+		}
 		w.Header().Set("Error-Code", "999")
-		w.WriteHeader(http.StatusConflict)
+		w.WriteHeader(f.vmAddStatus)
 	case r.Method == "POST" && path == "vm/add" && f.vmAdd500:
 		w.WriteHeader(http.StatusInternalServerError)
 	case r.Method == "POST" && path == "vm/add":
@@ -476,7 +485,11 @@ func TestImportQcow2CleanupOnFailure(t *testing.T) {
 		"template task fails":          {func(f *impFake) { f.failTask[8003] = true }, "DELETE /cas/casrs/vm/delete/uuid/uuid-tmp", true},
 		"unexpected vm status":         {func(f *impFake) { f.vmStatus = "weird" }, "DELETE /cas/casrs/vm/delete/uuid/uuid-tmp", true},
 		"vm booted by CAS":             {func(f *impFake) { f.vmStatus = "running" }, "DELETE /cas/casrs/vm/delete/uuid/uuid-tmp", true},
-		"vm/add http error, no VM":     {func(f *impFake) { f.failVMAddHTTP = true }, "DELETE /cas/casrs/storage/volume/delete/1/defaultpool/tplimp-ubuntu-2204-sys.qcow2", false},
+		"vm/add 400, no VM":            {func(f *impFake) { f.vmAddStatus = 400 }, "DELETE /cas/casrs/storage/volume/delete/1/defaultpool/tplimp-ubuntu-2204-sys.qcow2", false},
+		"vm/add 409 is ambiguous":      {func(f *impFake) { f.vmAddStatus = 409 }, "POST /cas/casrs/vm/add", false},
+		"vm/add 408 is ambiguous":      {func(f *impFake) { f.vmAddStatus = 408 }, "POST /cas/casrs/vm/add", false},
+		"vm/add 429 is ambiguous":      {func(f *impFake) { f.vmAddStatus = 429 }, "POST /cas/casrs/vm/add", false},
+		"vm/add 400 but VM exists":     {func(f *impFake) { f.vmAddStatus, f.vmAddStCreates = 400, true }, "POST /cas/casrs/vm/add", false},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -572,11 +585,11 @@ func TestImportQcow2AmbiguousAfterVMAddKeepsOverlay(t *testing.T) {
 	}
 }
 
-// B2: vm/add rejected (409), but CAS lists a user on the overlay: re-read
+// B2: vm/add rejected (400), but CAS lists a user on the overlay: re-read
 // before delete and refuse.
 func TestImportQcow2OverlayInUseNotDeleted(t *testing.T) {
 	f := newImpFake(t)
-	f.failVMAddHTTP = true
+	f.vmAddStatus = 400
 	f.overlayUsers = "someone"
 	_, err := f.client(t).ImportQcow2AsTemplate(impOpts())
 	if err == nil || !strings.Contains(err.Error(), "is used by someone; not deleting it") {
@@ -646,8 +659,12 @@ func TestImportQcow2TemplateBackedFails(t *testing.T) {
 		t.Fatalf("res = %+v", res)
 	}
 	w := f.writes()
-	if len(w) != 4 || !strings.HasPrefix(w[3], "DELETE /cas/casrs/vm/delete/uuid/uuid-tmp?") {
+	// R5: the temp VM stays live after a B1 error
+	if len(w) != 3 || hasDelete(w) {
 		t.Fatalf("writes = %v", w)
+	}
+	if !strings.Contains(err.Error(), "temporary VM tplimp-ubuntu-2204 (uuid-tmp) was kept live") {
+		t.Errorf("temp VM not named: %v", err)
 	}
 	f.assertSourceUntouched(t)
 }
@@ -662,6 +679,38 @@ func TestImportQcow2TemplateUnverifiedFails(t *testing.T) {
 	}
 	if res == nil || res.Template == nil {
 		t.Fatalf("res = %+v", res)
+	}
+	if w := f.writes(); hasDelete(w) || !strings.Contains(err.Error(), "kept live") {
+		t.Fatalf("temp VM must stay live: %v %v", w, err)
+	}
+}
+
+// R2: a template volume without a backingStore key is not "flat".
+func TestImportQcow2TemplateBackingKeyMissing(t *testing.T) {
+	f := newImpFake(t)
+	f.tplNoBackKey = true
+	_, err := f.client(t).ImportQcow2AsTemplate(impOpts())
+	if err == nil || !strings.Contains(err.Error(), "TemplateBackingUnverified") || !strings.Contains(err.Error(), "no backingStore field") {
+		t.Fatalf("err = %v", err)
+	}
+	if w := f.writes(); hasDelete(w) {
+		t.Fatalf("temp VM must stay live: %v", w)
+	}
+}
+
+// R1: classification uses diskDevice (api.yaml), not device.
+func TestTemplateStorageIsDisk(t *testing.T) {
+	for st, want := range map[STemplateStorage]bool{
+		{Device: "vda", DiskDevice: "disk"}:   true,
+		{Device: "hdc", DiskDevice: "cdrom"}:  false,
+		{Device: "fda", DiskDevice: "floppy"}: false,
+		{Device: "disk"}:                      true,
+		{Device: "vda"}:                       true, // no kind: checked (fails closed)
+		{}:                                    true,
+	} {
+		if got := st.isDisk(); got != want {
+			t.Errorf("%+v: %v", st, got)
+		}
 	}
 }
 
@@ -689,9 +738,14 @@ func TestIsDefiniteRejection(t *testing.T) {
 		err  error
 		want bool
 	}{
-		"409":       {&SCasError{StatusCode: 409}, true},
+		"409":       {&SCasError{StatusCode: 409}, false},
+		"408":       {&SCasError{StatusCode: 408}, false},
+		"429":       {&SCasError{StatusCode: 429}, false},
+		"499":       {&SCasError{StatusCode: 499}, false},
 		"400":       {errors.Wrap(&SCasError{StatusCode: 400}, "x"), true},
-		"404":       {errors.Wrap(cloudprovider.ErrNotFound, "x"), true},
+		"403":       {&SCasError{StatusCode: 403}, true},
+		"404 raw":   {&SCasError{StatusCode: 404}, true},
+		"mapped":    {errors.Wrap(cloudprovider.ErrNotFound, "x"), false},
 		"read-only": {errors.Wrap(cloudprovider.ErrAccountReadOnly, "x"), true},
 		"500":       {&SCasError{StatusCode: 500}, false},
 		"timeout":   {errors.Wrap(cloudprovider.ErrTimeout, "x"), false},

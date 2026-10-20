@@ -265,58 +265,21 @@ func (cli *SCasClient) url(res string, params url.Values) string {
 }
 
 func (cli *SCasClient) request(method httputils.THttpMethod, res string, params url.Values, body jsonutils.JSONObject) (jsonutils.JSONObject, error) {
-	u := cli.url(res, params)
-	var reader io.Reader
+	var raw []byte
 	if body != nil {
-		reader = strings.NewReader(body.String())
+		raw = []byte(body.String())
 	}
-	req, err := http.NewRequestWithContext(context.Background(), string(method), u, reader)
+	data, ce, err := cli.rawRequest(method, res, params, raw, "application/json; charset=UTF-8")
 	if err != nil {
-		return nil, errors.Wrapf(err, "NewRequest %s %s", method, u)
+		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	if ce != nil {
+		return nil, ce.mapped()
 	}
-	resp, err := cli.getDefaultClient().Do(req)
-	if err != nil {
-		// unwrap *url.Error so causes such as ErrAccountReadOnly survive
-		if ue, ok := err.(*url.Error); ok {
-			err = ue.Err
-		}
-		return nil, errors.Wrapf(err, "%s %s", method, u)
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, errors.Wrapf(err, "read body %s %s", method, u)
-	}
-	if cli.debug {
-		log.Debugf("%s %s -> %d %s", method, u, resp.StatusCode, redactBody(data))
-	}
-	if resp.StatusCode >= 300 {
-		ce := &SCasError{
-			Method:       string(method),
-			Url:          u,
-			StatusCode:   resp.StatusCode,
-			ErrorCode:    resp.Header.Get("Error-Code"),
-			ErrorMessage: decodeErrorMessage(resp.Header.Get("Error-Message"), resp.Header.Get("charset")),
-			Body:         redactBody(data),
-		}
-		switch resp.StatusCode {
-		case http.StatusNotFound:
-			return nil, errors.Wrap(cloudprovider.ErrNotFound, ce.Error())
-		case http.StatusUnauthorized:
-			return nil, errors.Wrap(cloudprovider.ErrInvalidAccessKey, ce.Error())
-		case http.StatusForbidden:
-			return nil, errors.Wrap(cloudprovider.ErrNoPermission, ce.Error())
-		case http.StatusConflict:
-			if ce.isNotFound() {
-				return nil, errors.Wrap(cloudprovider.ErrNotFound, ce.Error())
-			}
-		}
-		return nil, ce
-	}
+	return parseJSONBody(method, cli.url(res, params), data)
+}
+
+func parseJSONBody(method httputils.THttpMethod, u string, data []byte) (jsonutils.JSONObject, error) {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 {
 		// Never turn an empty 200 into {}: a zero-value VM detail would make
@@ -332,6 +295,72 @@ func (cli *SCasClient) request(method httputils.THttpMethod, res string, params 
 		return nil, errors.Wrapf(err, "parse json %s %s", method, u)
 	}
 	return obj, nil
+}
+
+// mapped turns an HTTP error status into the cloudprovider error causes
+// callers test for (404/401/403, and 409 with a not-found code).
+func (ce *SCasError) mapped() error {
+	switch ce.StatusCode {
+	case http.StatusNotFound:
+		return errors.Wrap(cloudprovider.ErrNotFound, ce.Error())
+	case http.StatusUnauthorized:
+		return errors.Wrap(cloudprovider.ErrInvalidAccessKey, ce.Error())
+	case http.StatusForbidden:
+		return errors.Wrap(cloudprovider.ErrNoPermission, ce.Error())
+	case http.StatusConflict:
+		if ce.isNotFound() {
+			return errors.Wrap(cloudprovider.ErrNotFound, ce.Error())
+		}
+	}
+	return ce
+}
+
+// rawRequest sends body (with contentType when non-empty) and returns the
+// response body of a 2xx, or the unmapped *SCasError for status >= 300, or
+// a transport error. Callers that need the exact status (for example to
+// tell a missing endpoint, HTTP 404, from a business error) use it
+// directly; request() maps the error.
+func (cli *SCasClient) rawRequest(method httputils.THttpMethod, res string, params url.Values, body []byte, contentType string) ([]byte, *SCasError, error) {
+	u := cli.url(res, params)
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(context.Background(), string(method), u, reader)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "NewRequest %s %s", method, u)
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := cli.getDefaultClient().Do(req)
+	if err != nil {
+		// unwrap *url.Error so causes such as ErrAccountReadOnly survive
+		if ue, ok := err.(*url.Error); ok {
+			err = ue.Err
+		}
+		return nil, nil, errors.Wrapf(err, "%s %s", method, u)
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "read body %s %s", method, u)
+	}
+	if cli.debug {
+		log.Debugf("%s %s -> %d %s", method, u, resp.StatusCode, redactBody(data))
+	}
+	if resp.StatusCode >= 300 {
+		return nil, &SCasError{
+			Method:       string(method),
+			Url:          u,
+			StatusCode:   resp.StatusCode,
+			ErrorCode:    resp.Header.Get("Error-Code"),
+			ErrorMessage: decodeErrorMessage(resp.Header.Get("Error-Message"), resp.Header.Get("charset")),
+			Body:         redactBody(data),
+		}, nil
+	}
+	return data, nil, nil
 }
 
 func (cli *SCasClient) get(res string, params url.Values, retVal interface{}) error {

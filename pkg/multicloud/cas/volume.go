@@ -80,6 +80,25 @@ func (cli *SCasClient) GetStorageVolumes(hostId int64, poolName, volName string)
 	return ret, nil
 }
 
+// getStorageVolumeRaw is GetStorageVolume without decoding, so callers can
+// tell a missing field from an empty one.
+func (cli *SCasClient) getStorageVolumeRaw(hostId int64, poolName, volName string) (jsonutils.JSONObject, error) {
+	params := url.Values{}
+	params.Set("hostId", fmt.Sprintf("%d", hostId))
+	params.Set("poolName", poolName)
+	params.Set("volumeName", volName)
+	items, err := cli.listPagedBy("storage/volume", params, "storageVolume", "name", "pageSize")
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		if n, _ := items[i].GetString("name"); n == volName {
+			return items[i], nil
+		}
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "volume %s in pool %s on host %d", volName, poolName, hostId)
+}
+
 // GetStorageVolume finds one volume by exact name in a pool.
 func (cli *SCasClient) GetStorageVolume(hostId int64, poolName, volName string) (*SStorageVolume, error) {
 	vols, err := cli.GetStorageVolumes(hostId, poolName, volName)

@@ -59,6 +59,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"net/http"
 	"net/url"
 	"path"
 	"regexp"
@@ -429,19 +430,32 @@ func overlayCapacityMB(sizeMB float64) int64 {
 }
 
 // isDefiniteRejection is true when a write was certainly not carried out:
-// blocked before sending (read-only guard) or answered with HTTP 4xx (no
-// task was created). 5xx, transport errors, task failures and timeouts
-// are ambiguous: CAS may have acted.
+// blocked before sending (read-only guard), or an unmapped *SCasError (see
+// rawRequest) whose status isDefiniteStatus. Everything else is ambiguous:
+// CAS may have acted. That includes mapped causes such as ErrNotFound,
+// which can come from a 409 business error.
 func isDefiniteRejection(err error) bool {
 	cause := errors.Cause(err)
-	switch cause {
-	case cloudprovider.ErrAccountReadOnly, cloudprovider.ErrNotFound, cloudprovider.ErrNoPermission, cloudprovider.ErrInvalidAccessKey:
+	if cause == cloudprovider.ErrAccountReadOnly {
 		return true
 	}
 	if ce, ok := cause.(*SCasError); ok {
-		return ce.StatusCode >= 400 && ce.StatusCode < 500
+		return isDefiniteStatus(ce.StatusCode)
 	}
 	return false
+}
+
+// isDefiniteStatus: a 4xx that means the request was refused before any
+// work. Excluded: 408 Request Timeout, 429 Too Many Requests and 499
+// (client closed), which a proxy can send after forwarding; and 409, the
+// CAS business error, because it is unverified that CAS never answers 409
+// after it has already created the domain.
+func isDefiniteStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests, 499:
+		return false
+	}
+	return code >= 400 && code < 500
 }
 
 func isTimeout(err error) bool {
@@ -624,6 +638,16 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 			} else {
 				res.add("cleanup-delete-temp-vm", "DELETE", "vm/delete/uuid/"+vm.Uuid, "recycle bin; the overlay stays with the recycled VM", true, true)
 			}
+		case overlayCreated && vmAddSent:
+			// R3: even after a definite rejection, keep the overlay if any
+			// VM with our name exists or the list cannot be read.
+			if vms, err := c.findVMsByName(opts.TempVMName); err != nil {
+				errs = append(errs, byHand("vm/add was rejected but VMs cannot be listed (%v); the overlay was kept", err))
+			} else if len(vms) > 0 {
+				errs = append(errs, byHand("vm/add was rejected but %d VM(s) named %s exist; the overlay was kept", len(vms), opts.TempVMName))
+			} else if err := c.deleteImportOverlay(res, host.Id, pool.Name, overlay, overlayPath, fileName); err != nil {
+				errs = append(errs, err)
+			}
 		case overlayCreated:
 			if err := c.deleteImportOverlay(res, host.Id, pool.Name, overlay, overlayPath, fileName); err != nil {
 				errs = append(errs, err)
@@ -650,9 +674,17 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	}
 
 	vmAddSent = true
-	addResp, err := c.request(httputils.POST, "vm/add", nil, jsonutils.Marshal(addBody))
+	// rawRequest keeps the exact HTTP status for isDefiniteRejection
+	addData, addErr, err := c.rawRequest(httputils.POST, "vm/add", nil, []byte(jsonutils.Marshal(addBody).String()), "application/json; charset=UTF-8")
+	if err == nil && addErr != nil {
+		err = addErr
+	}
 	if err != nil {
 		vmAddRejected = isDefiniteRejection(err)
+		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
+	}
+	addResp, err := parseJSONBody(httputils.POST, "vm/add", addData)
+	if err != nil {
 		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
 	}
 	if _, err := c.waitAsync(httputils.POST, "vm/add", addResp); err != nil {
@@ -707,11 +739,14 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	res.add("clone-to-template", "POST", "vmTemplate/addVmTemplate", fmt.Sprintf("id=%d&domainName=%s&opType=%s", vm.Id, opts.TemplateName, TEMPLATE_OP_CLONE), true, true)
 
 	errs := []error{}
-	if detail, err := c.checkTemplateFlat(host.Id, tpl, srcPath, overlayPath); err != nil {
-		errs = append(errs, err)
-	} else {
-		res.add("check-template-flat", "GET", fmt.Sprintf("vmTemplate/storage?vmId=%d", tpl.Id), detail, false, true)
+	detail, err := c.checkTemplateFlat(host.Id, tpl, srcPath, overlayPath)
+	if err != nil {
+		// R5: the template may depend on the overlay, and a recycle-bin
+		// purge (retention) would remove it without anyone acting. Keep
+		// the temp VM live so the overlay stays referenced.
+		return res, errors.NewAggregate([]error{err, errors.Errorf("temporary VM %s (%s) was kept live (not recycled) with its overlay %s, because the template may depend on them; delete it only after the template disk is confirmed flat (qemu-img info --backing-chain)", vm.Name, vm.Uuid, overlayPath)})
 	}
+	res.add("check-template-flat", "GET", fmt.Sprintf("vmTemplate/storage?vmId=%d", tpl.Id), detail, false, true)
 
 	if err := vm.DeleteVM(context.Background()); err != nil {
 		errs = append(errs, errors.Wrapf(err, "template %d created, but deleting temporary VM %s (%s) failed; remove it by hand", tpl.Id, vm.Name, vm.Uuid))
@@ -763,13 +798,28 @@ func (c *SCasClient) deleteImportOverlay(res *SImageImportResult, hostId int64, 
 }
 
 // STemplateStorage is api.yaml RsTemplateStorage, an element of
-// GET vmTemplate/storage?vmId=<template id> (key "data").
+// GET vmTemplate/storage?vmId=<template id> (key "data"). Per api.yaml:
+// diskDevice is the kind ("disk cdrom floppy"), device the device name
+// ("hda hdb hdc"), driveType the volume type ("如raw"), and format the
+// access mode ("Read-Write Read-ForceWrite Read-Only"), not a file format.
 type STemplateStorage struct {
-	Id        int64   `json:"id"`
-	StoreFile string  `json:"storeFile"`
-	Capacity  float64 `json:"capacity"`
-	Device    string  `json:"device"`
-	Format    string  `json:"format"`
+	Id         int64   `json:"id"`
+	StoreFile  string  `json:"storeFile"`
+	Capacity   float64 `json:"capacity"`
+	Device     string  `json:"device"`
+	DiskDevice string  `json:"diskDevice"`
+	DriveType  string  `json:"driveType"`
+	Format     string  `json:"format"`
+}
+
+// isDisk classifies by diskDevice ("disk", "cdrom", "floppy"). Without it
+// (device is only a name like vda/hdc) the entry is checked as a disk, so
+// an unknown shape fails closed (Unverified) rather than being skipped.
+func (st *STemplateStorage) isDisk() bool {
+	if kind := strings.ToLower(strings.TrimSpace(st.DiskDevice)); len(kind) > 0 {
+		return kind == "disk"
+	}
+	return true
 }
 
 func (cli *SCasClient) GetVmTemplateStorages(id int64) ([]STemplateStorage, error) {
@@ -823,7 +873,7 @@ func (c *SCasClient) checkTemplateFlat(hostId int64, tpl *SVmTemplate, srcPath, 
 	}
 	checked := []string{}
 	for _, st := range storages {
-		if len(st.Device) > 0 && st.Device != "disk" {
+		if !st.isDisk() {
 			continue
 		}
 		if len(st.StoreFile) == 0 {
@@ -841,12 +891,17 @@ func (c *SCasClient) checkTemplateFlat(hostId int64, tpl *SVmTemplate, srcPath, 
 		if err != nil {
 			return "", unverified("no pool on host %d covers %s (%v)", hostId, dir, err)
 		}
-		vol, err := c.GetStorageVolume(hostId, pool.Name, name)
+		raw, err := c.getStorageVolumeRaw(hostId, pool.Name, name)
 		if err != nil {
 			return "", unverified("volume %s in pool %s could not be read (%v)", name, pool.Name, err)
 		}
-		if b := strings.TrimSpace(vol.BackingStore); len(b) > 0 {
-			return "", errors.Wrapf(ErrTemplateHasBackingFile, "%s, but its disk %s/%s has backing file %s, so the template depends on it (source %s, overlay %s): do NOT delete, move or overwrite those files, and do not purge the recycled temp VM. addVmTemplate did not flatten; the fallback is a full copy (vm/clone cloneMode=0), not implemented yet", keep, path.Clean(dir), name, b, srcPath, overlayPath)
+		// R2: a missing key is not "flat"
+		if !raw.Contains("backingStore") {
+			return "", unverified("volume %s in pool %s has no backingStore field", name, pool.Name)
+		}
+		b, _ := raw.GetString("backingStore")
+		if b = strings.TrimSpace(b); len(b) > 0 {
+			return "", errors.Wrapf(ErrTemplateHasBackingFile, "%s, but its disk %s/%s has backing file %s, so the template depends on it (source %s, overlay %s): do NOT delete, move or overwrite those files. addVmTemplate did not flatten; the fallback is a full copy (vm/clone cloneMode=0), not implemented yet", keep, path.Clean(dir), name, b, srcPath, overlayPath)
 		}
 		checked = append(checked, path.Join(dir, name))
 	}
