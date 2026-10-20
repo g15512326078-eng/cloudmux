@@ -1,51 +1,33 @@
 # CloudMuX
 
-CloudMuX is an in-process Multi-Cloud Library written entirely in Golang. It provides consistent interfaces to access OpenAPIs of various cloud providers. Cloudpods CMP service is built upon CloudMux.
+CloudMuX is an in-process Multi-Cloud Library written entirely in Golang. It provides consistent interfaces to access OpenAPIs of cloud providers. Cloudpods CMP service is built upon CloudMux.
+
+This fork is trimmed down to a single provider: **H3C CAS** (`pkg/multicloud/cas`). All other public cloud, private cloud and object storage providers have been removed.
 
 ## Command line tool -- cmx
 
-cmx is the command line tool based on CloudMux. cmx is a compact utility to access various clouds.
+cmx is the command line tool based on CloudMux. cmx is a compact utility to access H3C CAS.
 
 ### Complile
 
-```bash
-$ make cmd/cmx
-```
+```ba### Example
 
-### Build Image
-
-```bash
-TAG=v3.10.4 GOOS=linux ARCH=amd64 REGISTRY=registry.cn-beijing.aliyuncs.com/<name> make image cloudmux
-```
-
-### Example
+`--cloud-env` is the CAS access URL; `--access-key` / `--secret` are the CAS username and password.
 
 1. List regions
 
 ```bash
-# Aliyun
-$ ./_output/bin/cmx --provider Aliyun  --access-key $your_access_key --secret $your_secret region-list 
-
-# Aws
-$ ./_output/bin/cmx --provider Aws --cloud-env ChinaCloud  --access-key $your_access_key --secret $your_secret --debug region-list
-
-# Azure
-$ ./_output/bin/cmx --provider Azure --cloud-env AzurePublicCloud \
-    --access-key $your_directory_id/$your_subscription_id \
-    --secret $your_app_id/$your_app_key \
-    region-list
+$ ./_output/bin/cmx --provider CAS --cloud-env http://$cas_host:8080 --access-key $username --secret $password region-list
 ```
 
 2. List zones
 
 ```bash
-# Aliyun
-$ ./_output/bin/cmx --provider Aliyun  --access-key $your_access_key --secret $your_secret zone-list
+$ ./_output/bin/cmx --provider CAS --cloud-env http://$cas_host:8080 --access-key $username --secret $password zone-list
 ```
 
 3. List VM instances
 
 ```bash
-# Aliyun
-$ ./_output/bin/cmx --provider Aliyun --region ap-southeast-1 --access-key $your_access_key  --secret $your_secret  instance-list --zone ap-southeast-1a
+$ ./_output/bin/cmx --provider CAS --cloud-env http://$cas_host:8080 --access-key $username --secret $password --region $region_id instance-list --zone $zone_id
 ```

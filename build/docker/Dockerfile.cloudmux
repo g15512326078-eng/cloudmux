@@ -5,4 +5,4 @@ ENV TZ="Asia/Shanghai"
 RUN mkdir -p /opt/yunion/bin
 RUN cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
-ADD ./_output/alpine-build/bin/*cli /opt/yunion/bin/
+ADD ./_output/alpine-build/bin/cmx /opt/yunion/bin/

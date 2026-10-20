@@ -72,7 +72,7 @@ build_bin() {
                 -v $SRC_DIR/_output/alpine-build:/root/go/src/yunion.io/x/$PKGNAME/_output \
                 -v $SRC_DIR/_output/alpine-build/_cache:/root/.cache \
                 registry.cn-beijing.aliyuncs.com/yunionio/alpine-build:3.22.2-go-1.24.9-0 \
-                /bin/sh -c "set -ex; git config --global --add safe.directory /root/go/src/yunion.io/x/$PKGNAME; cd /root/go/src/yunion.io/x/$PKGNAME; $BUILD_ARCH $BUILD_CGO GOOS=linux make cmd/*cli; chown -R $(id -u):$(id -g) _output"
+                /bin/sh -c "set -ex; git config --global --add safe.directory /root/go/src/yunion.io/x/$PKGNAME; cd /root/go/src/yunion.io/x/$PKGNAME; $BUILD_ARCH $BUILD_CGO GOOS=linux make cmd/cmx; chown -R $(id -u):$(id -g) _output"
             ;;
         *)
             docker run --rm \
