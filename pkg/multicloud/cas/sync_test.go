@@ -216,7 +216,7 @@ func (f *fakeCloud) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if f.notFound409 {
-			w.Header().Set("Error-Code", "3006")
+			w.Header().Set("Error-Code", "1001")
 			w.Header().Set("Error-Message", "虚拟机不存在。")
 			w.WriteHeader(http.StatusConflict)
 			return

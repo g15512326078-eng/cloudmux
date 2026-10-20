@@ -25,8 +25,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/icholy/digest"
+	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/log"
@@ -144,20 +146,64 @@ func (e *SCasError) Error() string {
 // ErrEmptyBody is returned for a 2xx response without a body.
 const ErrEmptyBody = errors.Error("EmptyResponseBody")
 
-// notFoundErrorCodes are 409 Error-Code values meaning "object does not
-// exist". api.yaml documents none (and the review lists none), so this is
-// empty until confirmed on a real CAS; see isNotFound.
-var notFoundErrorCodes = map[string]bool{}
+// notFoundErrorCodes are 409 Error-Code values meaning "the addressed
+// object does not exist". Taken from the H3C error catalogue
+// (errorcodes.properties in the CAS domain-server); only codes for the
+// object itself are listed. Codes such as 1011 ("the storage file of the
+// VM does not exist") or 212 ("the file does not exist") are deliberately
+// absent: they describe a broken dependency of an object that still
+// exists, and reporting the VM as gone would let cloudpods drop it.
+var notFoundErrorCodes = map[string]bool{
+	"402":     true, // host does not exist
+	"1000":    true, // VM template does not exist
+	"1001":    true, // VM does not exist
+	"1013":    true, // VM template "{0}" does not exist
+	"1101":    true, // cluster does not exist
+	"11007":   true, // storage pool does not exist
+	"91200":   true, // storage pool "{0}" does not exist
+	"91606":   true, // storage volume "{0}" does not exist
+	"1900009": true, // cluster with ID "{0}" does not exist
+	"1900015": true, // host with ID "{0}" does not exist
+}
 
 // isNotFound reports whether a 409 business error means the target does
-// not exist: either a known Error-Code, or an Error-Message containing
-// "不存在" ("does not exist"), the wording api.yaml uses in its error
-// message examples (e.g. "子网“suet_post”不存在。").
+// not exist. When CAS sends an Error-Code, only notFoundErrorCodes count.
+// Without a code, fall back to an Error-Message containing "不存在"
+// ("does not exist"), the wording api.yaml uses in its examples.
 func (e *SCasError) isNotFound() bool {
-	if notFoundErrorCodes[e.ErrorCode] {
-		return true
+	if code := strings.TrimSpace(e.ErrorCode); len(code) > 0 {
+		return notFoundErrorCodes[code]
 	}
 	return strings.Contains(e.ErrorMessage, "不存在")
+}
+
+// decodeErrorMessage turns the raw Error-Message header into UTF-8. CAS
+// writes it in a legacy Chinese charset carried as ISO-8859-1 header
+// bytes: H3C's own clients decode it with the response "charset" header
+// (nova plugin error.py) or GB2312 (domain-server CvmRestClient). Go keeps
+// header bytes as-is, so decode here: the charset header first, then
+// GB18030 (a superset of GB2312/GBK) when the bytes are not valid UTF-8.
+func decodeErrorMessage(raw, charset string) string {
+	if len(raw) == 0 {
+		return raw
+	}
+	cs := strings.ToLower(strings.TrimSpace(charset))
+	switch cs {
+	case "utf-8", "utf8":
+		return raw
+	case "gb2312", "gbk", "gb18030", "":
+		if cs == "" && utf8.ValidString(raw) {
+			return raw
+		}
+		out, err := simplifiedchinese.GB18030.NewDecoder().String(raw)
+		if err == nil {
+			return out
+		}
+	}
+	if utf8.ValidString(raw) {
+		return raw
+	}
+	return strings.ToValidUTF8(raw, "?")
 }
 
 func (cli *SCasClient) url(res string, params url.Values) string {
@@ -204,7 +250,7 @@ func (cli *SCasClient) request(method httputils.THttpMethod, res string, params 
 			Url:          u,
 			StatusCode:   resp.StatusCode,
 			ErrorCode:    resp.Header.Get("Error-Code"),
-			ErrorMessage: resp.Header.Get("Error-Message"),
+			ErrorMessage: decodeErrorMessage(resp.Header.Get("Error-Message"), resp.Header.Get("charset")),
 			Body:         redactBody(data),
 		}
 		switch resp.StatusCode {

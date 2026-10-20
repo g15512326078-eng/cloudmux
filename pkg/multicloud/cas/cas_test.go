@@ -176,7 +176,7 @@ func TestRequestErrors(t *testing.T) {
 		case "/cas/casrs/missing":
 			w.WriteHeader(http.StatusNotFound)
 		case "/cas/casrs/conflict-notfound":
-			w.Header().Set("Error-Code", "5001")
+			w.Header().Set("Error-Code", "1001")
 			w.Header().Set("Error-Message", "虚拟机不存在。")
 			w.WriteHeader(http.StatusConflict)
 		case "/cas/casrs/forbidden":
