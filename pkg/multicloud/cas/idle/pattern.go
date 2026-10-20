@@ -33,6 +33,7 @@ type patternStats struct {
 	DetectedWindow string
 	Reason         string
 	Ac24, Ac168    float64
+	HolidayGap     string // data_gaps entry when --holiday-file is unusable
 }
 
 func parseWorkHours(s string) ([]timeWindow, error) {
@@ -130,7 +131,7 @@ func classifyPattern(f VmFeatures, cfg Config, loc *time.Location) patternStats 
 		wins, _ = parseWorkHours("08:30-11:30,13:00-18:00")
 	}
 	workdays := parseWorkdays(cfg.Workdays)
-	cal := loadHolidayCalendar(cfg.HolidayFile)
+	cal, holidayGap := loadHolidayCalendar(cfg.HolidayFile)
 
 	var covered, activeN int
 	var inCovered, inActive, outCovered, outActive int
@@ -176,7 +177,7 @@ func classifyPattern(f VmFeatures, cfg Config, loc *time.Location) patternStats 
 		}
 	}
 
-	ps := patternStats{}
+	ps := patternStats{HolidayGap: holidayGap}
 	if covered > 0 {
 		ps.RTotal = float64(activeN) / float64(covered)
 	}
@@ -202,7 +203,10 @@ func classifyPattern(f VmFeatures, cfg Config, loc *time.Location) patternStats 
 	ps.DetectedWindow = detectWindow(profile, profileN, cfg.PatternMinProb, wins)
 
 	// Classification order per research §7.3
-	idleOK := ps.RTotal <= 0.02 && f.CpuMax < 20
+	// Peak gates cover CPU, net and disk (R1): a weekly net-only or
+	// disk-only backup must not pass as 闲置.
+	peakSig := peakGateHit(f, cfg)
+	idleOK := ps.RTotal <= 0.02 && peakSig == ""
 	// also: no day with >2 active hours
 	dayActiveHours := map[string]int{}
 	for i, h := range f.Hours {
@@ -252,9 +256,24 @@ func classifyPattern(f VmFeatures, cfg Config, loc *time.Location) patternStats 
 	// peak (batch/burst) → intermittent, never idle.
 	ps.Class = ClassIntermittent
 	ps.Reason = fmt.Sprintf(
-		"PATTERN_INTERMITTENT: 低总活跃(%.1f%%)但有忙日或高峰(peak CPU %.0f%%)，非闲置",
-		ps.RTotal*100, f.CpuMax)
+		"PATTERN_INTERMITTENT: 低总活跃(%.1f%%)但有忙日或高峰(%s)，非闲置",
+		ps.RTotal*100, peakSummary(f))
 	return ps
+}
+
+// peakSummary renders window peaks with units, e.g. "CPU 3% 网络 5.0 MB/s 磁盘 0.0 MB/s".
+func peakSummary(f VmFeatures) string {
+	parts := []string{}
+	if f.HasCpu {
+		parts = append(parts, fmt.Sprintf("CPU %.0f%%", f.CpuMax))
+	}
+	if f.HasNet {
+		parts = append(parts, "网络 "+formatKBps(f.NetMax))
+	}
+	if f.HasDisk {
+		parts = append(parts, "磁盘 "+formatKBps(f.DiskMax))
+	}
+	return strings.Join(parts, " ")
 }
 
 func detectWindow(profile, profileN []int, minProb float64, fallback []timeWindow) string {
@@ -320,4 +339,19 @@ func autocorr(x []float64, lag int) float64 {
 		num += (x[i] - mean) * (x[i+lag] - mean)
 	}
 	return num / den
+}
+
+// peakGateHit returns the first signal whose window peak reaches its strict
+// idle gate ("cpu", "net", "disk"), or "" when all peaks are below.
+func peakGateHit(f VmFeatures, cfg Config) string {
+	if f.HasCpu && f.CpuMax >= cfg.IdlePeakCPU {
+		return "cpu"
+	}
+	if f.HasNet && f.NetMax >= cfg.IdlePeakNetKBps {
+		return "net"
+	}
+	if f.HasDisk && f.DiskMax >= cfg.IdlePeakDiskKBps {
+		return "disk"
+	}
+	return ""
 }

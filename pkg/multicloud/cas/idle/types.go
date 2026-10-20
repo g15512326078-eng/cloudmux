@@ -100,10 +100,13 @@ type VmFeatures struct {
 
 	DroppedBuckets int // unparseable report bucket labels
 
-	// Active[i] / HourCPU[i] align with Hours[i] (HourCPU is 0 when no CPU point).
-	Hours   []time.Time
-	Active  []bool
-	HourCPU []float64
+	// Active[i] / HourCPU[i] / HourNet[i] / HourDisk[i] align with Hours[i]
+	// (0 when that series has no point for the hour). Net/Disk are KB/s.
+	Hours    []time.Time
+	Active   []bool
+	HourCPU  []float64
+	HourNet  []float64
+	HourDisk []float64
 
 	LastActive time.Time
 
@@ -180,6 +183,29 @@ type Config struct {
 	PrefilterCPU   float64 // monthTopCpu threshold to mark ACTIVE early
 	Signals        map[string]bool
 
+	// Peak gates for strict 闲置 (spec §7.3, R1). Any hour at or above one
+	// of these makes the VM non-idle (间歇使用 at most). Net/Disk in KB/s,
+	// same unit as ActiveNetKBps / NetP95KBps.
+	IdlePeakCPU      float64
+	IdlePeakNetKBps  float64
+	IdlePeakDiskKBps float64
+
+	// Same-clock-hour recurring spike veto (spec §6.2): an hour at or above
+	// one of these on ≥3 distinct days vetoes 闲置. Net/Disk in KB/s.
+	SpikeCPU      float64
+	SpikeNetKBps  float64
+	SpikeDiskKBps float64
+
+	// Release gate (R2). release/回收 only for confidence 高 plus either a
+	// real lastOffTime (shutOff) or full signal coverage (running, see
+	// hasFullSignalCoverage). ReleaseMinCoverage is the hourly-bucket part
+	// of "full".
+	ReleaseMinCoverage float64
+
+	// LifecycleStubFactor multiplies confidence while the lifecycle signal
+	// (D4) is a stub, so a missing signal is never neutral.
+	LifecycleStubFactor float64
+
 	// Weights for idle_score (research §6.2).
 	WeightCPU  float64
 	WeightNet  float64
@@ -219,15 +245,24 @@ func DefaultConfig() Config {
 		ScheduleMargin:   30 * time.Minute,
 		WindowOverlap:    0.5,
 		PrefilterCPU:     50,
-		WeightCPU:        0.30,
-		WeightNet:        0.20,
-		WeightDisk:       0.15,
-		WeightIops:       0.05,
-		WeightConn:       0.15,
-		WeightPPS:        0.05,
-		WeightProc:       0.10,
-		ReportNetIsKBps:  true,
-		ReportDiskIsKBps: true,
+		IdlePeakCPU:      20,
+		IdlePeakNetKBps:  1024,     // 1 MB/s
+		IdlePeakDiskKBps: 5 * 1024, // 5 MB/s
+		SpikeCPU:         50,
+		SpikeNetKBps:     1024,     // 1 MB/s
+		SpikeDiskKBps:    5 * 1024, // 5 MB/s
+		// Full hourly coverage for release: ≥95% of the lookback buckets.
+		ReleaseMinCoverage:  0.95,
+		LifecycleStubFactor: 0.95,
+		WeightCPU:           0.30,
+		WeightNet:           0.20,
+		WeightDisk:          0.15,
+		WeightIops:          0.05,
+		WeightConn:          0.15,
+		WeightPPS:           0.05,
+		WeightProc:          0.10,
+		ReportNetIsKBps:     true,
+		ReportDiskIsKBps:    true,
 		Signals: map[string]bool{
 			"cpu": true, "net": true, "disk": true, "iops": true,
 			// conn off until flowLink semantics verified (spec §6.2 / D3).

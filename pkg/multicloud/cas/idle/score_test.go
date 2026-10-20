@@ -207,7 +207,10 @@ func TestHolidayJSON(t *testing.T) {
 	}
 	cfg := DefaultConfig()
 	cfg.HolidayFile = path
-	cal := loadHolidayCalendar(path)
+	cal, gap := loadHolidayCalendar(path)
+	if gap != "" {
+		t.Fatalf("unexpected holiday gap %q", gap)
+	}
 	sat := time.Date(2026, 3, 7, 10, 0, 0, 0, loc)
 	mon := time.Date(2026, 3, 9, 10, 0, 0, 0, loc)
 	if w, ok := cal.IsWorkday(sat); !ok || !w {

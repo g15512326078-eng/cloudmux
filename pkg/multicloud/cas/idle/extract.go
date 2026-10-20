@@ -82,6 +82,8 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 			f.Hours = append(f.Hours, h)
 			f.Active = append(f.Active, false)
 			f.HourCPU = append(f.HourCPU, 0)
+			f.HourNet = append(f.HourNet, 0)
+			f.HourDisk = append(f.HourDisk, 0)
 		}
 	}
 	addHour(b.CPU)
@@ -115,6 +117,8 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 		if hasCpu {
 			f.HourCPU[i] = cpu
 		}
+		f.HourNet[i] = net
+		f.HourDisk[i] = disk
 
 		active := (hasCpu && cpu >= cfg.ActiveCPU) ||
 			net >= cfg.ActiveNetKBps ||
@@ -133,7 +137,7 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 			f.LastActive = h
 		}
 		local := h.In(loc)
-		if (hasCpu && cpu >= 50) || net >= 1024 {
+		if (hasCpu && cpu >= cfg.SpikeCPU) || net >= cfg.SpikeNetKBps || disk >= cfg.SpikeDiskKBps {
 			hod := local.Hour()
 			day := local.Format("2006-01-02")
 			if spikeByHour[hod] == nil {

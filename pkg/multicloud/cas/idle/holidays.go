@@ -38,21 +38,23 @@ type mapCalendar struct {
 	days map[string]string
 }
 
-func loadHolidayCalendar(path string) holidayCalendar {
+// loadHolidayCalendar returns the calendar plus a non-empty data_gaps entry
+// when a configured file could not be used (also logged as a warning).
+func loadHolidayCalendar(path string) (holidayCalendar, string) {
 	if len(path) == 0 {
-		return nil
+		return nil, ""
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		log.Warningf("cas idle: holiday file %q: %v (continuing without holidays)", path, err)
-		return nil
+		return nil, "holiday_file=unreadable"
 	}
 	var raw holidayFileJSON
 	if err := json.Unmarshal(data, &raw); err != nil {
 		log.Warningf("cas idle: holiday file %q: parse error: %v", path, err)
-		return nil
+		return nil, "holiday_file=invalid"
 	}
-	return &mapCalendar{days: raw}
+	return &mapCalendar{days: raw}, ""
 }
 
 func (c *mapCalendar) IsWorkday(d time.Time) (bool, bool) {
