@@ -15,15 +15,18 @@
 package shell
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+
+	"yunion.io/x/cloudmux/pkg/multicloud/cas"
 )
 
 func TestImageImportOptions(t *testing.T) {
 	o := &ImageImportTemplateOptions{HostId: 1, Pool: "p", File: "f.qcow2", TemplateName: "t", Vswitch: "vs"}
 	io, err := o.importOptions()
-	if err != nil || io.Upload != nil {
-		t.Fatalf("mode a: %v %+v", err, io.Upload)
+	if err != nil || io.Stager != nil {
+		t.Fatalf("mode a: %v %v", err, io.Stager)
 	}
 	o.SshAddr = "h:22"
 	if _, err := o.importOptions(); err == nil {
@@ -32,10 +35,11 @@ func TestImageImportOptions(t *testing.T) {
 	t.Setenv(SSH_PASSWORD_ENV, "env-pw")
 	o.SshUpload = "/tmp/x.qcow2"
 	io, err = o.importOptions()
-	if err != nil || io.Upload == nil || io.Upload.Password != "env-pw" || io.Upload.Addr != "h:22" {
-		t.Fatalf("mode b: %v %+v", err, io.Upload)
+	st, ok := io.Stager.(*cas.SSSHStager)
+	if err != nil || !ok || st.Options.Password != "env-pw" || st.Options.Addr != "h:22" {
+		t.Fatalf("mode b: %v %v", err, io.Stager)
 	}
-	if strings.Contains(io.Upload.String(), "env-pw") {
+	if strings.Contains(fmt.Sprintf("%v %+v %s", st, st, st), "env-pw") {
 		t.Fatal("password in String()")
 	}
 }

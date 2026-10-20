@@ -37,7 +37,10 @@
 //   - Image import: a qcow2 cloud image already in a file pool (or copied
 //     there over SSH when explicitly configured) becomes a template via a
 //     qcow2 overlay, a never-booted temporary VM and addVmTemplate opType=1
-//     (imageimport.go, cmx image-import-template).
+//     (imageimport.go, cmx image-import-template). The import fails if
+//     the new template's disk still has a backing file, or if that cannot
+//     be checked. The upload step is pluggable (ImportSourceStager); SSH
+//     is the only implementation.
 //
 // Storagecache.UploadImage (cloudpods image upload), ISO installs and
 // template storage pool management are not implemented.

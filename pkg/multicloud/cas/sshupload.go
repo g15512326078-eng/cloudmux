@@ -66,8 +66,11 @@ type SSSHUploadOptions struct {
 	InsecureIgnoreHostKey bool
 
 	LocalPath string
+	// ExpectSHA256, when set, must match the hash of the bytes actually
+	// streamed (catches a local file that changed after it was planned).
+	ExpectSHA256 string
 
-	// RemoteDir/RemoteName are set by the importer from the pool path.
+	// RemoteDir/RemoteName are set by the stager from the pool path.
 	RemoteDir  string
 	RemoteName string
 
@@ -245,6 +248,9 @@ func uploadFileSSH(o *SSSHUploadOptions) (*SSSHUploadResult, error) {
 		return nil, cleanup(errors.Wrap(err, "upload"))
 	}
 	local := hex.EncodeToString(h.Sum(nil))
+	if len(o.ExpectSHA256) > 0 && local != o.ExpectSHA256 {
+		return nil, cleanup(errors.Errorf("local file %s changed while uploading: planned sha256 %s, sent %s", o.LocalPath, o.ExpectSHA256, local))
+	}
 	out, err := runSSH(client, fmt.Sprintf("sha256sum -b -- %s", qt), nil)
 	if err != nil {
 		return nil, cleanup(errors.Wrap(err, "remote sha256sum"))
@@ -264,4 +270,77 @@ type countWriter struct{ n int64 }
 func (w *countWriter) Write(p []byte) (int, error) {
 	w.n += int64(len(p))
 	return len(p), nil
+}
+
+// SSHInsecureHostKeyWarning is reported (result warnings; cmx prints it
+// to stderr) whenever host key checking is switched off.
+const SSHInsecureHostKeyWarning = "SSH HOST KEY NOT VERIFIED (insecure opt-out): anyone on the path to the host can intercept the upload and the SSH password; use a known_hosts file or a pinned SHA256 fingerprint instead"
+
+// SSSHStager is the SSH (mode b) ImportSourceStager. The account needs
+// write access to the pool directory only; root is not required if a
+// less privileged user can write there.
+type SSSHStager struct {
+	Options SSSHUploadOptions
+	// planned sha256 of the local file, set by Plan and enforced by Stage
+	sum string
+}
+
+func NewSSHStager(o SSSHUploadOptions) *SSSHStager {
+	return &SSSHStager{Options: o}
+}
+
+// String never includes the password or key (also used by %v / %+v).
+func (s *SSSHStager) String() string { return s.Options.String() }
+
+// GoString keeps %#v from dumping the password or key.
+func (s *SSSHStager) GoString() string { return s.Options.String() }
+
+func (s *SSSHStager) prepare(t SImportTarget) (*SSSHUploadOptions, error) {
+	up := s.Options
+	up.RemoteDir, up.RemoteName = t.PoolPath, t.FileName
+	if len(up.Addr) == 0 {
+		up.Addr = net.JoinHostPort(t.HostIp, "22")
+	}
+	if err := up.validate(); err != nil {
+		return nil, err
+	}
+	return &up, nil
+}
+
+// Plan validates the options and hashes the local file. No connection.
+func (s *SSSHStager) Plan(t SImportTarget) (*SImportStagePlan, error) {
+	up, err := s.prepare(t)
+	if err != nil {
+		return nil, err
+	}
+	sum, size, err := localFileSHA256(up.LocalPath)
+	if err != nil {
+		return nil, err
+	}
+	s.sum = sum
+	check := "host key pinned " + up.HostKeySHA256
+	if len(up.KnownHostsFile) > 0 {
+		check = "host key from " + up.KnownHostsFile
+	}
+	plan := &SImportStagePlan{Step: "ssh-upload", Method: "SSH"}
+	if up.InsecureIgnoreHostKey {
+		check = "HOST KEY NOT VERIFIED"
+		plan.Warnings = append(plan.Warnings, SSHInsecureHostKeyWarning)
+	}
+	plan.Detail = fmt.Sprintf("%s (%d bytes, sha256 %s) -> %s@%s:%s, %s, no overwrite, sha256 verified on host", up.LocalPath, size, sum, up.User, up.Addr, t.Path(), check)
+	return plan, nil
+}
+
+// Stage uploads the file; the bytes sent must match the planned hash.
+func (s *SSSHStager) Stage(t SImportTarget) error {
+	up, err := s.prepare(t)
+	if err != nil {
+		return err
+	}
+	if len(s.sum) == 0 {
+		return errors.Errorf("ssh stager: Stage called before Plan")
+	}
+	up.ExpectSHA256 = s.sum
+	_, err = uploadFileSSH(up)
+	return err
 }

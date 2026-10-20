@@ -198,6 +198,14 @@ func (cli *SCasClient) doAsync(method httputils.THttpMethod, res string, params 
 	if err != nil {
 		return nil, err
 	}
+	return cli.waitAsync(method, res, resp)
+}
+
+// waitAsync is the second half of doAsync: it parses the RsTaskMsg ack of
+// a write that was already sent and waits for its task. Split out so a
+// caller can tell a request CAS rejected outright (error from request,
+// no task) from a task that failed or timed out after it was accepted.
+func (cli *SCasClient) waitAsync(method httputils.THttpMethod, res string, resp jsonutils.JSONObject) (*SMessage, error) {
 	ack, err := parseTaskMsg(resp)
 	if err != nil {
 		return nil, err

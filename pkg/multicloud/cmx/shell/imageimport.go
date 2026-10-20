@@ -46,7 +46,7 @@ type ImageImportTemplateOptions struct {
 
 	SshUpload                string `help:"Mode b: local qcow2 to copy into the pool over SSH first (off unless set)"`
 	SshAddr                  string `help:"SSH host:port (default <host ip>:22)"`
-	SshUser                  string `help:"SSH user" default:"root"`
+	SshUser                  string `help:"SSH user; it only needs write access to the pool directory" default:"root"`
 	SshPassword              string `help:"SSH password (prefer env CAS_SSH_PASSWORD; avoid ps/history)"`
 	SshKeyFile               string `help:"SSH private key file (PEM, unencrypted)"`
 	SshKnownHosts            string `help:"known_hosts file used to verify the host key"`
@@ -68,7 +68,7 @@ func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, e
 		}
 		return ret, nil
 	}
-	up := &cas.SSSHUploadOptions{
+	up := cas.SSSHUploadOptions{
 		Addr: o.SshAddr, User: o.SshUser, Password: o.SshPassword, LocalPath: o.SshUpload,
 		KnownHostsFile: o.SshKnownHosts, HostKeySHA256: o.SshHostKeySha256, InsecureIgnoreHostKey: o.SshInsecureIgnoreHostKey,
 	}
@@ -82,7 +82,7 @@ func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, e
 		}
 		up.PrivateKey = key
 	}
-	ret.Upload = up
+	ret.Stager = cas.NewSSHStager(up)
 	return ret, nil
 }
 
@@ -100,6 +100,10 @@ func init() {
 		if !ok {
 			return errors.Wrap(cloudprovider.ErrNotSupported, "image-import-template requires the CAS provider")
 		}
+		if args.SshInsecureIgnoreHostKey {
+			// before anything connects, not only in the result
+			fmt.Fprintln(os.Stderr, "WARNING: "+cas.SSHInsecureHostKeyWarning)
+		}
 		res, err := p.GetClient().ImportQcow2AsTemplate(opts)
 		if res != nil {
 			enc := json.NewEncoder(os.Stdout)
@@ -107,7 +111,12 @@ func init() {
 			if eerr := enc.Encode(res); eerr != nil {
 				fmt.Fprintln(os.Stderr, eerr)
 			}
+			for _, w := range res.Warnings {
+				fmt.Fprintln(os.Stderr, "WARNING: "+w)
+			}
 		}
+		// a non-nil err makes cmx exit non-zero, also when a template was
+		// created but failed the backing-file check
 		return err
 	})
 }

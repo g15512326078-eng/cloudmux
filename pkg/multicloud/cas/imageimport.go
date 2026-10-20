@@ -17,15 +17,20 @@ package cas
 // Import of a Linux cloud image (qcow2) that sits in, or is first copied
 // into, a CAS storage pool, turned into a CAS VM template:
 //
-//  1. (optional, mode b) copy a local file into the pool directory over
-//     SSH, see sshupload.go; then GET storage/refresh so CAS lists it.
+//  1. (optional) an ImportSourceStager makes the file present in the pool
+//     directory first (today only SSH, mode b, see sshupload.go); then
+//     GET storage/refresh so CAS lists it.
 //  2. POST storage/volume with baseFile=<source>: a thin qcow2 overlay.
 //  3. POST vm/add with the overlay as the only disk; the VM is never
 //     started (autoBooting=0).
 //  4. Make sure the VM is shut off, then addVmTemplate opType=1
 //     (CreateVmTemplateFromVM).
-//  5. Delete the temporary VM into the recycle bin (DeleteVM, type=3,
-//     isWipeVolume=false).
+//  5. Post-check: list the template's disks (GET vmTemplate/storage) and
+//     their volumes in the template pool (GET storage/volume). A disk with
+//     a non-empty backingStore, or one that cannot be checked, makes the
+//     import fail (the template is kept and named in the error).
+//  6. Delete the temporary VM into the recycle bin (DeleteVM, type=3,
+//     isWipeVolume=false, delBase0=false).
 //
 // Copy strategy: an overlay (storage/volume + baseFile) rather than
 // cinder/volume/copy. The overlay endpoint is the one P2 already uses for
@@ -36,8 +41,14 @@ package cas
 // the temporary VM writes (if ever booted) would land in the overlay.
 // Because the VM is never booted the overlay stays empty, so the template
 // content is exactly the source image. Whether addVmTemplate flattens the
-// backing chain into the template is UNVERIFIED (live check): if it does
-// not, the template would depend on the source file.
+// backing chain into the template is UNVERIFIED (live check), hence the
+// post-check in step 5. vm/mergeDomainVol is deliberately not used: its
+// merge direction is undocumented and a commit-style merge would write
+// into the source. If the lab shows opType=1 does not flatten, the
+// documented fallback is a full copy before templating: POST vm/clone
+// with cloneMode=0 (not a fast clone) of the temp VM, then template the
+// clone. Not built yet: it doubles copy time/space and adds a second VM
+// with its own cleanup paths, all unverified.
 //
 // cloud-init / configDrive is not used: the VM is never booted, so the
 // template stays as clean as the source image and cloud-init runs on the
@@ -97,12 +108,47 @@ type SImageImportOptions struct {
 	// TempVMName defaults to "tplimp-<template name>".
 	TempVMName string
 	// Refresh runs GET storage/refresh before looking the file up (always
-	// done after an SSH upload).
+	// done after a Stager ran).
 	Refresh bool
 	// DryRun only reads (through a read-only client) and returns the plan.
 	DryRun bool
-	// Upload, when set, copies a local file into the pool first (mode b).
-	Upload *SSSHUploadOptions
+	// Stager, when set, makes the file present in the pool first. nil is
+	// mode a (the file is already there). NewSSHStager is mode b.
+	Stager ImportSourceStager
+}
+
+// SImportTarget is where a stager must put the source file.
+type SImportTarget struct {
+	HostId   int64
+	HostIp   string
+	PoolName string
+	PoolPath string
+	FileName string
+}
+
+func (t SImportTarget) Path() string { return path.Join(t.PoolPath, t.FileName) }
+
+// SImportStagePlan describes a staging step without performing it.
+type SImportStagePlan struct {
+	Step     string
+	Method   string
+	Detail   string
+	Warnings []string
+}
+
+// ImportSourceStager makes the source file exist in the pool directory
+// (the "upload" step). The importer has already checked that CAS does not
+// list the file and that the account is writable; it calls Plan first
+// (also in dry-run), then Stage once (never in dry-run), then refreshes
+// the pool. Implementations must never overwrite an existing file and
+// must not log secrets. SSH (sshupload.go) is the only one today; an HTTP
+// upload can implement the same interface.
+type ImportSourceStager interface {
+	// Plan validates the options against t and describes the step. No
+	// network access, no side effects.
+	Plan(t SImportTarget) (*SImportStagePlan, error)
+	// Stage makes t.Path() exist with the planned content.
+	Stage(t SImportTarget) error
 }
 
 // SImportStep is one planned or executed call.
@@ -329,7 +375,8 @@ func (cli *SCasClient) findImportPool(hostId int64, name string) (*SStoragePool,
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "pool %s on host %d", name, hostId)
 }
 
-// findLiveVMsByName returns VMs in the unfiltered vm/vmList with the name.
+// findVMsByName returns VMs in the unfiltered vm/vmList with the name,
+// recycled ones included (intentional: the duplicate check must see them).
 func (cli *SCasClient) findVMsByName(name string) ([]SInstance, error) {
 	vms, err := cli.listInstances(nil)
 	if err != nil {
@@ -344,17 +391,61 @@ func (cli *SCasClient) findVMsByName(name string) ([]SInstance, error) {
 	return ret, nil
 }
 
-func checkImportSource(vol *SStorageVolume, srcPath string) error {
+// checkImportSource refuses a source that is not a standalone, unused
+// qcow2. A source with its own backing file would extend the dependency
+// chain of the overlay (and maybe the template) to a file we never
+// checked. It returns warnings for a level>0 source (CAS marks it as the
+// base of other volumes; it is only read here, but deleting it later
+// would break those volumes as well).
+func checkImportSource(vol *SStorageVolume, srcPath string) ([]string, error) {
 	if strings.ToLower(vol.Format) != "qcow2" {
-		return errors.Wrapf(cloudprovider.ErrNotSupported, "source %s has format %q; only qcow2 is supported", srcPath, vol.Format)
+		return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "source %s has format %q; only qcow2 is supported", srcPath, vol.Format)
+	}
+	if b := strings.TrimSpace(vol.BackingStore); len(b) > 0 {
+		return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "source %s has its own backing file %s; import a standalone qcow2 (for example qemu-img convert -O qcow2 the chain into a new file)", srcPath, b)
 	}
 	if vol.isAttached() {
-		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "source %s is used by VM(s) %s; refusing to build on a disk in use", srcPath, vol.Users)
+		return nil, errors.Wrapf(cloudprovider.ErrInvalidStatus, "source %s is used by VM(s) %s; refusing to build on a disk in use", srcPath, vol.Users)
 	}
 	if vol.Size <= 0 {
-		return errors.Errorf("source %s reports size %v MB", srcPath, vol.Size)
+		return nil, errors.Errorf("source %s reports size %v MB", srcPath, vol.Size)
 	}
-	return nil
+	if vol.Level > 0 {
+		return []string{fmt.Sprintf("source %s is level %d (CAS marks it as a base file of other volumes); it is only read, but do not delete it", srcPath, vol.Level)}, nil
+	}
+	return nil, nil
+}
+
+// overlayCapacityMB is the overlay virtual size for a source of sizeMB:
+// the next whole GiB strictly above the source size. Margin, because
+// (1) storage/volume reports size as MB in a double whose rounding on a
+// real CAS is unverified, and the unit of capacity on create is
+// undocumented (assumed MB); an overlay even slightly smaller than its
+// base truncates the guest disk (a GPT backup header at the end is lost);
+// (2) the overlay is thin, so up to 1 GiB extra costs no space, and
+// cloud-init growpart simply sees a slightly larger disk.
+func overlayCapacityMB(sizeMB float64) int64 {
+	return (int64(math.Floor(sizeMB/1024)) + 1) * 1024
+}
+
+// isDefiniteRejection is true when a write was certainly not carried out:
+// blocked before sending (read-only guard) or answered with HTTP 4xx (no
+// task was created). 5xx, transport errors, task failures and timeouts
+// are ambiguous: CAS may have acted.
+func isDefiniteRejection(err error) bool {
+	cause := errors.Cause(err)
+	switch cause {
+	case cloudprovider.ErrAccountReadOnly, cloudprovider.ErrNotFound, cloudprovider.ErrNoPermission, cloudprovider.ErrInvalidAccessKey:
+		return true
+	}
+	if ce, ok := cause.(*SCasError); ok {
+		return ce.StatusCode >= 400 && ce.StatusCode < 500
+	}
+	return false
+}
+
+func isTimeout(err error) bool {
+	return errors.Cause(err) == cloudprovider.ErrTimeout
 }
 
 // ImportQcow2AsTemplate runs the pipeline described at the top of this
@@ -406,10 +497,10 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	if vms, err := c.findVMsByName(opts.TempVMName); err != nil {
 		return nil, errors.Wrapf(err, "list VMs")
 	} else if len(vms) > 0 {
-		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "a VM named %s already exists (%s)", opts.TempVMName, vms[0].Uuid)
+		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "a VM named %s already exists (%s; maybe a recycled temp VM of an earlier run): pick another temporary name with --temp-vm-name", opts.TempVMName, vms[0].Uuid)
 	}
 	if _, err := c.GetStorageVolume(host.Id, pool.Name, overlay); err == nil {
-		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "overlay volume %s already exists in pool %s", overlay, pool.Name)
+		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "overlay volume %s already exists in pool %s (maybe left by an earlier run): pick another temporary name with --temp-vm-name", overlay, pool.Name)
 	} else if errors.Cause(err) != cloudprovider.ErrNotFound {
 		return nil, errors.Wrapf(err, "check overlay %s", overlay)
 	}
@@ -422,33 +513,26 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return nil, err
 	}
 
-	// ---- (b) SSH upload, then refresh ----
-	if opts.Upload != nil {
+	// ---- stage the file (mode b: SSH upload), then refresh ----
+	if opts.Stager != nil {
 		if _, err := c.GetStorageVolume(host.Id, pool.Name, fileName); err == nil {
-			return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "%s already exists in pool %s; refusing to upload over it", fileName, pool.Name)
+			return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "%s already exists in pool %s; refusing to upload over it. If it is your earlier upload, rerun with --file %s and without the upload option", fileName, pool.Name, fileName)
 		} else if errors.Cause(err) != cloudprovider.ErrNotFound {
 			return nil, errors.Wrapf(err, "check %s", fileName)
 		}
-		up := *opts.Upload
-		up.RemoteDir, up.RemoteName = pool.Path, fileName
-		if len(up.Addr) == 0 {
-			up.Addr = fmt.Sprintf("%s:22", host.Ip)
-		}
-		if err := up.validate(); err != nil {
-			return nil, err
-		}
-		sum, size, err := localFileSHA256(up.LocalPath)
+		target := SImportTarget{HostId: host.Id, HostIp: host.Ip, PoolName: pool.Name, PoolPath: pool.Path, FileName: fileName}
+		plan, err := opts.Stager.Plan(target)
 		if err != nil {
 			return nil, err
 		}
-		detail := fmt.Sprintf("%s (%d bytes, sha256 %s) -> %s@%s:%s, no overwrite, sha256 verified on host", up.LocalPath, size, sum, up.User, up.Addr, srcPath)
+		res.Warnings = append(res.Warnings, plan.Warnings...)
 		if opts.DryRun {
-			res.add("ssh-upload", "SSH", srcPath, detail, true, false)
+			res.add(plan.Step, plan.Method, srcPath, plan.Detail, true, false)
 		} else {
-			if _, err := uploadFileSSH(&up); err != nil {
-				return res, errors.Wrapf(err, "ssh upload")
+			if err := opts.Stager.Stage(target); err != nil {
+				return res, errors.Wrapf(err, "%s", plan.Step)
 			}
-			res.add("ssh-upload", "SSH", srcPath, detail, true, true)
+			res.add(plan.Step, plan.Method, srcPath, plan.Detail, true, true)
 		}
 		opts.Refresh = true
 	}
@@ -468,10 +552,12 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	src, err := c.GetStorageVolume(host.Id, pool.Name, fileName)
 	switch {
 	case err == nil:
-		if err := checkImportSource(src, srcPath); err != nil {
+		warns, err := checkImportSource(src, srcPath)
+		if err != nil {
 			return res, err
 		}
-		capacity = int64(math.Ceil(src.Size))
+		res.Warnings = append(res.Warnings, warns...)
+		capacity = overlayCapacityMB(src.Size)
 	case errors.Cause(err) == cloudprovider.ErrNotFound && opts.DryRun && opts.Refresh:
 		res.Warnings = append(res.Warnings, fmt.Sprintf("%s is not listed yet; it is checked after the refresh in a real run", srcPath))
 	case errors.Cause(err) == cloudprovider.ErrNotFound && !opts.Refresh:
@@ -487,7 +573,8 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		res.add("create-overlay", "POST", "storage/volume", jsonutils.Marshal(volBody).String(), true, false)
 		res.add("create-vm", "POST", "vm/add", jsonutils.Marshal(addBody).String(), true, false)
 		res.add("clone-to-template", "POST", "vmTemplate/addVmTemplate", fmt.Sprintf("id=<temp vm id>&domainName=%s&opType=%s", opts.TemplateName, TEMPLATE_OP_CLONE), true, false)
-		res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/<temp vm uuid>", fmt.Sprintf("type=%s&isWipeVolume=%s (recycle bin)", DELETE_VM_TYPE, DELETE_VM_WIPE_VOLUME), true, false)
+		res.add("check-template-flat", "GET", "vmTemplate/storage?vmId=<template id> + storage/volume on the template pool", "fail if a template disk has a backingStore", false, false)
+		res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/<temp vm uuid>", deleteTempVMDetail, true, false)
 		return res, nil
 	}
 
@@ -495,13 +582,39 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	region := &SRegion{cli: c}
 	var vm *SInstance
 	overlayCreated := false
+	// vmAddSent/vmAddRejected: the overlay may only be deleted while no VM
+	// can be using it, i.e. vm/add was never sent or CAS rejected it
+	// outright (isDefiniteRejection).
+	vmAddSent, vmAddRejected := false, false
+	byHand := func(format string, args ...interface{}) error {
+		return errors.Errorf("cleanup: "+format+"; remove by hand: VM %s, overlay %s (the source %s is not affected)",
+			append(args, opts.TempVMName, overlayPath, srcPath)...)
+	}
 	fail := func(cause error) (*SImageImportResult, error) {
 		errs := []error{cause}
-		if vm == nil && overlayCreated {
-			// vm/add may have created the VM even though it reported an error
-			if vms, err := c.findVMsByName(opts.TempVMName); err == nil && len(vms) == 1 {
+		if vm == nil && vmAddSent && !vmAddRejected {
+			// vm/add was accepted or its outcome is unknown, so the VM may
+			// exist and use the overlay: never delete the overlay here.
+			// Adopt the VM only when exactly one VM has our name and no
+			// task may still be running.
+			if isTimeout(cause) {
+				errs = append(errs, byHand("vm/add did not finish in time and may still be running; nothing was cleaned up"))
+				return res, errors.NewAggregate(errs)
+			}
+			vms, err := c.findVMsByName(opts.TempVMName)
+			switch {
+			case err != nil:
+				errs = append(errs, byHand("cannot list VMs (%v), so the temporary VM cannot be identified; nothing was cleaned up", err))
+			case len(vms) == 1:
 				vm = &vms[0]
 				vm.region = region
+			case len(vms) == 0:
+				errs = append(errs, byHand("vm/add outcome unknown and no VM named %s is listed; the overlay was kept in case CAS attaches it later", opts.TempVMName))
+			default:
+				errs = append(errs, byHand("%d VMs are named %s, refusing to pick one (ours has description %q); nothing was cleaned up", len(vms), opts.TempVMName, importTempVMDescription(&opts)))
+			}
+			if vm == nil {
+				return res, errors.NewAggregate(errs)
 			}
 		}
 		switch {
@@ -512,14 +625,8 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 				res.add("cleanup-delete-temp-vm", "DELETE", "vm/delete/uuid/"+vm.Uuid, "recycle bin; the overlay stays with the recycled VM", true, true)
 			}
 		case overlayCreated:
-			if overlay == fileName {
-				errs = append(errs, errors.Errorf("cleanup: refusing to delete %s, it is the source", overlay))
-				break
-			}
-			if err := c.DeleteStorageVolume(host.Id, pool.Name, overlay); err != nil {
-				errs = append(errs, errors.Wrapf(err, "cleanup: delete overlay %s; remove it by hand", overlayPath))
-			} else {
-				res.add("cleanup-delete-overlay", "DELETE", fmt.Sprintf("storage/volume/delete/%d/%s/%s", host.Id, pool.Name, overlay), "isWipeVolume=false", true, true)
+			if err := c.deleteImportOverlay(res, host.Id, pool.Name, overlay, overlayPath, fileName); err != nil {
+				errs = append(errs, err)
 			}
 		}
 		return res, errors.NewAggregate(errs)
@@ -542,7 +649,13 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return fail(errors.Errorf("overlay %s reports backing store %q, want %s", overlayPath, ov.BackingStore, srcPath))
 	}
 
-	if _, err := c.doAsync(httputils.POST, "vm/add", nil, jsonutils.Marshal(addBody)); err != nil {
+	vmAddSent = true
+	addResp, err := c.request(httputils.POST, "vm/add", nil, jsonutils.Marshal(addBody))
+	if err != nil {
+		vmAddRejected = isDefiniteRejection(err)
+		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
+	}
+	if _, err := c.waitAsync(httputils.POST, "vm/add", addResp); err != nil {
 		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
 	}
 	res.add("create-vm", "POST", "vm/add", jsonutils.Marshal(addBody).String(), true, true)
@@ -559,30 +672,188 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	switch st := vm.GetStatus(); st {
 	case api.VM_READY:
 	case api.VM_RUNNING, api.VM_SUSPEND:
-		if err := vm.StopVM(context.Background(), &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
-			return fail(errors.Wrapf(err, "power off temporary VM (status %s)", st))
-		}
-		res.add("power-off-temp-vm", "PUT", fmt.Sprintf("vm/powerOff/%d", vm.Id), "status was "+st, true, true)
-		if err := c.waitVMStatus(vm, "shutOff"); err != nil {
-			return fail(err)
-		}
+		// CAS ignored autoBooting=0: the first boot (cloud-init) may already
+		// have written machine-id, host keys etc. into the overlay, so the
+		// template would not be clean. Refuse; cleanup powers it off and
+		// recycles it.
+		return fail(errors.Wrapf(cloudprovider.ErrInvalidStatus, "temporary VM %s was started by CAS (status %s) although autoBooting=0; refusing to template a booted image", vm.Name, st))
 	default:
 		return fail(errors.Errorf("temporary VM %s has unexpected status %q", vm.Name, vm.VmStatus))
 	}
 
 	tpl, err := c.CreateVmTemplateFromVM(vm, opts.TemplateName, opts.Description)
 	if err != nil {
-		return fail(errors.Wrapf(err, "clone temporary VM to template"))
+		cause := errors.Wrapf(err, "clone temporary VM to template")
+		errs := []error{cause}
+		if found, lerr := c.findTemplatesNamed(opts.TemplateName); lerr != nil {
+			errs = append(errs, errors.Wrapf(lerr, "could not re-list templates; check by hand whether a template %q was left", opts.TemplateName))
+		} else if len(found) > 0 {
+			if len(found) == 1 {
+				res.Template = &found[0]
+			}
+			for i := range found {
+				errs = append(errs, errors.Errorf("template %d %q exists after the failure and may be incomplete: check it, and delete it by hand if broken", found[i].Id, found[i].Name))
+			}
+		}
+		if isTimeout(err) {
+			// The clone task may still be copying the VM's disk: do not
+			// delete the VM under it.
+			errs = append(errs, errors.Errorf("addVmTemplate did not finish in time (see the task/message id above) and may still be copying; temporary VM %s (%s) and overlay %s were kept. When the task has ended, check the template and remove them by hand", vm.Name, vm.Uuid, overlayPath))
+			return res, errors.NewAggregate(errs)
+		}
+		return fail(errors.NewAggregate(errs))
 	}
 	res.Template = tpl
 	res.add("clone-to-template", "POST", "vmTemplate/addVmTemplate", fmt.Sprintf("id=%d&domainName=%s&opType=%s", vm.Id, opts.TemplateName, TEMPLATE_OP_CLONE), true, true)
-	res.Warnings = append(res.Warnings, "UNVERIFIED: whether the template disk was flattened or still uses "+srcPath+" as backing file; do not delete the source until checked")
+
+	errs := []error{}
+	if detail, err := c.checkTemplateFlat(host.Id, tpl, srcPath, overlayPath); err != nil {
+		errs = append(errs, err)
+	} else {
+		res.add("check-template-flat", "GET", fmt.Sprintf("vmTemplate/storage?vmId=%d", tpl.Id), detail, false, true)
+	}
 
 	if err := vm.DeleteVM(context.Background()); err != nil {
-		return res, errors.Wrapf(err, "template %d created, but deleting temporary VM %s (%s) failed; remove it by hand", tpl.Id, vm.Name, vm.Uuid)
+		errs = append(errs, errors.Wrapf(err, "template %d created, but deleting temporary VM %s (%s) failed; remove it by hand", tpl.Id, vm.Name, vm.Uuid))
+	} else {
+		res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/"+vm.Uuid, deleteTempVMDetail+"; overlay stays with it", true, true)
 	}
-	res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/"+vm.Uuid, fmt.Sprintf("type=%s&isWipeVolume=%s (recycle bin; overlay stays with it)", DELETE_VM_TYPE, DELETE_VM_WIPE_VOLUME), true, true)
+	if len(errs) > 0 {
+		return res, errors.NewAggregate(errs)
+	}
 	return res, nil
+}
+
+var deleteTempVMDetail = fmt.Sprintf("type=%s&isWipeVolume=%s&delBase0=%s (recycle bin)", DELETE_VM_TYPE, DELETE_VM_WIPE_VOLUME, DELETE_VM_DEL_BASE0)
+
+func importTempVMDescription(o *SImageImportOptions) string {
+	return "temporary VM for template " + o.TemplateName + "; safe to delete"
+}
+
+func (c *SCasClient) findTemplatesNamed(name string) ([]SVmTemplate, error) {
+	templates, err := c.GetVmTemplates()
+	if err != nil {
+		return nil, err
+	}
+	return findTemplatesByName(templates, name), nil
+}
+
+// deleteImportOverlay removes the overlay after a failure in which no VM
+// can be using it. It re-reads the volume first and refuses when CAS
+// lists any user, or when the name is the source's.
+func (c *SCasClient) deleteImportOverlay(res *SImageImportResult, hostId int64, poolName, overlay, overlayPath, fileName string) error {
+	if overlay == fileName {
+		return errors.Errorf("cleanup: refusing to delete %s, it is the source", overlay)
+	}
+	vol, err := c.GetStorageVolume(hostId, poolName, overlay)
+	if errors.Cause(err) == cloudprovider.ErrNotFound {
+		return nil
+	}
+	if err != nil {
+		return errors.Wrapf(err, "cleanup: re-read overlay %s before deleting it; remove it by hand once no VM uses it", overlayPath)
+	}
+	if vol.isAttached() {
+		return errors.Errorf("cleanup: overlay %s is used by %s; not deleting it, remove it by hand once unused", overlayPath, vol.Users)
+	}
+	if err := c.DeleteStorageVolume(hostId, poolName, overlay); err != nil {
+		return errors.Wrapf(err, "cleanup: delete overlay %s; remove it by hand", overlayPath)
+	}
+	res.add("cleanup-delete-overlay", "DELETE", fmt.Sprintf("storage/volume/delete/%d/%s/%s", hostId, poolName, overlay), "isWipeVolume=false", true, true)
+	return nil
+}
+
+// STemplateStorage is api.yaml RsTemplateStorage, an element of
+// GET vmTemplate/storage?vmId=<template id> (key "data").
+type STemplateStorage struct {
+	Id        int64   `json:"id"`
+	StoreFile string  `json:"storeFile"`
+	Capacity  float64 `json:"capacity"`
+	Device    string  `json:"device"`
+	Format    string  `json:"format"`
+}
+
+func (cli *SCasClient) GetVmTemplateStorages(id int64) ([]STemplateStorage, error) {
+	params := url.Values{}
+	params.Set("vmId", fmt.Sprintf("%d", id))
+	ret := []STemplateStorage{}
+	return ret, cli.list("vmTemplate/storage", params, "data", &ret)
+}
+
+const (
+	// ErrTemplateHasBackingFile: a disk of the new template still has a
+	// backing file (addVmTemplate did not flatten).
+	ErrTemplateHasBackingFile = errors.Error("TemplateHasBackingFile")
+	// ErrTemplateUnverified: the template's disks could not be checked.
+	ErrTemplateUnverified = errors.Error("TemplateBackingUnverified")
+)
+
+func (cli *SCasClient) findPoolByPath(hostId int64, dir string) (*SStoragePool, error) {
+	pools, err := cli.GetStoragePools(hostId)
+	if err != nil {
+		return nil, err
+	}
+	shared, err := cli.GetSharedStoragePools(hostId)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range append(pools, shared...) {
+		if len(p.Path) > 0 && path.Clean(p.Path) == path.Clean(dir) {
+			pool := p
+			return &pool, nil
+		}
+	}
+	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "no storage pool with path %s on host %d", dir, hostId)
+}
+
+// checkTemplateFlat is the B1 post-check. The template's own backingStore
+// is documented as not valid on template queries, so it reads the
+// template's disk files (vmTemplate/storage) and looks each one up in the
+// storage pool of the import host whose path is the file's directory
+// (storage/volume lists backingStore). A disk with a backing file returns
+// ErrTemplateHasBackingFile; anything that cannot be checked returns
+// ErrTemplateUnverified. Either way the template is kept and named.
+func (c *SCasClient) checkTemplateFlat(hostId int64, tpl *SVmTemplate, srcPath, overlayPath string) (string, error) {
+	keep := fmt.Sprintf("template %d %q was created and is kept", tpl.Id, tpl.Name)
+	unverified := func(format string, args ...interface{}) error {
+		return errors.Wrapf(ErrTemplateUnverified, "%s, but %s; check its disk with qemu-img info on the host before deleting or moving %s", keep, fmt.Sprintf(format, args...), srcPath)
+	}
+	storages, err := c.GetVmTemplateStorages(tpl.Id)
+	if err != nil {
+		return "", unverified("listing its disks failed (%v)", err)
+	}
+	checked := []string{}
+	for _, st := range storages {
+		if len(st.Device) > 0 && st.Device != "disk" {
+			continue
+		}
+		if len(st.StoreFile) == 0 {
+			return "", unverified("disk %d has no storeFile", st.Id)
+		}
+		dir := tpl.TempletStoragePath
+		if path.IsAbs(st.StoreFile) {
+			dir = path.Dir(st.StoreFile)
+		}
+		name := path.Base(st.StoreFile)
+		if len(dir) == 0 {
+			return "", unverified("the directory of disk %s is unknown", st.StoreFile)
+		}
+		pool, err := c.findPoolByPath(hostId, dir)
+		if err != nil {
+			return "", unverified("no pool on host %d covers %s (%v)", hostId, dir, err)
+		}
+		vol, err := c.GetStorageVolume(hostId, pool.Name, name)
+		if err != nil {
+			return "", unverified("volume %s in pool %s could not be read (%v)", name, pool.Name, err)
+		}
+		if b := strings.TrimSpace(vol.BackingStore); len(b) > 0 {
+			return "", errors.Wrapf(ErrTemplateHasBackingFile, "%s, but its disk %s/%s has backing file %s, so the template depends on it (source %s, overlay %s): do NOT delete, move or overwrite those files, and do not purge the recycled temp VM. addVmTemplate did not flatten; the fallback is a full copy (vm/clone cloneMode=0), not implemented yet", keep, path.Clean(dir), name, b, srcPath, overlayPath)
+		}
+		checked = append(checked, path.Join(dir, name))
+	}
+	if len(checked) == 0 {
+		return "", unverified("no disk was listed for it")
+	}
+	return "no backingStore on " + strings.Join(checked, ", "), nil
 }
 
 // waitVMStatus polls vm/vmList until the VM reports vmStatus want.
@@ -644,7 +915,7 @@ func buildImportDomainAdd(o *SImageImportOptions, host *SHost, pool *SStoragePoo
 	return &SDomainAdd{
 		Name:           o.TempVMName,
 		Title:          o.TempVMName,
-		Description:    "temporary VM for template " + o.TemplateName + "; safe to delete",
+		Description:    importTempVMDescription(o),
 		HostId:         host.Id,
 		AutoMigrate:    0,
 		Memory:         o.MemoryMB,

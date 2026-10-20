@@ -301,8 +301,9 @@ func TestImportQcow2WithSSHUpload(t *testing.T) {
 	dir := t.TempDir()
 	f := impSSHFake(t, dir)
 	o := impOpts()
-	o.Upload = s.opts(writeLocal(t, []byte("cloud image")), "")
-	o.Upload.Addr = s.addr
+	up := s.opts(writeLocal(t, []byte("cloud image")), "")
+	up.Addr = s.addr
+	o.Stager = NewSSHStager(*up)
 	res, err := f.client(t).ImportQcow2AsTemplate(o)
 	if err != nil {
 		t.Fatal(err)
@@ -322,7 +323,7 @@ func TestImportQcow2SSHDryRunAndReadOnlyNoConnection(t *testing.T) {
 		f := impSSHFake(t, dir)
 		cli := f.client(t)
 		o := impOpts()
-		o.Upload = s.opts(writeLocal(t, []byte("x")), "")
+		o.Stager = NewSSHStager(*s.opts(writeLocal(t, []byte("x")), ""))
 		if mode == "dry-run" {
 			o.DryRun = true
 		} else {
@@ -344,5 +345,61 @@ func TestImportQcow2SSHDryRunAndReadOnlyNoConnection(t *testing.T) {
 	}
 	if e := dirEntries(t, dir); len(e) != 0 {
 		t.Fatalf("files written: %v", e)
+	}
+}
+
+// N5: skipping host-key checks is reported as a warning in the plan (and
+// so in the import result); verified modes give none. Plan never connects.
+func TestSSHStagerInsecureWarning(t *testing.T) {
+	s := startSSHServer(t)
+	local := writeLocal(t, []byte("img"))
+	target := SImportTarget{HostIp: "127.0.0.1", PoolPath: t.TempDir(), FileName: "cloud.qcow2"}
+
+	up := s.opts(local, "")
+	plan, err := NewSSHStager(*up).Plan(target)
+	if err != nil || len(plan.Warnings) != 0 || strings.Contains(plan.Detail, "NOT VERIFIED") {
+		t.Fatalf("pinned: %v %+v", err, plan)
+	}
+	up.HostKeySHA256 = ""
+	up.InsecureIgnoreHostKey = true
+	plan, err = NewSSHStager(*up).Plan(target)
+	if err != nil || len(plan.Warnings) != 1 || plan.Warnings[0] != SSHInsecureHostKeyWarning || !strings.Contains(plan.Detail, "HOST KEY NOT VERIFIED") {
+		t.Fatalf("insecure: %v %+v", err, plan)
+	}
+	if n := atomic.LoadInt32(&s.conns); n != 0 {
+		t.Fatalf("Plan connected %d times", n)
+	}
+
+	f := impSSHFake(t, target.PoolPath)
+	o := impOpts()
+	o.DryRun = true
+	up.Addr = s.addr
+	o.Stager = NewSSHStager(*up)
+	res, err := f.client(t).ImportQcow2AsTemplate(o)
+	if err != nil || len(res.Warnings) == 0 || res.Warnings[0] != SSHInsecureHostKeyWarning {
+		t.Fatalf("import result warnings: %v %+v", err, res)
+	}
+}
+
+// N7: the bytes streamed must match the hash shown in the plan.
+func TestSSHUploadLocalFileChanged(t *testing.T) {
+	s := startSSHServer(t)
+	dir := t.TempDir()
+	o := s.opts(writeLocal(t, []byte("now different")), dir)
+	o.ExpectSHA256 = strings.Repeat("0", 64)
+	_, err := uploadFileSSH(o)
+	if err == nil || !strings.Contains(err.Error(), "changed while uploading") {
+		t.Fatalf("err = %v", err)
+	}
+	if e := dirEntries(t, dir); len(e) != 0 {
+		t.Fatalf("leftovers: %v", e)
+	}
+}
+
+func TestSSHStagerStageNeedsPlan(t *testing.T) {
+	s := startSSHServer(t)
+	err := NewSSHStager(*s.opts(writeLocal(t, []byte("x")), "")).Stage(SImportTarget{HostIp: "127.0.0.1", PoolPath: t.TempDir(), FileName: "a.qcow2"})
+	if err == nil || !strings.Contains(err.Error(), "before Plan") {
+		t.Fatalf("err = %v", err)
 	}
 }
