@@ -16,10 +16,12 @@ package cas
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -42,6 +44,13 @@ type tplFake struct {
 	lastBody  string
 	// noopModify: modifyVmTemplate "succeeds" but leaves the name alone
 	noopModify bool
+	// deleteNotFound: deleteVmTemplateInfo answers 404; deleteRemoves
+	// says whether the template is gone anyway (concurrent delete).
+	deleteNotFound bool
+	deleteRemoves  bool
+	// infoRaw, when set, is the literal vmTemplateInfo body (for shapes
+	// such as "storages": null that dict marshalling cannot express).
+	infoRaw string
 }
 
 func (f *tplFake) writes() []string {
@@ -77,6 +86,11 @@ func (f *tplFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && path == "vmTemplate/all":
 		reply(w, dict{"domain": append([]dict{}, f.templates...)})
 	case r.Method == http.MethodGet && path == "vmTemplate/vmTemplateInfo":
+		if len(f.infoRaw) > 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(f.infoRaw))
+			return
+		}
 		tpl := f.find(id)
 		if tpl == nil {
 			w.Header().Set("Error-Code", "1000")
@@ -100,6 +114,17 @@ func (f *tplFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			tpl["description"], _ = body.GetString("description")
 		}
 		reply(w, dict{"msgId": 7002, "completed": false, "targetId": tid})
+	case r.Method == http.MethodDelete && path == "vmTemplate/deleteVmTemplateInfo" && f.deleteNotFound:
+		if f.deleteRemoves {
+			kept := []dict{}
+			for _, tpl := range f.templates {
+				if fmt.Sprintf("%v", tpl["id"]) != q.Get("id") {
+					kept = append(kept, tpl)
+				}
+			}
+			f.templates = kept
+		}
+		w.WriteHeader(http.StatusNotFound)
 	case r.Method == http.MethodDelete && path == "vmTemplate/deleteVmTemplateInfo":
 		kept := []dict{}
 		for _, tpl := range f.templates {
@@ -120,11 +145,34 @@ func (f *tplFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// testStorages carries an unknown field ("futureField", nested) that a
+// rename must send back as-is.
+func testStorages() []dict {
+	return []dict{
+		{"id": 100, "capacity": 4096, "storeFile": "/vms/template/tmpName.qcow2", "targetBus": "virtio",
+			"futureField": dict{"nested": []interface{}{1, "x", true}}, "ratio": 0.5},
+		{"id": 101, "capacity": 10240, "storeFile": "/vms/template/tmpName-1.qcow2"},
+	}
+}
+
+// jsonEqual compares two JSON texts semantically (encoding/json values).
+func jsonEqual(t *testing.T, a, b string) bool {
+	var va, vb interface{}
+	if err := json.Unmarshal([]byte(a), &va); err != nil {
+		t.Fatalf("unmarshal %s: %v", a, err)
+	}
+	if err := json.Unmarshal([]byte(b), &vb); err != nil {
+		t.Fatalf("unmarshal %s: %v", b, err)
+	}
+	return reflect.DeepEqual(va, vb)
+}
+
 func newTplFake(t *testing.T) (*tplFake, *SRegion) {
 	f := &tplFake{t: t, polls: map[int64]int{}}
 	f.templates = []dict{
 		{"id": 4, "name": "tmpName", "title": "tmpName", "description": "desc", "deployed": false,
-			"cpuSockets": 2, "cpuCores": 2, "memory": 4096, "memoryInit": 4, "memoryUnit": "GB", "system": 1},
+			"cpuSockets": 2, "cpuCores": 2, "memory": 4096, "memoryInit": 4, "memoryUnit": "GB", "system": 1,
+			"storages": testStorages()},
 		{"id": 5, "name": "other", "description": "", "deployed": false},
 	}
 	srv := httptest.NewServer(f)
@@ -215,8 +263,16 @@ func TestRenameTemplateBodyKeepsConfig(t *testing.T) {
 			t.Errorf("body %s = %v, want %s (body %s)", k, got, v, f.lastBody)
 		}
 	}
-	if body.Contains("storages") || body.Contains("domain") {
-		t.Errorf("rename body must not carry storages or a wrapper: %s", f.lastBody)
+	if body.Contains("domain") {
+		t.Errorf("rename body must not carry a wrapper: %s", f.lastBody)
+	}
+	// storages must come back exactly as vmTemplateInfo returned them
+	sent, err := body.Get("storages")
+	if err != nil {
+		t.Fatalf("rename body has no storages: %s", f.lastBody)
+	}
+	if !jsonEqual(t, sent.String(), jsonutils.Marshal(testStorages()).String()) {
+		t.Errorf("storages sent %s, want %s", sent, jsonutils.Marshal(testStorages()))
 	}
 	w := f.writes()
 	if len(w) != 1 || w[0] != "PUT /cas/casrs/vmTemplate/modifyVmTemplate" {
@@ -329,5 +385,51 @@ func TestTemplateWritesBlockedWhenReadOnly(t *testing.T) {
 	}
 	if len(f.hits) != 0 {
 		t.Fatalf("hits = %v", f.hits)
+	}
+}
+
+// B1: no write unless storages can be echoed unchanged.
+func TestRenameTemplateRefusedWithoutStorages(t *testing.T) {
+	for name, storages := range map[string]interface{}{
+		"missing":       nil,
+		"null":          "RAW",
+		"empty":         []dict{},
+		"object":        dict{"storage": testStorages()},
+		"string":        "/vms/template/x",
+		"non-object el": []interface{}{testStorages()[0], 7},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, region := newTplFake(t)
+			if storages == nil {
+				delete(f.templates[0], "storages")
+			} else if storages == "RAW" {
+				f.infoRaw = `{"id":4,"name":"tmpName","description":"desc","storages":null}`
+			} else {
+				f.templates[0]["storages"] = storages
+			}
+			_, err := region.cli.RenameVmTemplate(4, "renamed", nil)
+			if errors.Cause(err) != cloudprovider.ErrNotSupported || !strings.Contains(err.Error(), "refusing to rename") {
+				t.Fatalf("err = %v, want refusal", err)
+			}
+			if w := f.writes(); len(w) != 0 {
+				t.Fatalf("writes = %v, want none", w)
+			}
+		})
+	}
+}
+
+// N2: DELETE answering not-found is success only if vmTemplate/all agrees.
+func TestDeleteTemplateNotFoundMidFlight(t *testing.T) {
+	f, region := newTplFake(t)
+	f.deleteNotFound, f.deleteRemoves = true, true
+	if err := region.cli.DeleteVmTemplate(5); err != nil {
+		t.Fatalf("gone after 404: %v", err)
+	}
+
+	f, region = newTplFake(t)
+	f.deleteNotFound, f.deleteRemoves = true, false
+	err := region.cli.DeleteVmTemplate(5)
+	if err == nil || !strings.Contains(err.Error(), "does not confirm it is gone") {
+		t.Fatalf("still listed after 404: err = %v, want error", err)
 	}
 }

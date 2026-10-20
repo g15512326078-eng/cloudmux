@@ -57,11 +57,44 @@ type SVmTemplateInfo struct {
 	CpuMax          int     `json:"cpuMax"`
 	StorageCapacity int64   `json:"storageCapacity"`
 	CreateDate      string  `json:"createDate"`
+
+	// storages is the raw "storages" value of the response, kept as parsed
+	// JSON so a rename can send it back unchanged, unknown fields included.
+	// nil when the key is absent. api.yaml does not document storages on
+	// vmTemplateInfo, so whether a real CAS returns it is UNVERIFIED.
+	storages jsonutils.JSONObject
+}
+
+// renameStorages returns the template storages to echo in a rename body.
+// It fails closed: only a non-empty JSON array whose every element is an
+// object is accepted. Missing, null, empty, a bare object or any other
+// shape is an error, because api.yaml does not say what modifyVmTemplate
+// does when storages is omitted or different (the CAS UI uses the same
+// call to change disk size).
+func (info *SVmTemplateInfo) renameStorages() (jsonutils.JSONObject, error) {
+	if info.storages == nil {
+		return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "template %d: vmTemplateInfo has no storages; refusing to rename without them", info.Id)
+	}
+	arr, ok := info.storages.(*jsonutils.JSONArray)
+	if !ok {
+		return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "template %d: storages is %T, not an array; refusing to rename", info.Id, info.storages)
+	}
+	items, err := arr.GetArray()
+	if err != nil || len(items) == 0 {
+		return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "template %d: storages is empty; refusing to rename", info.Id)
+	}
+	for i := range items {
+		if _, ok := items[i].(*jsonutils.JSONDict); !ok {
+			return nil, errors.Wrapf(cloudprovider.ErrNotSupported, "template %d: storages[%d] is %T, not an object; refusing to rename", info.Id, i, items[i])
+		}
+	}
+	return info.storages, nil
 }
 
 // SVmTemplateModify is the body of PUT vmTemplate/modifyVmTemplate
 // (api.yaml body parameter "domain"; sent unwrapped like vm/deploy).
-// storages is never sent: rename must not touch template disks.
+// RenameVmTemplate adds "storages" to it, copied unchanged from
+// vmTemplateInfo.
 type SVmTemplateModify struct {
 	Id          int64   `json:"id"`
 	Name        string  `json:"name"`
@@ -103,6 +136,9 @@ func (cli *SCasClient) GetVmTemplateInfo(id int64) (*SVmTemplateInfo, error) {
 	info := &SVmTemplateInfo{}
 	if err := resp.Unmarshal(info); err != nil {
 		return nil, errors.Wrapf(err, "Unmarshal vmTemplateInfo %d", id)
+	}
+	if resp.Contains("storages") {
+		info.storages, _ = resp.Get("storages")
 	}
 	if info.Id != id {
 		return nil, errors.Errorf("vmTemplateInfo?id=%d returned template %d", id, info.Id)
@@ -216,11 +252,13 @@ func (cli *SCasClient) CreateVmTemplateFromVM(vm *SInstance, name, desc string) 
 
 // RenameVmTemplate changes the template name, and the description when
 // desc is not nil, with PUT vmTemplate/modifyVmTemplate. The body echoes
-// the current cpu/memory from vmTemplateInfo so a server that treats the
-// body as a full update keeps them; storages is never sent. It refuses:
-// a read-only account; an empty name; a name used by another template;
-// a template with deployed=true (the CAS UI says a fast-deployed template
-// cannot change its name).
+// the current cpu/memory and the storages value from vmTemplateInfo
+// unchanged, so a server that treats the body as a full update keeps
+// them. It refuses, without sending a write: a read-only account; an
+// empty name; a template whose storages cannot be echoed (see
+// renameStorages); a name used by another template; a template with
+// deployed=true (the CAS UI says a fast-deployed template cannot change
+// its name).
 func (cli *SCasClient) RenameVmTemplate(id int64, name string, desc *string) (*SVmTemplate, error) {
 	if err := cli.checkWritable("RenameVmTemplate"); err != nil {
 		return nil, err
@@ -239,6 +277,10 @@ func (cli *SCasClient) RenameVmTemplate(id int64, name string, desc *string) (*S
 	}
 	if info.Name == name && info.Description == newDesc {
 		return cli.getVmTemplateById(id)
+	}
+	storages, err := info.renameStorages()
+	if err != nil {
+		return nil, err
 	}
 	if info.Name != name && info.Deployed {
 		return nil, errors.Wrapf(cloudprovider.ErrInvalidStatus, "template %d (%s) has been fast-deployed; CAS does not allow renaming it", id, info.Name)
@@ -267,7 +309,9 @@ func (cli *SCasClient) RenameVmTemplate(id int64, name string, desc *string) (*S
 	if info.CpuSockets > 0 && info.CpuCores > 0 {
 		body.Cpu = info.CpuSockets * info.CpuCores
 	}
-	if _, err := cli.doAsync(httputils.PUT, "vmTemplate/modifyVmTemplate", nil, jsonutils.Marshal(body)); err != nil {
+	payload := jsonutils.Marshal(body).(*jsonutils.JSONDict)
+	payload.Set("storages", storages)
+	if _, err := cli.doAsync(httputils.PUT, "vmTemplate/modifyVmTemplate", nil, payload); err != nil {
 		return nil, errors.Wrapf(err, "modifyVmTemplate %d", id)
 	}
 	tpl, err := cli.getVmTemplateById(id)
@@ -290,8 +334,13 @@ func (cli *SCasClient) RenameVmTemplate(id int64, name string, desc *string) (*S
 //
 // The VM list cannot tell full from linked clones, so every VM deployed
 // from the template blocks the delete. A template that is already gone
-// returns nil. Afterwards the template must be absent from vmTemplate/all.
+// returns nil. If the DELETE itself answers not-found (a concurrent
+// delete), that is success only when vmTemplate/all confirms the template
+// is gone. Afterwards the template must be absent from vmTemplate/all.
 // No storage pool or volume endpoint is called.
+//
+// The dependents check and the DELETE are not atomic: a VM deployed from
+// the template in between is not seen here (CAS may still refuse).
 func (cli *SCasClient) DeleteVmTemplate(id int64) error {
 	if err := cli.checkWritable("DeleteVmTemplate"); err != nil {
 		return err
@@ -316,7 +365,13 @@ func (cli *SCasClient) DeleteVmTemplate(id int64) error {
 	params := url.Values{}
 	params.Set("id", fmt.Sprintf("%d", id))
 	if _, err := cli.doAsync(httputils.DELETE, "vmTemplate/deleteVmTemplateInfo", params, nil); err != nil {
-		return errors.Wrapf(err, "deleteVmTemplateInfo %d", id)
+		if errors.Cause(err) != cloudprovider.ErrNotFound {
+			return errors.Wrapf(err, "deleteVmTemplateInfo %d", id)
+		}
+		if _, lerr := cli.getVmTemplateById(id); errors.Cause(lerr) != cloudprovider.ErrNotFound {
+			return errors.Wrapf(err, "deleteVmTemplateInfo %d returned not-found but vmTemplate/all does not confirm it is gone (%v)", id, lerr)
+		}
+		return nil
 	}
 	_, err = cli.getVmTemplateById(id)
 	if err == nil {
