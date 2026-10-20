@@ -262,3 +262,29 @@ func TestWaitLoopsCancelDuringPoll(t *testing.T) {
 		}
 	}
 }
+
+// N-1: Probe has its own bound, below the per-request default.
+func TestProbeTimeoutBoundsStalledServer(t *testing.T) {
+	old := probeTimeout
+	probeTimeout = 300 * time.Millisecond
+	defer func() { probeTimeout = old }()
+	cli := timeoutClient("http://"+stalledListener(t), sClientTimeouts{ResponseHeader: time.Hour, Request: time.Hour})
+	start := time.Now()
+	err := cli.Probe()
+	assertFast(t, start, 5*time.Second, err)
+}
+
+// N-2: an ICloudVM method passes its ctx to the request.
+func TestVMMethodPassesCtx(t *testing.T) {
+	cli := timeoutClient("http://"+stalledListener(t), sClientTimeouts{ResponseHeader: time.Hour, Request: time.Hour})
+	vm := &SInstance{region: &SRegion{cli: cli}}
+	vm.Id = 9
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	start := time.Now()
+	err := vm.StopVM(ctx, &cloudprovider.ServerStopOptions{})
+	assertFast(t, start, 5*time.Second, err)
+	if errors.Cause(err) != context.Canceled && !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("err %v", err)
+	}
+}

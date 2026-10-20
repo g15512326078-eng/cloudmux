@@ -231,10 +231,13 @@ func NewCasClient(cfg *CasClientConfig) (*SCasClient, error) {
 	return cli, nil
 }
 
+// probeTimeout is DEFAULT_PROBE_TIMEOUT; a var so tests can shorten it.
+var probeTimeout = DEFAULT_PROBE_TIMEOUT
+
 // Probe checks Digest credentials with GET /cas/casrs/host, bounded by
-// DEFAULT_PROBE_TIMEOUT so an unreachable CAS fails fast (S-2).
+// probeTimeout so an unreachable CAS fails fast (S-2).
 func (cli *SCasClient) Probe() error {
-	_, err := cli.withRequestTimeout(DEFAULT_PROBE_TIMEOUT).GetHostBriefs()
+	_, err := cli.withRequestTimeout(probeTimeout).GetHostBriefs()
 	if err != nil {
 		return errors.Wrapf(err, "probe %s", cli.accessUrl)
 	}
