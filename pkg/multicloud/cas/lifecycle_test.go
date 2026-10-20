@@ -284,7 +284,7 @@ func TestCreateVMDeploy(t *testing.T) {
 	}
 	checks := map[string]interface{}{
 		"id": int64(11), "domainName": "newvm", "title": "newvm", "deployType": int64(1),
-		"deployMode": int64(0), "targetHostId": int64(7), "cpuSocket": int64(4), "cpuCore": int64(1),
+		"deployMode": int64(0), "targetHostId": int64(7), "cpuSocket": int64(1), "cpuCore": int64(4),
 		"memory": int64(4096), "memoryUnit": "MB", "desc": "p1 test",
 	}
 	for k, want := range checks {

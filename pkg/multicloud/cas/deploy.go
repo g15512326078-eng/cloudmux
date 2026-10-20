@@ -132,10 +132,10 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 		DeployMode:   0,
 		DeployType:   1,
 		TargetHostId: host.Id,
-		// UNVERIFIED split: api.yaml has both cpuSocket and cpuCore. We put
-		// the requested vCPU count in cpuSocket and leave cpuCore=1.
-		CpuSocket:  opts.Cpu,
-		CpuCore:    1,
+		// One socket with N cores, the split H3C's own nova plugin uses
+		// for deploy (cpuSockets=1, cpuCores=vcpus).
+		CpuSocket:  1,
+		CpuCore:    opts.Cpu,
 		Memory:     opts.MemoryMB,
 		MemoryUnit: "MB",
 		UserData:   opts.UserData,
