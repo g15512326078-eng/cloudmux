@@ -205,6 +205,14 @@ func (self *SCasProvider) GetIRegionById(id string) (cloudprovider.ICloudRegion,
 	return nil, cloudprovider.ErrNotFound
 }
 
+func (self *SCasProvider) GetClient() *cas.SCasClient {
+	return self.client
+}
+
+func (self *SCasProvider) GetMetrics(opts *cloudprovider.MetricListOptions) ([]cloudprovider.MetricValues, error) {
+	return self.client.GetMetrics(opts)
+}
+
 func (self *SCasProvider) GetBalance() (*cloudprovider.SBalanceInfo, error) {
 	return &cloudprovider.SBalanceInfo{
 		Amount:   0.0,

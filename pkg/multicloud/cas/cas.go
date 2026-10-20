@@ -93,6 +93,16 @@ func (cfg *CasClientConfig) SnapshotTimeZone(tz string) *CasClientConfig {
 	return cfg
 }
 
+// ReadOnlyClone returns a client that refuses non-GET/HEAD requests.
+func (cli *SCasClient) ReadOnlyClone() *SCasClient {
+	if cli == nil {
+		return nil
+	}
+	cfg := *cli.CasClientConfig
+	cfg.cpcfg.ReadOnly = true
+	return &SCasClient{CasClientConfig: &cfg, taskPollInterval: cli.taskPollInterval, taskTimeout: cli.taskTimeout}
+}
+
 // snapshotLocation returns the zone for zone-less snapshot timestamps.
 func (cli *SCasClient) snapshotLocation() *time.Location {
 	tz := DEFAULT_SNAPSHOT_TIMEZONE
@@ -121,16 +131,23 @@ type SCasClient struct {
 	taskTimeout      time.Duration
 }
 
-// NewCasClient builds a client and probes GET /cas/casrs/host (the path
-// upstream cas-clitool.sh uses), which checks connectivity and Digest
-// credentials in one go.
+// NewCasClient builds a client. Connectivity is checked on the first API
+// call (cloudmon/cmx), not at construction, so offline --fixture runs and
+// account wiring do not require a live CVM.
 func NewCasClient(cfg *CasClientConfig) (*SCasClient, error) {
-	cli := &SCasClient{CasClientConfig: cfg}
+	if cfg == nil {
+		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "nil CasClientConfig")
+	}
+	return &SCasClient{CasClientConfig: cfg}, nil
+}
+
+// Probe checks Digest credentials with GET /cas/casrs/host.
+func (cli *SCasClient) Probe() error {
 	_, err := cli.GetHostBriefs()
 	if err != nil {
-		return nil, errors.Wrapf(err, "probe %s", cfg.accessUrl)
+		return errors.Wrapf(err, "probe %s", cli.accessUrl)
 	}
-	return cli, nil
+	return nil
 }
 
 func (cli *SCasClient) getDefaultClient() *http.Client {

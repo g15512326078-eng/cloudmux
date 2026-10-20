@@ -143,6 +143,9 @@ func TestDigestAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCasClient: %v", err)
 	}
+	if err := cli.Probe(); err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
 	if len(f.seen) != 1 || f.seen[0] != "/cas/casrs/host" {
 		t.Errorf("probe requests = %v, want [/cas/casrs/host]", f.seen)
 	}
@@ -151,9 +154,12 @@ func TestDigestAuth(t *testing.T) {
 		t.Errorf("GetVersion = %q, %v", version, err)
 	}
 
-	_, err = newTestClient(t, srv.URL, "wrong")
-	if errors.Cause(err) != cloudprovider.ErrInvalidAccessKey {
-		t.Errorf("wrong password: err = %v, want ErrInvalidAccessKey", err)
+	bad, err := newTestClient(t, srv.URL, "wrong")
+	if err != nil {
+		t.Fatalf("NewCasClient(wrong): %v", err)
+	}
+	if err := bad.Probe(); errors.Cause(err) != cloudprovider.ErrInvalidAccessKey {
+		t.Errorf("wrong password Probe: err = %v, want ErrInvalidAccessKey", err)
 	}
 }
 
