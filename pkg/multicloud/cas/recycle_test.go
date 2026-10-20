@@ -143,8 +143,8 @@ func TestGetInstancesFiltersDelTime(t *testing.T) {
 	}
 }
 
-// db/01-cvm-tables.sql in the reference stores tbl_domain.del_time as
-// INTEGER DEFAULT 0: a live VM must not be hidden when vmList returns 0.
+// Observed CVM behaviour: delTime defaults to integer 0 for live VMs.
+// A live VM must not be hidden when vmList returns 0.
 func TestIsRecycledDelTimeForms(t *testing.T) {
 	cases := []struct {
 		raw  string

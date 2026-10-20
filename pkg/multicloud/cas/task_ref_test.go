@@ -21,7 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/httputils"
+
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
 
 func newTaskClient(t *testing.T, h http.HandlerFunc) *SCasClient {
@@ -71,6 +74,41 @@ func TestWaitTaskToleratesTransient403(t *testing.T) {
 	msg, err := cli.waitTask(9)
 	if err != nil || msg.TargetId != 3 {
 		t.Fatalf("msg=%+v err=%v", msg, err)
+	}
+}
+
+func TestWaitTaskFailsAfterConsecutive403s(t *testing.T) {
+	cli := newTaskClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	_, err := cli.waitTask(9)
+	if errors.Cause(err) != cloudprovider.ErrNoPermission {
+		t.Fatalf("err = %v, want ErrNoPermission", err)
+	}
+	if !strings.Contains(err.Error(), "consecutive 403") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestWaitTask403CounterResetsOnSuccess(t *testing.T) {
+	n := 0
+	cli := newTaskClient(t, func(w http.ResponseWriter, r *http.Request) {
+		n++
+		// 403, ok(incomplete), 403x2, ok(complete) — never 6 in a row
+		switch n {
+		case 1, 3, 4:
+			w.WriteHeader(http.StatusForbidden)
+			return
+		case 2:
+			reply(w, dict{"msgId": 9, "completed": false, "result": 0})
+			return
+		default:
+			reply(w, dict{"msgId": 9, "completed": true, "result": 0, "targetId": 3})
+		}
+	})
+	msg, err := cli.waitTask(9)
+	if err != nil || msg.TargetId != 3 {
+		t.Fatalf("msg=%+v err=%v after %d polls", msg, err, n)
 	}
 }
 

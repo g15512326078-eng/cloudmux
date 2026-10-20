@@ -162,7 +162,7 @@ func TestCreateVMWithDataDisks(t *testing.T) {
 	}
 }
 
-func TestCreateVMDataDiskFailureKeepsVM(t *testing.T) {
+func TestCreateVMDataDiskFailureRollsBack(t *testing.T) {
 	f, region, host, _ := newP2Env(t)
 	mux := http.NewServeMux()
 	mux.HandleFunc(API_PREFIX+"/vm/deploy", func(w http.ResponseWriter, r *http.Request) {
@@ -185,13 +185,45 @@ func TestCreateVMDataDiskFailureKeepsVM(t *testing.T) {
 		SysDisk:   cloudprovider.SDiskInfo{StorageExternalId: "host/7/defaultpool"},
 		DataDisks: []cloudprovider.SDiskInfo{{SizeGB: 10}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "uuid-9") || !strings.Contains(err.Error(), "deployed") {
+	if err == nil || !strings.Contains(err.Error(), "uuid-9") || !strings.Contains(err.Error(), "recycle") {
 		t.Errorf("err = %v", err)
 	}
+	foundDelete := false
 	for _, w := range f.writes() {
-		if strings.HasPrefix(w, "DELETE ") || strings.Contains(w, "vm/delete") {
-			t.Errorf("failure path issued %s", w)
+		if strings.Contains(w, "vm/delete/uuid/uuid-9") && strings.Contains(w, "type=3") {
+			foundDelete = true
 		}
+	}
+	if !foundDelete {
+		t.Errorf("expected rollback DeleteVM type=3: %v", f.writes())
+	}
+}
+
+func TestCreateVMDataDiskCollisionRefused(t *testing.T) {
+	f, region, host, _ := newP2Env(t)
+	f.vols["vm9-data1"] = &p2Vol{name: "vm9-data1", format: "qcow2", sizeMB: 1}
+	mux := http.NewServeMux()
+	mux.HandleFunc(API_PREFIX+"/vm/deploy", func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("deploy must not run when data-disk file exists")
+		w.WriteHeader(500)
+	})
+	mux.Handle("/", f)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig(srv.URL, testUser, testPass).CloudproviderConfig(cloudprovider.ProviderConfig{Id: "acc1", Name: "cas-test"})}
+	cli.taskPollInterval = 5 * time.Millisecond
+	cli.taskTimeout = 2 * time.Second
+	region.cli = cli
+	_, err := host.CreateVM(&cloudprovider.SManagedVMCreateConfig{
+		Name: "vm9", ExternalImageId: "11", Cpu: 1, MemoryMB: 1024,
+		SysDisk:   cloudprovider.SDiskInfo{StorageExternalId: "host/7/defaultpool"},
+		DataDisks: []cloudprovider.SDiskInfo{{SizeGB: 10}},
+	})
+	if errors.Cause(err) != cloudprovider.ErrDuplicateId {
+		t.Errorf("collision: %v", err)
+	}
+	if w := f.writes(); len(w) != 0 {
+		t.Errorf("writes before deploy: %v", w)
 	}
 }
 

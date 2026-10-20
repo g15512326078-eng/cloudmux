@@ -446,9 +446,9 @@ func TestSyncRequestCount(t *testing.T) {
 	const nHosts = 2
 	// hostpool/all + host + vmTemplate/all + one vm/vmList page, plus per
 	// host: host/id/{id}, storage/pool, host/id/{id}/storage,
-	// host/id/{id}/vswitch, vm/detail/all?hostId=, and one storage/volume
-	// per pool (2 pools) for unattached volumes.
-	want := 4 + 7*nHosts
+	// host/id/{id}/vswitch, vm/detail/all?hostId=.
+	// Unattached pool files are no longer listed (B1), so no storage/volume.
+	want := 4 + 5*nHosts
 	for _, nVMs := range []int{6, 60} {
 		f := newFakeCloud(t, nHosts, nVMs)
 		cli, _ := f.start()

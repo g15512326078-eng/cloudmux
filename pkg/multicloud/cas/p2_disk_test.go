@@ -66,6 +66,8 @@ type p2Fake struct {
 	failMsg   map[string]bool // "METHOD path" -> task fails
 	modifyAck int64           // msgId vm/modify returns; 0 = task
 	resized   bool            // vm/modify really changes the size
+	volDelay  map[string]int  // volumeName -> GETs to skip before appearing
+	recycled  bool            // after DeleteVM type=3
 }
 
 func newP2Fake(t *testing.T) *p2Fake {
@@ -124,7 +126,15 @@ func (f *p2Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == "GET" && p == "hostpool/all":
 		reply(w, dict{"hostPool": []dict{{"id": 1, "name": "hp1"}}})
+	case r.Method == "GET" && p == "host":
+		reply(w, dict{"host": []dict{{"id": 7, "name": "cvk7", "hostPoolId": 1, "status": 1}}})
+	case r.Method == "GET" && p == "host/id/7":
+		reply(w, dict{"id": 7, "name": "cvk7", "hostPoolId": 1, "status": 1})
 	case r.Method == "GET" && p == "vm/vmList":
+		if f.recycled {
+			reply(w, dict{"domain": []dict{{"id": 9, "uuid": "uuid-9", "name": "vm9", "title": "vm9", "hostId": 7, "hostPoolId": 1, "cpu": 1, "memory": 1024, "vmStatus": "shutOff", "system": 1, "delTime": 1603983250000}}})
+			return
+		}
 		reply(w, dict{"domain": []dict{{"id": 9, "uuid": "uuid-9", "name": "vm9", "title": "vm9", "hostId": 7, "hostPoolId": 1, "cpu": 1, "memory": 1024, "vmStatus": f.vmStatus, "system": 1}}})
 	case r.Method == "GET" && (p == "vm/detail/9" || p == "vm/detail/uuid/uuid-9"):
 		reply(w, f.detail())
@@ -142,6 +152,12 @@ func (f *p2Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for _, v := range f.vols {
 			if n := q.Get("volumeName"); len(n) > 0 && n != v.name {
 				continue
+			}
+			if f.volDelay != nil {
+				if left := f.volDelay[v.name]; left > 0 {
+					f.volDelay[v.name] = left - 1
+					continue
+				}
 			}
 			ret = append(ret, dict{"name": v.name, "format": v.format, "size": v.sizeMB, "users": v.users, "level": v.level, "storagePoolName": "defaultpool"})
 		}
@@ -231,6 +247,12 @@ func (f *p2Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		f.task(w, key)
+	case r.Method == "PUT" && len(parts) == 3 && parts[0] == "vm" && (parts[1] == "stop" || parts[1] == "powerOff" || parts[1] == "start"):
+		f.vmStatus = map[string]string{"stop": "shutOff", "powerOff": "shutOff", "start": "running"}[parts[1]]
+		f.task(w, key)
+	case r.Method == "DELETE" && strings.HasPrefix(p, "vm/delete/uuid/"):
+		f.recycled = true
 		f.task(w, key)
 	case r.Method == "GET" && len(parts) == 2 && parts[0] == "message":
 		var id int64
@@ -348,6 +370,7 @@ func TestParseDiskId(t *testing.T) {
 
 func TestStableDiskIdAndListing(t *testing.T) {
 	f, _, host, vm := newP2Env(t)
+	// Leftovers / templates / ISOs must NOT appear as pool disks (B1).
 	f.vols["free.qcow2"] = &p2Vol{name: "free.qcow2", format: "qcow2", sizeMB: 1024}
 	f.vols["base.qcow2"] = &p2Vol{name: "base.qcow2", format: "qcow2", sizeMB: 1024, level: 1}
 	f.vols["os.iso"] = &p2Vol{name: "os.iso", format: "iso", sizeMB: 600}
@@ -362,7 +385,6 @@ func TestStableDiskIdAndListing(t *testing.T) {
 		t.Errorf("type %s", disks[0].GetDiskType())
 	}
 	pool := localPool(t, host)
-	// GetIDisks of a pool walks region VMs; seed the VM list via the fake.
 	all, err := pool.GetIDisks()
 	if err != nil {
 		t.Fatal(err)
@@ -372,8 +394,13 @@ func TestStableDiskIdAndListing(t *testing.T) {
 		ids = append(ids, d.GetGlobalId())
 	}
 	got := strings.Join(ids, ",")
-	if got != "host/7/defaultpool/vm9-sys.qcow2,host/7/defaultpool/free.qcow2" {
-		t.Errorf("pool disks = %s", got)
+	if got != "host/7/defaultpool/vm9-sys.qcow2" {
+		t.Errorf("pool disks = %s (must not list unattached leftovers)", got)
+	}
+	// Known unattached id is still reachable for Delete / Attach.
+	d, err := pool.GetIDiskById("host/7/defaultpool/free.qcow2")
+	if err != nil || d.GetDiskSizeMB() != 1024 {
+		t.Fatalf("GetIDiskById free: %v %v", d, err)
 	}
 }
 
@@ -483,5 +510,62 @@ func TestDiskResize(t *testing.T) {
 	free := volumeDisk(&SStorage{SStoragePool: SStoragePool{Name: "defaultpool", Path: p2PoolPath}}, &SStorageVolume{Name: "x.qcow2", Format: "qcow2", Size: 1})
 	if err := free.Resize(context.Background(), 2048); errors.Cause(err) != cloudprovider.ErrNotSupported {
 		t.Errorf("unattached resize: %v", err)
+	}
+}
+
+func TestWaitStorageVolume(t *testing.T) {
+	f, _, host, _ := newP2Env(t)
+	pool := localPool(t, host)
+	// Delay appearance: first N GETs omit the new volume.
+	f.lock.Lock()
+	f.volDelay = map[string]int{"late.qcow2": 2}
+	f.lock.Unlock()
+	disk, err := pool.CreateIDisk(&cloudprovider.DiskCreateConfig{Name: "late", SizeGb: 1})
+	if err != nil {
+		t.Fatalf("CreateIDisk: %v", err)
+	}
+	if disk.GetGlobalId() != "host/7/defaultpool/late.qcow2" {
+		t.Errorf("id %s", disk.GetGlobalId())
+	}
+}
+
+func TestRegionGetIDiskById(t *testing.T) {
+	f, region, _, vm := newP2Env(t)
+	_ = f
+	disks, _ := vm.GetIDisks()
+	id := disks[0].GetGlobalId()
+	got, err := region.GetIDiskById(id)
+	if err != nil || got.GetGlobalId() != id {
+		t.Fatalf("GetIDiskById(%s) = %v %v", id, got, err)
+	}
+	if _, err := region.GetIDiskById("uuid-9/vda"); errors.Cause(err) != cloudprovider.ErrNotFound {
+		t.Errorf("legacy id: %v", err)
+	}
+	if _, err := region.GetIDiskById("host/7/defaultpool/missing.qcow2"); errors.Cause(err) != cloudprovider.ErrNotFound {
+		t.Errorf("missing: %v", err)
+	}
+}
+
+func TestDiskIdSkipsLegacyOnTransientStorageError(t *testing.T) {
+	// A disk with storage pre-set keeps the stable id even if a later
+	// getStorage would fail; GetIDisks surfaces transient errors.
+	st := &SStorage{SStoragePool: SStoragePool{Name: "defaultpool", Path: p2PoolPath}, host: &SHost{Id: 7, HostPoolId: 1}}
+	d := SDisk{
+		SInstanceStorage: SInstanceStorage{Device: "disk", DeviceName: "vda", Path: p2PoolPath + "/vm9-sys.qcow2"},
+		ins:              &SInstance{Uuid: "uuid-9"},
+		storage:          st,
+	}
+	if id := d.GetId(); id != "host/7/defaultpool/vm9-sys.qcow2" {
+		t.Errorf("stable id with storage set: %s", id)
+	}
+	d.storage = nil
+	d.ins = &SInstance{Uuid: "uuid-9", region: &SRegion{cli: &SCasClient{CasClientConfig: NewCasClientConfig("http://127.0.0.1:1", "u", "p")}}}
+	// No host → getStorage fails with a non-NotFound error; must not flip to uuid/vda.
+	id := d.GetId()
+	if id == "uuid-9/vda" {
+		t.Errorf("transient/missing host flipped to legacy id %s", id)
+	}
+	if id != p2PoolPath+"/vm9-sys.qcow2" {
+		t.Errorf("want path stand-in, got %s", id)
 	}
 }

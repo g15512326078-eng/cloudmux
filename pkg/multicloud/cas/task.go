@@ -60,7 +60,7 @@ type SMessage struct {
 	Result     int    `json:"result"`
 	FailMsg    string `json:"failMsg"`
 	EventType  int    `json:"eventType"`
-	// KeyValue carries extra failure context (H3C's nova plugin reads it
+	// KeyValue carries extra failure context (observed CAS clients read it
 	// next to failMsg when result != 0).
 	KeyValue []SMessageKeyValue `json:"keyValue"`
 }
@@ -92,6 +92,9 @@ const (
 	// client and must be confirmed on a real CAS.
 	DEFAULT_TASK_POLL_INTERVAL = 5 * time.Second
 	DEFAULT_TASK_TIMEOUT       = 10 * time.Minute
+	// MAX_TASK_403 is how many consecutive 403s waitTask tolerates
+	// before treating the denial as real (Digest nonce blips are brief).
+	MAX_TASK_403 = 6
 )
 
 // parseTaskMsg decodes an RsTaskMsg body. A missing/zero msgId with
@@ -140,6 +143,7 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 		timeout = DEFAULT_TASK_TIMEOUT
 	}
 	var last *SMessage
+	consecutive403 := 0
 	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
 		msg, err := cli.GetMessage(msgId)
 		if err != nil {
@@ -149,10 +153,14 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 			if errors.Cause(err) == cloudprovider.ErrNotFound {
 				return false, nil
 			}
-			// H3C's own clients keep polling on 403 (nova plugin
-			// wait_for_task, and its HTTP client retries 403): CAS returns
-			// it transiently, e.g. while the Digest nonce rolls over.
+			// Observed CAS clients keep polling on 403: Digest auth can
+			// 403 briefly while the nonce rolls over. Bound the streak so a
+			// real permission denial does not become a 10-minute timeout.
 			if errors.Cause(err) == cloudprovider.ErrNoPermission {
+				consecutive403++
+				if consecutive403 >= MAX_TASK_403 {
+					return false, errors.Wrapf(cloudprovider.ErrNoPermission, "waitTask %d: %d consecutive 403s", msgId, consecutive403)
+				}
 				return false, nil
 			}
 			if ce, ok := errors.Cause(err).(*SCasError); ok && ce.StatusCode >= 500 {
@@ -160,6 +168,7 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 			}
 			return false, err
 		}
+		consecutive403 = 0
 		last = msg
 		log.Debugf("cas task %d completed=%v result=%d progress from submit unknown failMsg=%q",
 			msg.MsgId, msg.Completed, msg.Result, msg.FailMsg)
@@ -182,7 +191,7 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 }
 
 // MSG_ID_NO_TASK is the msgId CAS returns when a write finished inline
-// and no task was created (H3C's nova plugin skips waiting on "-1" after
+// and no task was created (observed CAS clients skip waiting on "-1" after
 // PUT /vm/modify).
 const MSG_ID_NO_TASK = -1
 

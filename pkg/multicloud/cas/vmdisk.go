@@ -66,7 +66,7 @@ const (
 	ADD_DEVICE_PATH_NEW_FILE      = 2
 
 	DEFAULT_DISK_BUS   = "virtio"
-	DEFAULT_DISK_CACHE = "directsync" // what H3C's nova plugin attaches with
+	DEFAULT_DISK_CACHE = "directsync" // cache mode observed on CAS attach
 )
 
 // diskBus reuses the bus of the VM's first disk so the guest has a driver

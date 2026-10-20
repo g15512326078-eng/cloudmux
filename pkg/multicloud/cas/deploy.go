@@ -119,9 +119,6 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 	if opts.Cpu <= 0 || opts.MemoryMB <= 0 {
 		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "Cpu and MemoryMB are required")
 	}
-	if _, err := dataDiskPlan(opts); err != nil {
-		return nil, err
-	}
 	body := &SDomainDeploy{
 		Id:           tplId,
 		Title:        opts.Name,
@@ -130,7 +127,7 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 		DeployMode:   0,
 		DeployType:   1,
 		TargetHostId: host.Id,
-		// One socket with N cores, the split H3C's own nova plugin uses
+		// One socket with N cores: the split observed on real CAS deploys
 		// for deploy (cpuSockets=1, cpuCores=vcpus).
 		CpuSocket:  1,
 		CpuCore:    opts.Cpu,
@@ -175,15 +172,16 @@ func buildDeployBody(host *SHost, opts *cloudprovider.SManagedVMCreateConfig) (*
 }
 
 type dataDiskSpec struct {
-	pool   string
-	sizeMB int64
+	pool     string
+	fileName string
+	sizeMB   int64
 }
 
 // dataDiskPlan validates DataDisks before anything is deployed: each needs
 // a positive size and a pool (its own StorageExternalId, else the system
 // disk's). VMRsDomainDeploy has no data-disk size field, so data disks are
-// added after deploy with vm/addDevice (new file), the way H3C's nova
-// plugin attaches block devices after its deploy call.
+// added after deploy with vm/addDevice (new file), matching the observed
+// CAS flow of attaching block devices after deploy.
 func dataDiskPlan(opts *cloudprovider.SManagedVMCreateConfig) ([]dataDiskSpec, error) {
 	ret := []dataDiskSpec{}
 	for i, d := range opts.DataDisks {
@@ -197,9 +195,48 @@ func dataDiskPlan(opts *cloudprovider.SManagedVMCreateConfig) ([]dataDiskSpec, e
 		if len(storageId) == 0 {
 			return nil, errors.Wrapf(cloudprovider.ErrMissingParameter, "data disk %d: no storage", i)
 		}
-		ret = append(ret, dataDiskSpec{pool: storagePoolNameFromId(storageId), sizeMB: int64(d.SizeGB) * 1024})
+		ret = append(ret, dataDiskSpec{
+			pool:     storagePoolNameFromId(storageId),
+			fileName: dataDiskFileName(opts.Name, i+1),
+			sizeMB:   int64(d.SizeGB) * 1024,
+		})
 	}
 	return ret, nil
+}
+
+// ensureDataDiskFilesFree refuses a deploy when any planned data-disk
+// file name already exists in its pool (retry after a partial failure,
+// or a leftover of the same name, must not reuse/overwrite).
+func (self *SHost) ensureDataDiskFilesFree(plan []dataDiskSpec) error {
+	cli := self.zone.region.cli
+	for i, d := range plan {
+		_, err := cli.GetStorageVolume(self.Id, d.pool, d.fileName)
+		if err == nil {
+			return errors.Wrapf(cloudprovider.ErrDuplicateId, "data disk file %s already exists in pool %s (disk %d)", d.fileName, d.pool, i+1)
+		}
+		if errors.Cause(err) != cloudprovider.ErrNotFound {
+			return errors.Wrapf(err, "GetStorageVolume %s/%s before deploy", d.pool, d.fileName)
+		}
+	}
+	return nil
+}
+
+// rollbackDeployedVM best-effort DeleteVM (type=3 recycle, no wipe) after
+// a post-deploy data-disk failure. The VM was just created and holds no
+// user data; recycling it avoids a leaked CAS guest that cloudpods would
+// re-import on the next sync.
+func rollbackDeployedVM(vm *SInstance, cause error) error {
+	if vm == nil {
+		return cause
+	}
+	rbErr := vm.DeleteVM(context.Background())
+	if rbErr != nil {
+		return errors.NewAggregate([]error{
+			cause,
+			errors.Wrapf(rbErr, "rollback DeleteVM of deployed vm %s (%s)", vm.GetName(), vm.Uuid),
+		})
+	}
+	return errors.Wrapf(cause, "rolled back deployed vm %s (%s) into the CAS recycle bin", vm.GetName(), vm.Uuid)
 }
 
 // DeployVM is POST /cas/casrs/vm/deploy. Returns the finished SMessage
@@ -215,6 +252,13 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	if err != nil {
 		return nil, err
 	}
+	plan, err := dataDiskPlan(opts)
+	if err != nil {
+		return nil, err
+	}
+	if err := self.ensureDataDiskFilesFree(plan); err != nil {
+		return nil, err
+	}
 	msg, err := self.zone.region.cli.DeployVM(body)
 	if err != nil {
 		return nil, errors.Wrapf(err, "DeployVM")
@@ -225,30 +269,27 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	}
 	vm.host = self
 	vm.region = self.zone.region
-	plan, _ := dataDiskPlan(opts)
 	if len(plan) > 0 && (vm.GetStatus() == api.VM_RUNNING || vm.GetStatus() == api.VM_SUSPEND) {
 		// add disks to a stopped guest only
 		if err := vm.StopVM(context.Background(), &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
-			return nil, errors.Wrapf(err, "StopVM before adding data disks (status was %s)", vm.GetStatus())
+			return nil, rollbackDeployedVM(vm, errors.Wrapf(err, "StopVM before adding data disks (status was %s)", vm.GetStatus()))
 		}
 	}
 	for i, d := range plan {
-		// On failure the deployed VM is left in place (never deleted
-		// here); the error names it so it can be cleaned up.
-		if err := vm.createDataDisk(d.pool, dataDiskFileName(opts.Name, i+1), d.sizeMB); err != nil {
-			return nil, errors.Wrapf(err, "vm %s (%s) deployed, but adding data disk %d (%d MB in %s) failed", vm.GetName(), vm.Uuid, i+1, d.sizeMB, d.pool)
+		if err := vm.createDataDisk(d.pool, d.fileName, d.sizeMB); err != nil {
+			return nil, rollbackDeployedVM(vm, errors.Wrapf(err, "vm %s (%s) deployed, but adding data disk %d (%d MB in %s as %s) failed", vm.GetName(), vm.Uuid, i+1, d.sizeMB, d.pool, d.fileName))
 		}
 	}
 	if len(plan) > 0 {
 		if err := vm.Refresh(); err != nil {
-			return nil, errors.Wrapf(err, "Refresh after adding data disks")
+			return nil, rollbackDeployedVM(vm, errors.Wrapf(err, "Refresh after adding data disks"))
 		}
 		disks, err := vm.getDisks()
 		if err != nil {
-			return nil, errors.Wrapf(err, "getDisks after adding data disks")
+			return nil, rollbackDeployedVM(vm, errors.Wrapf(err, "getDisks after adding data disks"))
 		}
 		if len(disks) < len(plan)+1 {
-			return nil, errors.Errorf("vm %s has %d disks after adding %d data disks, want %d", vm.Uuid, len(disks), len(plan), len(plan)+1)
+			return nil, rollbackDeployedVM(vm, errors.Errorf("vm %s has %d disks after adding %d data disks, want %d", vm.Uuid, len(disks), len(plan), len(plan)+1))
 		}
 	}
 	// cloudpods CAS guest driver expects VM_READY (shutOff) after create.

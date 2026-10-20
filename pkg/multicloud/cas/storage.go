@@ -17,7 +17,6 @@ package cas
 import (
 	"fmt"
 	"net/url"
-	"path"
 	"strings"
 
 	"yunion.io/x/jsonutils"
@@ -237,9 +236,9 @@ func (self *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (cloudpr
 	if err := cli.CreateStorageVolume(body); err != nil {
 		return nil, errors.Wrapf(err, "CreateStorageVolume %s", volName)
 	}
-	vol, err := cli.GetStorageVolume(self.host.Id, self.Name, volName)
+	vol, err := cli.waitStorageVolume(self.host.Id, self.Name, volName)
 	if err != nil {
-		return nil, errors.Wrapf(err, "GetStorageVolume %s after create", volName)
+		return nil, errors.Wrapf(err, "waitStorageVolume %s after create", volName)
 	}
 	disk := volumeDisk(self, vol)
 	return &disk, nil
@@ -253,10 +252,11 @@ func (self *SStorage) contains(path string) bool {
 	return strings.HasPrefix(path, strings.TrimSuffix(self.Path, "/")+"/")
 }
 
-// GetIDisks returns the VM disks in this pool (walking the VMs that can
-// use it: the host for a local pool, the host pool for a shared one) plus
-// the unattached data volumes of the pool (GET storage/volume: leaf
-// qcow2/raw files with no users; ISOs and base files are skipped).
+// GetIDisks returns the VM disks that live in this pool (walking the VMs
+// that can use it: the host for a local pool, the host pool for a shared
+// one). Unattached pool files are NOT listed: templates, backups and
+// leftovers would otherwise show up as deletable cloudpods disks.
+// Known unattached volumes are still reachable via GetIDiskById.
 func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 	region := self.host.zone.region
 	vms, err := region.cachedInstances()
@@ -264,7 +264,6 @@ func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 		return nil, err
 	}
 	ret := []cloudprovider.ICloudDisk{}
-	inUse := map[string]bool{}
 	for i := range vms {
 		if self.shared && vms[i].HostPoolId != self.host.HostPoolId {
 			continue
@@ -278,22 +277,12 @@ func (self *SStorage) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 		}
 		for j := range disks {
 			if self.contains(disks[j].Path) {
+				// Known pool: set storage directly so GetId stays stable
+				// without a host lookup on the cached VM (C3).
 				disks[j].storage = self
-				inUse[path.Base(disks[j].Path)] = true
 				ret = append(ret, &disks[j])
 			}
 		}
-	}
-	vols, err := region.cli.GetStorageVolumes(self.host.Id, self.Name, "")
-	if err != nil {
-		return nil, errors.Wrapf(err, "GetStorageVolumes %s", self.Name)
-	}
-	for i := range vols {
-		if !vols[i].isDataVolume() || vols[i].isAttached() || inUse[vols[i].Name] {
-			continue
-		}
-		disk := volumeDisk(self, &vols[i])
-		ret = append(ret, &disk)
 	}
 	return ret, nil
 }
@@ -308,5 +297,20 @@ func (self *SStorage) GetIDiskById(id string) (cloudprovider.ICloudDisk, error) 
 			return disks[i], nil
 		}
 	}
-	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "disk %s", id)
+	// Known id of an unattached volume we manage by id (CreateIDisk /
+	// DetachDisk): resolve via GET storage/volume, never by listing every
+	// leftover file in the pool.
+	storageId, volName, err := parseDiskId(id)
+	if err != nil || storageId != self.GetGlobalId() {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "disk %s", id)
+	}
+	vol, err := self.host.zone.region.cli.GetStorageVolume(self.host.Id, self.Name, volName)
+	if err != nil {
+		return nil, err
+	}
+	if !vol.isDataVolume() {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "volume %s is not a data disk", volName)
+	}
+	disk := volumeDisk(self, vol)
+	return &disk, nil
 }

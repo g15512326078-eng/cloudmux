@@ -52,7 +52,7 @@ func (self *SCasProviderFactory) ValidateChangeBandwidth(instanceId string, band
 // documented default; deployments serving https must pass a full URL.
 const DEFAULT_SCHEME = "http"
 
-// defaultPorts are the CVM Tomcat connectors: H3C's own REST clients use
+// defaultPorts are the CVM Tomcat connectors observed in the field:
 // http://host:8080 and https://host:8443 (TLS 1.2, self-signed).
 var defaultPorts = map[string]int{"http": 8080, "https": 8443}
 

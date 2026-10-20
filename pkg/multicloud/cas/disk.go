@@ -43,11 +43,21 @@ type SDisk struct {
 }
 
 // GetId is diskId(storage, file name) — stable across attach/detach. A
-// VM disk whose pool cannot be resolved falls back to the legacy
-// {vm uuid}/{device name}.
+// VM disk whose pool cannot be resolved (definitive ErrNotFound) falls
+// back to the legacy {vm uuid}/{device name}. Transient lookup errors
+// must not flip the id: callers that need a stable id (GetIDisks) resolve
+// storage first and surface those errors instead of calling GetId blind.
 func (self *SDisk) GetId() string {
+	if self.storage != nil {
+		return diskId(self.storage.GetGlobalId(), path.Base(self.Path))
+	}
 	if storage, err := self.getStorage(); err == nil {
 		return diskId(storage.GetGlobalId(), path.Base(self.Path))
+	} else if errors.Cause(err) != cloudprovider.ErrNotFound {
+		// Transient lookup failure: never flip to the legacy {uuid}/{dev}
+		// id (that churns synced records). Use the volume path as a
+		// stand-in; GetIDisks surfaces the error before GetId is relied on.
+		return self.Path
 	}
 	if self.ins != nil {
 		return fmt.Sprintf("%s/%s", self.ins.Uuid, self.DeviceName)

@@ -63,9 +63,9 @@ type SInstance struct {
 	CreateDate   string  `json:"createDate"`
 	Type         int     `json:"type"` // 0 CAS, 1 VMware
 	// DelTime is DomainRsDomainvmList.delTime ("虚拟机逻辑回收时间").
-	// api.yaml types it as a date string, but the CVM schema stores
-	// tbl_domain.del_time as INTEGER DEFAULT 0, so a live VM may come back
-	// as 0 / "0". See isRecycled. POST /vm/restoreVm restores a recycled VM.
+	// api.yaml types it as a date string; observed CAS returns integer 0
+	// (or "0") for live VMs. See isRecycled. POST /vm/restoreVm restores
+	// a recycled VM.
 	DelTime string `json:"delTime"`
 }
 
@@ -536,6 +536,14 @@ func (self *SInstance) GetIDisks() ([]cloudprovider.ICloudDisk, error) {
 	}
 	ret := []cloudprovider.ICloudDisk{}
 	for i := range disks {
+		if _, err := disks[i].getStorage(); err != nil {
+			if errors.Cause(err) != cloudprovider.ErrNotFound {
+				// Transient host/pool lookup failure must not flip the
+				// disk id to the legacy form for one sync.
+				return nil, errors.Wrapf(err, "resolve storage for disk %s of vm %s", disks[i].Path, self.GetName())
+			}
+			// Pool truly missing from the host listing: legacy id is OK.
+		}
 		ret = append(ret, &disks[i])
 	}
 	return ret, nil

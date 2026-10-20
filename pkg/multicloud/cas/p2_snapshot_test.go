@@ -56,8 +56,14 @@ func TestInstanceSnapshots(t *testing.T) {
 	if strings.Join(names, ",") != "s1,s2,s3,s4" {
 		t.Errorf("flattened = %v", names)
 	}
-	if !snaps[0].GetCreatedAt().Equal(time.Date(2020, 12, 2, 11, 34, 59, 0, time.UTC)) {
-		t.Errorf("createdAt %v", snaps[0].GetCreatedAt())
+	loc, err := time.LoadLocation(DEFAULT_SNAPSHOT_TIMEZONE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2020, 12, 2, 11, 34, 59, 0, loc)
+	got := snaps[0].GetCreatedAt()
+	if !got.Equal(want) {
+		t.Errorf("createdAt %v want %v (zone %s)", got, want, DEFAULT_SNAPSHOT_TIMEZONE)
 	}
 	if _, err := vm.CreateInstanceSnapshot(context.Background(), "s2", ""); errors.Cause(err) != cloudprovider.ErrDuplicateId {
 		t.Errorf("dup: %v", err)
@@ -122,5 +128,35 @@ func TestP2WritesBlockedWhenReadOnly(t *testing.T) {
 	}
 	if w := f.writes(); len(w) != 0 {
 		t.Errorf("writes reached server: %v", w)
+	}
+}
+
+func TestResetSnapshotRefusesRunning(t *testing.T) {
+	f, _, _, vm := newP2Env(t)
+	f.vmStatus = "running"
+	f.snaps = []p2Snap{{name: "s1"}}
+	err := vm.ResetToInstanceSnapshot(context.Background(), "uuid-9/s1")
+	if errors.Cause(err) != cloudprovider.ErrInvalidStatus {
+		t.Errorf("running reset: %v", err)
+	}
+	for _, w := range f.writes() {
+		if strings.Contains(w, "snapshot/resume") {
+			t.Errorf("resume reached server: %s", w)
+		}
+	}
+}
+
+func TestSnapshotTimeZoneOverride(t *testing.T) {
+	f, region, _, vm := newP2Env(t)
+	f.snaps = []p2Snap{{name: "s1"}}
+	region.cli.SnapshotTimeZone("America/Los_Angeles")
+	snaps, err := vm.GetInstanceSnapshots()
+	if err != nil || len(snaps) != 1 {
+		t.Fatal(err)
+	}
+	loc, _ := time.LoadLocation("America/Los_Angeles")
+	want := time.Date(2020, 12, 2, 11, 34, 59, 0, loc)
+	if !snaps[0].GetCreatedAt().Equal(want) {
+		t.Errorf("createdAt %v want %v", snaps[0].GetCreatedAt(), want)
 	}
 }

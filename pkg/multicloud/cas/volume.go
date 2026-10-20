@@ -96,7 +96,7 @@ func (cli *SCasClient) GetStorageVolume(hostId int64, poolName, volName string) 
 
 // SStorageVolumeCreate is the body of POST /cas/casrs/storage/volume
 // ("增加存储卷(以任务方式)"). capacity is MB (UNVERIFIED: api.yaml gives no
-// unit; every other CAS volume size, and H3C's cinder driver, use MB).
+// unit; every other CAS volume size observed in the field uses MB).
 type SStorageVolumeCreate struct {
 	HostId   int64  `json:"hostId"`
 	SpName   string `json:"spName"`
@@ -121,6 +121,41 @@ func (cli *SCasClient) CreateStorageVolume(body *SStorageVolumeCreate) error {
 		return err
 	}
 	return cli.waitAck(resp, "POST storage/volume")
+}
+
+// waitStorageVolume polls GET storage/volume until the named volume
+// appears. POST storage/volume may answer a bare 200 before the file is
+// listed; a single immediate read would then fail and leave an orphan.
+func (cli *SCasClient) waitStorageVolume(hostId int64, poolName, volName string) (*SStorageVolume, error) {
+	interval, timeout := cli.taskPollInterval, cli.taskTimeout
+	if interval <= 0 {
+		interval = DEFAULT_TASK_POLL_INTERVAL
+	}
+	if timeout <= 0 {
+		timeout = DEFAULT_TASK_TIMEOUT
+	}
+	var found *SStorageVolume
+	var last error
+	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		vol, err := cli.GetStorageVolume(hostId, poolName, volName)
+		if err == nil {
+			found = vol
+			last = nil
+			return true, nil
+		}
+		last = err
+		if errors.Cause(err) == cloudprovider.ErrNotFound {
+			return false, nil
+		}
+		return false, err
+	})
+	if err != nil {
+		if last != nil {
+			return nil, errors.Wrapf(err, "waitStorageVolume %s: last=%v", volName, last)
+		}
+		return nil, errors.Wrapf(err, "waitStorageVolume %s", volName)
+	}
+	return found, nil
 }
 
 // DeleteStorageVolume is DELETE /cas/casrs/storage/volume/delete/{hostId}/

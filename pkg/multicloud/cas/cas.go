@@ -57,8 +57,18 @@ type CasClientConfig struct {
 	// pageSize is the limit used by listPaged (DEFAULT_PAGE_SIZE if 0).
 	pageSize int
 
+	// snapshotTimeZone is the IANA name used to interpret zone-less
+	// snapshot creationTime strings (api.yaml examples have no offset).
+	// Empty means DEFAULT_SNAPSHOT_TIMEZONE. CAS prints CVM local wall
+	// time; CN deployments commonly use Asia/Shanghai.
+	snapshotTimeZone string
+
 	debug bool
 }
+
+// DEFAULT_SNAPSHOT_TIMEZONE is the zone assumed for zone-less snapshot
+// creationTime values. Override per client with SnapshotTimeZone.
+const DEFAULT_SNAPSHOT_TIMEZONE = "Asia/Shanghai"
 
 func NewCasClientConfig(accessUrl, username, password string) *CasClientConfig {
 	return &CasClientConfig{
@@ -76,6 +86,27 @@ func (cfg *CasClientConfig) CloudproviderConfig(cpcfg cloudprovider.ProviderConf
 func (cfg *CasClientConfig) Debug(debug bool) *CasClientConfig {
 	cfg.debug = debug
 	return cfg
+}
+
+func (cfg *CasClientConfig) SnapshotTimeZone(tz string) *CasClientConfig {
+	cfg.snapshotTimeZone = tz
+	return cfg
+}
+
+// snapshotLocation returns the zone for zone-less snapshot timestamps.
+func (cli *SCasClient) snapshotLocation() *time.Location {
+	tz := DEFAULT_SNAPSHOT_TIMEZONE
+	if cli != nil && cli.CasClientConfig != nil && len(cli.snapshotTimeZone) > 0 {
+		tz = cli.snapshotTimeZone
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		loc, _ = time.LoadLocation(DEFAULT_SNAPSHOT_TIMEZONE)
+	}
+	if loc == nil {
+		return time.UTC
+	}
+	return loc
 }
 
 type SCasClient struct {
@@ -146,24 +177,22 @@ func (e *SCasError) Error() string {
 // ErrEmptyBody is returned for a 2xx response without a body.
 const ErrEmptyBody = errors.Error("EmptyResponseBody")
 
-// notFoundErrorCodes are 409 Error-Code values meaning "the addressed
-// object does not exist". Taken from the H3C error catalogue
-// (errorcodes.properties in the CAS domain-server); only codes for the
-// object itself are listed. Codes such as 1011 ("the storage file of the
-// VM does not exist") or 212 ("the file does not exist") are deliberately
-// absent: they describe a broken dependency of an object that still
-// exists, and reporting the VM as gone would let cloudpods drop it.
+// notFoundErrorCodes are 409 Error-Code values that mean the addressed
+// object itself is gone. Only those codes are listed: others that also
+// contain "does not exist" (for example a missing backing file of a VM
+// that is still present) must not become ErrNotFound, or cloudpods would
+// drop a live object.
 var notFoundErrorCodes = map[string]bool{
-	"402":     true, // host does not exist
-	"1000":    true, // VM template does not exist
-	"1001":    true, // VM does not exist
-	"1013":    true, // VM template "{0}" does not exist
-	"1101":    true, // cluster does not exist
-	"11007":   true, // storage pool does not exist
-	"91200":   true, // storage pool "{0}" does not exist
-	"91606":   true, // storage volume "{0}" does not exist
-	"1900009": true, // cluster with ID "{0}" does not exist
-	"1900015": true, // host with ID "{0}" does not exist
+	"402":     true, // host missing
+	"1000":    true, // template missing
+	"1001":    true, // VM missing
+	"1013":    true, // named template missing
+	"1101":    true, // cluster missing
+	"11007":   true, // storage pool missing
+	"91200":   true, // named storage pool missing
+	"91606":   true, // named storage volume missing
+	"1900009": true, // cluster id missing
+	"1900015": true, // host id missing
 }
 
 // isNotFound reports whether a 409 business error means the target does
@@ -179,10 +208,10 @@ func (e *SCasError) isNotFound() bool {
 
 // decodeErrorMessage turns the raw Error-Message header into UTF-8. CAS
 // writes it in a legacy Chinese charset carried as ISO-8859-1 header
-// bytes: H3C's own clients decode it with the response "charset" header
-// (nova plugin error.py) or GB2312 (domain-server CvmRestClient). Go keeps
-// header bytes as-is, so decode here: the charset header first, then
-// GB18030 (a superset of GB2312/GBK) when the bytes are not valid UTF-8.
+// bytes. Observed CAS clients decode via the response "charset" header
+// or GB2312. Go keeps header bytes as-is, so decode here: the charset
+// header first, then GB18030 (a superset of GB2312/GBK) when the bytes
+// are not valid UTF-8.
 func decodeErrorMessage(raw, charset string) string {
 	if len(raw) == 0 {
 		return raw

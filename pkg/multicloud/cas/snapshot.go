@@ -75,10 +75,16 @@ func (self *SVmSnapshot) GetStatus() string {
 	return api.INSTANCE_SNAPSHOT_READY
 }
 
-// GetCreatedAt parses creationTime. It carries no zone; it is read as UTC
-// (UNVERIFIED: CAS most likely prints the CVM's local time).
+// GetCreatedAt parses creationTime. CAS returns a zone-less local wall
+// time (api.yaml example "2020-12-02 11:34:59"). It is interpreted in the
+// client snapshot timezone (default Asia/Shanghai; see
+// CasClientConfig.SnapshotTimeZone), not UTC.
 func (self *SVmSnapshot) GetCreatedAt() time.Time {
-	t, err := timeutils.ParseTimeStr(self.CreationTime)
+	loc := time.UTC
+	if self.ins != nil && self.ins.region != nil && self.ins.region.cli != nil {
+		loc = self.ins.region.cli.snapshotLocation()
+	}
+	t, err := timeutils.ParseTimeStrInLocation(self.CreationTime, loc)
 	if err != nil {
 		return time.Time{}
 	}
@@ -232,7 +238,16 @@ type SVmSnapshotResume struct {
 // ResetToInstanceSnapshot is PUT /cas/casrs/vm/snapshot/resume, waited on.
 // This discards the VM's current disk state since that snapshot; it runs
 // only when cloudpods asks for it explicitly. The snapshot must exist.
+// The VM must not be running or suspended: cloudpods guards VM_READY in
+// its DB, but the live CAS state can differ, so we check here too.
 func (self *SInstance) ResetToInstanceSnapshot(ctx context.Context, idStr string) error {
+	if err := self.Refresh(); err != nil {
+		return err
+	}
+	switch self.GetStatus() {
+	case api.VM_RUNNING, api.VM_SUSPEND:
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "reset snapshot of vm %s while status is %s; stop it first", self.GetName(), self.GetStatus())
+	}
 	name, err := self.snapshotName(idStr)
 	if err != nil {
 		return err

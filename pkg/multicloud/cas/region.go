@@ -221,6 +221,21 @@ func (self *SRegion) GetIStorageById(id string) (cloudprovider.ICloudStorage, er
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "storage %s", id)
 }
 
+// GetIDiskById resolves a stable disk id ({host|hostpool}/{id}/{pool}/{vol}).
+// Legacy {vm uuid}/{dev} ids and other unparseable strings return
+// ErrNotFound so cloudpods can purge stale records after the id change.
+func (self *SRegion) GetIDiskById(id string) (cloudprovider.ICloudDisk, error) {
+	storageId, _, err := parseDiskId(id)
+	if err != nil {
+		return nil, errors.Wrapf(cloudprovider.ErrNotFound, "disk %s", id)
+	}
+	storage, err := self.GetIStorageById(storageId)
+	if err != nil {
+		return nil, err
+	}
+	return storage.GetIDiskById(id)
+}
+
 func (self *SRegion) GetIVMs() ([]cloudprovider.ICloudVM, error) {
 	vms, err := self.cachedInstances()
 	if err != nil {
