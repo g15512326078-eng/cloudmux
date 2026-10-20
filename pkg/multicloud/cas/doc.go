@@ -39,8 +39,12 @@
 //     qcow2 overlay, a never-booted temporary VM and addVmTemplate opType=1
 //     (imageimport.go, cmx image-import-template). The import fails if
 //     the new template's disk still has a backing file, or if that cannot
-//     be checked. The upload step is pluggable (ImportSourceStager); SSH
-//     is the only implementation.
+//     be checked. The upload step is pluggable (ImportSourceStager). The
+//     SSH stager (sshupload.go) is only compiled with -tags cas_ssh, so the
+//     default build does not link golang.org/x/crypto/ssh (x/crypto
+//     v0.19.0 has open advisories; the newest release usable on go 1.24
+//     does not fix them). Without the tag cmx --ssh-upload fails and says
+//     to rebuild with -tags cas_ssh.
 //
 // Storagecache.UploadImage (cloudpods image upload), ISO installs and
 // template storage pool management are not implemented.

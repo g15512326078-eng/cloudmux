@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build cas_ssh
+
 package cas
 
 // Optional mode (b) of the image import: copy a local file into a CVK

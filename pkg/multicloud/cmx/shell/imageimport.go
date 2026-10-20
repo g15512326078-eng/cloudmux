@@ -44,7 +44,7 @@ type ImageImportTemplateOptions struct {
 	Refresh      bool   `help:"GET storage/refresh before looking the file up (use after copying it in by hand)"`
 	DryRun       bool   `help:"Only read and print the planned calls; no writes"`
 
-	SshUpload                string `help:"Mode b: local qcow2 to copy into the pool over SSH first (off unless set)"`
+	SshUpload                string `help:"Mode b: local qcow2 to copy into the pool over SSH first (off unless set; needs a cmx built with -tags cas_ssh)"`
 	SshAddr                  string `help:"SSH host:port (default <host ip>:22)"`
 	SshUser                  string `help:"SSH user; it only needs write access to the pool directory" default:"root"`
 	SshPassword              string `help:"SSH password (prefer env CAS_SSH_PASSWORD; avoid ps/history)"`
@@ -68,21 +68,11 @@ func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, e
 		}
 		return ret, nil
 	}
-	up := cas.SSSHUploadOptions{
-		Addr: o.SshAddr, User: o.SshUser, Password: o.SshPassword, LocalPath: o.SshUpload,
-		KnownHostsFile: o.SshKnownHosts, HostKeySHA256: o.SshHostKeySha256, InsecureIgnoreHostKey: o.SshInsecureIgnoreHostKey,
+	stager, err := o.sshStager()
+	if err != nil {
+		return ret, err
 	}
-	if len(up.Password) == 0 {
-		up.Password = os.Getenv(SSH_PASSWORD_ENV)
-	}
-	if len(o.SshKeyFile) > 0 {
-		key, err := os.ReadFile(o.SshKeyFile)
-		if err != nil {
-			return ret, errors.Wrapf(err, "read ssh key file %s", o.SshKeyFile)
-		}
-		up.PrivateKey = key
-	}
-	ret.Stager = cas.NewSSHStager(up)
+	ret.Stager = stager
 	return ret, nil
 }
 
@@ -100,9 +90,9 @@ func init() {
 		if !ok {
 			return errors.Wrap(cloudprovider.ErrNotSupported, "image-import-template requires the CAS provider")
 		}
-		if args.SshInsecureIgnoreHostKey {
+		for _, w := range args.sshPreflightWarnings() {
 			// before anything connects, not only in the result
-			fmt.Fprintln(os.Stderr, "WARNING: "+cas.SSHInsecureHostKeyWarning)
+			fmt.Fprintln(os.Stderr, "WARNING: "+w)
 		}
 		res, err := p.GetClient().ImportQcow2AsTemplate(opts)
 		if res != nil {

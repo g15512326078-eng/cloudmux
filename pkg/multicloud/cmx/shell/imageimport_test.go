@@ -15,11 +15,7 @@
 package shell
 
 import (
-	"fmt"
-	"strings"
 	"testing"
-
-	"yunion.io/x/cloudmux/pkg/multicloud/cas"
 )
 
 func TestImageImportOptions(t *testing.T) {
@@ -31,15 +27,5 @@ func TestImageImportOptions(t *testing.T) {
 	o.SshAddr = "h:22"
 	if _, err := o.importOptions(); err == nil {
 		t.Fatal("--ssh-* without --ssh-upload must fail")
-	}
-	t.Setenv(SSH_PASSWORD_ENV, "env-pw")
-	o.SshUpload = "/tmp/x.qcow2"
-	io, err = o.importOptions()
-	st, ok := io.Stager.(*cas.SSSHStager)
-	if err != nil || !ok || st.Options.Password != "env-pw" || st.Options.Addr != "h:22" {
-		t.Fatalf("mode b: %v %v", err, io.Stager)
-	}
-	if strings.Contains(fmt.Sprintf("%v %+v %s", st, st, st), "env-pw") {
-		t.Fatal("password in String()")
 	}
 }
