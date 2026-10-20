@@ -52,10 +52,14 @@ func (self *SCasProviderFactory) ValidateChangeBandwidth(instanceId string, band
 // documented default; deployments serving https must pass a full URL.
 const DEFAULT_SCHEME = "http"
 
+// defaultPorts are the CVM Tomcat connectors: H3C's own REST clients use
+// http://host:8080 and https://host:8443 (TLS 1.2, self-signed).
+var defaultPorts = map[string]int{"http": 8080, "https": 8443}
+
 // ValidateCreateCloudaccountData accepts either a full URL in AuthUrl
-// (scheme://host:port, scheme http or https) or Host + Port with
-// DEFAULT_SCHEME. The port is required either way: the CAS REST port is
-// not documented and differs between deployments.
+// (scheme://host[:port], scheme http or https) or Host [+ Port] with
+// DEFAULT_SCHEME. A missing port defaults to 8080 for http and 8443 for
+// https.
 func (self *SCasProviderFactory) ValidateCreateCloudaccountData(ctx context.Context, input cloudprovider.SCloudaccountCredential) (cloudprovider.SCloudaccount, error) {
 	output := cloudprovider.SCloudaccount{}
 	if len(input.Username) == 0 {
@@ -103,7 +107,7 @@ func buildAccessUrl(input cloudprovider.SCloudaccountCredential) (string, error)
 		return "", errors.Wrap(cloudprovider.ErrInputParameter, "host should be ip or domain name")
 	}
 	if port == 0 {
-		return "", errors.Wrap(cloudprovider.ErrMissingParameter, "port")
+		port = defaultPorts[scheme]
 	}
 	if port < 0 || port > 65535 {
 		return "", errors.Wrapf(cloudprovider.ErrInputParameter, "port %d out of range", port)
