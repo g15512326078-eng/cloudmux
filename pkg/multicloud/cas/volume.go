@@ -159,6 +159,9 @@ func (cli *SCasClient) waitStorageVolume(hostId int64, poolName, volName string)
 	var found *SStorageVolume
 	var last error
 	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		if err := cli.ctxErr(); err != nil {
+			return false, err
+		}
 		vol, err := cli.GetStorageVolume(hostId, poolName, volName)
 		if err == nil {
 			found = vol

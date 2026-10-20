@@ -180,6 +180,9 @@ func (cli *SCasClient) waitVMNotLive(uuid string) error {
 		timeout = DEFAULT_TASK_TIMEOUT
 	}
 	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		if err := cli.ctxErr(); err != nil {
+			return false, err
+		}
 		live, err := cli.vmIsLiveInList(uuid)
 		if err != nil {
 			return false, err
@@ -583,7 +586,7 @@ func (self *SInstance) SetSecurityGroups(secgroupIds []string) error {
 // StartVM is PUT /cas/casrs/vm/start/{id} (api.yaml: "uuid也适用", path type
 // is integer — we send the numeric domain id). Returns RsTaskMsg; waitTask.
 func (self *SInstance) StartVM(ctx context.Context) error {
-	_, err := self.region.cli.doAsync(httputils.PUT, fmt.Sprintf("vm/start/%d", self.Id), nil, nil)
+	_, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, fmt.Sprintf("vm/start/%d", self.Id), nil, nil)
 	return err
 }
 
@@ -596,7 +599,7 @@ func (self *SInstance) StopVM(ctx context.Context, opts *cloudprovider.ServerSto
 	if opts != nil && opts.IsForce {
 		path = fmt.Sprintf("vm/powerOff/%d", self.Id)
 	}
-	_, err := self.region.cli.doAsync(httputils.PUT, path, nil, nil)
+	_, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, path, nil, nil)
 	return err
 }
 
@@ -604,7 +607,7 @@ func (self *SInstance) StopVM(ctx context.Context, opts *cloudprovider.ServerSto
 // no Reboot method; cloudpods soft-reboot of managed guests typically
 // stop+start. This is exposed for callers that want the native restart.
 func (self *SInstance) RestartVM(ctx context.Context) error {
-	_, err := self.region.cli.doAsync(httputils.PUT, fmt.Sprintf("vm/restart/%d", self.Id), nil, nil)
+	_, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, fmt.Sprintf("vm/restart/%d", self.Id), nil, nil)
 	return err
 }
 
@@ -648,11 +651,12 @@ func (self *SInstance) DeleteVM(ctx context.Context) error {
 	params.Set("type", DELETE_VM_TYPE)
 	params.Set("isWipeVolume", DELETE_VM_WIPE_VOLUME)
 	params.Set("delBase0", DELETE_VM_DEL_BASE0)
-	_, err := self.region.cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
+	cli := self.region.cli.WithContext(ctx)
+	_, err := cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
 	if err != nil {
 		return err
 	}
-	return self.region.cli.waitVMNotLive(self.Uuid)
+	return cli.waitVMNotLive(self.Uuid)
 }
 
 func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {

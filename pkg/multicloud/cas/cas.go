@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -93,14 +94,85 @@ func (cfg *CasClientConfig) SnapshotTimeZone(tz string) *CasClientConfig {
 	return cfg
 }
 
-// ReadOnlyClone returns a client that refuses non-GET/HEAD requests.
+// ReadOnlyClone returns a client that refuses non-GET/HEAD requests. It
+// builds its own HTTP client (the read-only guard is per client).
 func (cli *SCasClient) ReadOnlyClone() *SCasClient {
 	if cli == nil {
 		return nil
 	}
 	cfg := *cli.CasClientConfig
 	cfg.cpcfg.ReadOnly = true
-	return &SCasClient{CasClientConfig: &cfg, taskPollInterval: cli.taskPollInterval, taskTimeout: cli.taskTimeout}
+	return &SCasClient{CasClientConfig: &cfg, ctx: cli.ctx, timeouts: cli.timeouts, taskPollInterval: cli.taskPollInterval, taskTimeout: cli.taskTimeout}
+}
+
+// S-2: every CAS request is bounded. The vendored adaptive client dials
+// for up to 120s and ignores the context, so an unreachable CAS took
+// about 135s to fail. These bounds replace it; waitTask keeps its own
+// overall deadline (DEFAULT_TASK_TIMEOUT) on top of them.
+const (
+	DEFAULT_DIAL_TIMEOUT            = 10 * time.Second
+	DEFAULT_TLS_HANDSHAKE_TIMEOUT   = 10 * time.Second
+	DEFAULT_RESPONSE_HEADER_TIMEOUT = 30 * time.Second // as the vendored transport
+	DEFAULT_REQUEST_TIMEOUT         = 5 * time.Minute  // whole request incl. body
+	// DEFAULT_PROBE_TIMEOUT bounds Probe (account create / health check).
+	DEFAULT_PROBE_TIMEOUT = 30 * time.Second
+)
+
+// sClientTimeouts overrides the defaults when a field is > 0 (tests).
+type sClientTimeouts struct {
+	Dial, TLSHandshake, ResponseHeader, Request time.Duration
+}
+
+func (t sClientTimeouts) withDefaults() sClientTimeouts {
+	if t.Dial <= 0 {
+		t.Dial = DEFAULT_DIAL_TIMEOUT
+	}
+	if t.TLSHandshake <= 0 {
+		t.TLSHandshake = DEFAULT_TLS_HANDSHAKE_TIMEOUT
+	}
+	if t.ResponseHeader <= 0 {
+		t.ResponseHeader = DEFAULT_RESPONSE_HEADER_TIMEOUT
+	}
+	if t.Request <= 0 {
+		t.Request = DEFAULT_REQUEST_TIMEOUT
+	}
+	return t
+}
+
+// WithContext returns a client whose requests and waits are bound to
+// ctx (cancel aborts an in-flight request; a task CAS already accepted
+// may still run). It shares the HTTP client and its read-only guard.
+func (cli *SCasClient) WithContext(ctx context.Context) *SCasClient {
+	c := cli.derive()
+	c.ctx = ctx
+	return c
+}
+
+// withRequestTimeout returns a client whose requests time out after d.
+func (cli *SCasClient) withRequestTimeout(d time.Duration) *SCasClient {
+	c := cli.derive()
+	c.timeouts.Request = d
+	return c
+}
+
+func (cli *SCasClient) derive() *SCasClient {
+	return &SCasClient{CasClientConfig: cli.CasClientConfig, client: cli.getDefaultClient(), ctx: cli.ctx, timeouts: cli.timeouts,
+		taskPollInterval: cli.taskPollInterval, taskTimeout: cli.taskTimeout}
+}
+
+func (cli *SCasClient) context() context.Context {
+	if cli.ctx == nil {
+		return context.Background()
+	}
+	return cli.ctx
+}
+
+// ctxErr reports a cancelled or expired client context (waits stop).
+func (cli *SCasClient) ctxErr() error {
+	if cli.ctx == nil {
+		return nil
+	}
+	return cli.ctx.Err()
 }
 
 // snapshotLocation returns the zone for zone-less snapshot timestamps.
@@ -125,6 +197,10 @@ type SCasClient struct {
 	lock   sync.Mutex
 	client *http.Client
 
+	// ctx bounds requests and waits (nil = Background); see WithContext.
+	ctx      context.Context
+	timeouts sClientTimeouts
+
 	// taskPollInterval / taskTimeout override waitTask defaults when > 0
 	// (tests set them; production leaves them zero).
 	taskPollInterval time.Duration
@@ -145,9 +221,10 @@ func NewCasClient(cfg *CasClientConfig) (*SCasClient, error) {
 	return cli, nil
 }
 
-// Probe checks Digest credentials with GET /cas/casrs/host.
+// Probe checks Digest credentials with GET /cas/casrs/host, bounded by
+// DEFAULT_PROBE_TIMEOUT so an unreachable CAS fails fast (S-2).
 func (cli *SCasClient) Probe() error {
-	_, err := cli.GetHostBriefs()
+	_, err := cli.withRequestTimeout(DEFAULT_PROBE_TIMEOUT).GetHostBriefs()
 	if err != nil {
 		return errors.Wrapf(err, "probe %s", cli.accessUrl)
 	}
@@ -163,6 +240,11 @@ func (cli *SCasClient) getDefaultClient() *http.Client {
 	client := httputils.GetAdaptiveTimeoutClient()
 	httputils.SetClientProxyFunc(client, cli.cpcfg.ProxyFunc)
 	ts, _ := client.Transport.(*http.Transport)
+	// S-2: a bounded, context-aware dial instead of the adaptive one
+	t := cli.timeouts.withDefaults()
+	ts.DialContext = (&net.Dialer{Timeout: t.Dial, KeepAlive: 30 * time.Second}).DialContext
+	ts.TLSHandshakeTimeout = t.TLSHandshake
+	ts.ResponseHeaderTimeout = t.ResponseHeader
 	// CAS ships with a self-signed certificate by default; same policy as
 	// the proxmox / oceanbase providers.
 	ts.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
@@ -326,7 +408,9 @@ func (cli *SCasClient) rawRequest(method httputils.THttpMethod, res string, para
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), string(method), u, reader)
+	ctx, cancel := context.WithTimeout(cli.context(), cli.timeouts.withDefaults().Request)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, string(method), u, reader)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "NewRequest %s %s", method, u)
 	}

@@ -840,7 +840,9 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	if err := interrupted("starting the VM"); err != nil {
 		return failBeforeStart(err)
 	}
-	if err := vm.StartVM(ctx); err != nil {
+	// not ctx: an interrupt is honoured between steps; aborting the
+	// start request itself would only make its outcome unknown
+	if err := vm.StartVM(context.Background()); err != nil {
 		if isDefiniteRejection(err) {
 			return failBeforeStart(errors.Wrapf(err, "start %s", vm.Name))
 		}

@@ -168,7 +168,7 @@ func (self *SImage) GetBios() cloudprovider.TBiosType {
 // after the in-use checks in SCasClient.DeleteVmTemplate. A template that
 // is already gone counts as deleted.
 func (self *SImage) Delete(ctx context.Context) error {
-	return self.cache.region.cli.DeleteVmTemplate(self.Id)
+	return self.cache.region.cli.WithContext(ctx).DeleteVmTemplate(self.Id)
 }
 
 // Rename changes only the template name (and description when desc is

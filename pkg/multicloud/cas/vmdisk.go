@@ -173,7 +173,7 @@ func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
 			return errors.Wrapf(cloudprovider.ErrNotSupported, "detaching the system disk %s", disks[i].DeviceName)
 		}
 		body := SVmDelDeviceBody{Id: self.Id, Storage: SVmDelStorage{DeviceName: disks[i].DeviceName, Path: disks[i].Path}}
-		if _, err := self.region.cli.doAsync(httputils.PUT, "vm/delDevice", nil, jsonutils.Marshal(body)); err != nil {
+		if _, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, "vm/delDevice", nil, jsonutils.Marshal(body)); err != nil {
 			return errors.Wrapf(err, "vm/delDevice %s", disks[i].DeviceName)
 		}
 		return self.Refresh()

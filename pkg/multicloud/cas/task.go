@@ -15,7 +15,10 @@
 package cas
 
 import (
+	"context"
+	stderrors "errors"
 	"fmt"
+	"net"
 	"net/url"
 	"time"
 
@@ -89,7 +92,25 @@ const (
 	// MAX_TASK_403 is how many consecutive 403s waitTask tolerates
 	// before treating the denial as real (Digest nonce blips are brief).
 	MAX_TASK_403 = 6
+	// MAX_TASK_TRANSPORT_ERRS is how many consecutive transport errors
+	// (timeouts, resets) a task poll tolerates: the task already runs on
+	// CAS, so one lost poll must not turn into "failed".
+	MAX_TASK_TRANSPORT_ERRS = 6
 )
+
+// isTransportError: the request did not get an HTTP answer (dial, TLS,
+// header or request timeout, reset). The server may or may not have acted.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	c := errors.Cause(err)
+	if c == context.DeadlineExceeded {
+		return true
+	}
+	var ne net.Error
+	return stderrors.As(c, &ne)
+}
 
 // parseTaskMsg decodes an RsTaskMsg body. A missing/zero msgId with
 // completed=true is treated as a synchronous success (UNVERIFIED: api.yaml
@@ -137,10 +158,20 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 		timeout = DEFAULT_TASK_TIMEOUT
 	}
 	var last *SMessage
-	consecutive403 := 0
+	consecutive403, transportErrs := 0, 0
 	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		if err := cli.ctxErr(); err != nil {
+			return false, errors.Wrapf(err, "cancelled while waiting; task %d may still run on CAS", msgId)
+		}
 		msg, err := cli.GetMessage(msgId)
 		if err != nil {
+			if isTransportError(err) && cli.ctxErr() == nil {
+				transportErrs++
+				if transportErrs >= MAX_TASK_TRANSPORT_ERRS {
+					return false, errors.Wrapf(err, "waitTask %d: %d consecutive transport errors; the task may still run on CAS", msgId, transportErrs)
+				}
+				return false, nil
+			}
 			// CAS may not publish the message immediately after submit.
 			// NotFound (and transient 5xx) keep polling until timeout;
 			// other errors abort.
@@ -162,7 +193,7 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 			}
 			return false, err
 		}
-		consecutive403 = 0
+		consecutive403, transportErrs = 0, 0
 		last = msg
 		log.Debugf("cas task %d completed=%v result=%d progress from submit unknown failMsg=%q",
 			msg.MsgId, msg.Completed, msg.Result, msg.FailMsg)

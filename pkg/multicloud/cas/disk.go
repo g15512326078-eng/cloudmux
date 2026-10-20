@@ -202,7 +202,7 @@ func (self *SDisk) Delete(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	cli := storage.host.zone.region.cli
+	cli := storage.host.zone.region.cli.WithContext(ctx)
 	volName := path.Base(self.Path)
 	vol, err := cli.GetStorageVolume(storage.host.Id, storage.Name, volName)
 	if err != nil {
@@ -258,7 +258,7 @@ func (self *SDisk) Resize(ctx context.Context, newSizeMB int64) error {
 	if newSizeMB == self.Size {
 		return nil
 	}
-	cli := self.ins.region.cli
+	cli := self.ins.region.cli.WithContext(ctx)
 	body := SVmModifyStorageBody{
 		Id: self.ins.Id,
 		Storage: SVmModifyStorage{

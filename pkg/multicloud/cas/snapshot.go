@@ -224,7 +224,7 @@ func (self *SInstance) CreateInstanceSnapshot(ctx context.Context, name string, 
 		return nil, err
 	}
 	body := SVmSnapshotCreate{VmId: self.Id, Name: name, Desc: desc, SnapMem: false}
-	if _, err := self.region.cli.doAsync(httputils.POST, "vm/snapshot", nil, jsonutils.Marshal(body)); err != nil {
+	if _, err := self.region.cli.WithContext(ctx).doAsync(httputils.POST, "vm/snapshot", nil, jsonutils.Marshal(body)); err != nil {
 		return nil, errors.Wrapf(err, "vm/snapshot")
 	}
 	return self.getSnapshot(name)
@@ -256,7 +256,7 @@ func (self *SInstance) ResetToInstanceSnapshot(ctx context.Context, idStr string
 		return err
 	}
 	body := SVmSnapshotResume{VmId: self.Id, Name: name}
-	if _, err := self.region.cli.doAsync(httputils.PUT, "vm/snapshot/resume", nil, jsonutils.Marshal(body)); err != nil {
+	if _, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, "vm/snapshot/resume", nil, jsonutils.Marshal(body)); err != nil {
 		return errors.Wrapf(err, "vm/snapshot/resume %s", name)
 	}
 	self.detail = nil
