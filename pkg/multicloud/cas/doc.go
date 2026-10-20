@@ -65,11 +65,19 @@
 //     with Joliet) boot a temporary VM behind a fail-closed disk-wipe
 //     guard; once it shut itself off (with install evidence) its media are
 //     always disconnected (verified), the boot order is set disk-first
-//     (verified) and it is cloned with addVmTemplate opType=1, checked
-//     flat and recycled. Secrets never reach logs, plans or errors; the
-//     answer file deletes its cached copies and autologon before Sysprep.
-//     Any doubt keeps the VM. The floppy layout, boot-order behaviour,
-//     firmware and the vm/modify bodies are UNVERIFIED on CAS.
+//     (verified; the current bootFirmware is sent back and vm/detail
+//     must not change otherwise) and it is cloned with addVmTemplate
+//     opType=1, checked flat and recycled. Secrets never reach logs,
+//     plans or errors; the answer file deletes its cached copies and
+//     autologon before Sysprep, and the uploaded answer ISO is deleted
+//     and confirmed gone (else a loud SECRET LEFT warning). With
+//     Castools, CAStools must have been seen running (opt out:
+//     NoWaitCastools). Any doubt keeps the VM. Review notes deliberately
+//     skipped: N-W2 (answer ISO kept after a post-start failure: the VM
+//     still references it; loud warning), N-W5 (ISO cosmetics), N-W7
+//     (product key in clear: answer-file schema), N-W8 (UEFI prompt
+//     idles to the timeout: fails safe). The floppy layout, boot-order
+//     behaviour, firmware and the vm/modify bodies are UNVERIFIED on CAS.
 //
 // Storagecache.UploadImage (cloudpods image upload) and template storage
 // pool management are not implemented.

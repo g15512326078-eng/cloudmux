@@ -99,9 +99,9 @@ type WindowsTemplateOptions struct {
 
 	VirtioFloppy   string `help:"How the virtio drivers reach Setup: floppy = storage floppy storeFile=autoVirtio (A:), autoload = vm/add autoLoadVirtio=true, or both (UNVERIFIED which one your CAS honours)" choices:"floppy|autoload|floppy+autoload" default:"floppy"`
 	BootOrder      string `help:"cdrom (bootingDevice=2): CD first; with BIOS and an empty disk no 'Press any key' prompt, later the prompt times out to the disk. disk-first (bootingDevice=1): relies on the empty disk falling through to the CD (UNVERIFIED on CAS). UEFI always prompts (unsupported)" choices:"cdrom|disk-first" default:"cdrom"`
-	Castools       bool   `help:"Mount the CAStools CD and install it at first logon"`
+	Castools       bool   `help:"Mount the CAStools CD and install it at first logon; the install then only counts as finished if CAStools was seen running (vm/<id>/castoolStatus), else the VM is kept (see --no-wait-castools)"`
 	CastoolsIso    string `help:"CAStools ISO path on the host" default:"/vms/isos/castools.iso"`
-	WaitCastools   bool   `help:"Poll vm/<id>/castoolStatus while installing; if CAStools never ran, the install counts as unfinished and the VM is kept (needs --castools)"`
+	NoWaitCastools bool   `help:"With --castools, do not require CAStools to have been seen running (weaker crash detection: only --min-installed-gb is checked)"`
 	MinInstalledGb int    `help:"After the guest shut off, the system disk must have at least this many GB allocated, else the VM is kept (a crash or power-off cannot be told from a Sysprep shutdown through the API)" default:"4"`
 	InstallTimeout string `help:"Give up waiting for Setup+Sysprep to shut the VM off after this long (the VM is then kept)" default:"2h"`
 	PollInterval   string `help:"Status poll interval" default:"30s"`
@@ -168,7 +168,7 @@ func (o *WindowsTemplateOptions) importOptions() (cas.SWindowsImportOptions, err
 		OsVersion: o.OsVersion, CpuCores: o.Cpu, MemoryMB: o.MemoryMb, VSwitchName: o.Vswitch, ProfileName: o.Profile,
 		TempVMName: o.TempVmName, Unattend: o.unattend(), AnswerIsoFile: o.AnswerIsoFile,
 		VirtioFloppy: o.VirtioFloppy, Castools: o.Castools, CastoolsISO: o.CastoolsIso, BootOrder: o.BootOrder,
-		WaitCastools: o.WaitCastools, MinInstalledGB: o.MinInstalledGb, Refresh: o.Refresh, DryRun: o.DryRun,
+		NoWaitCastools: o.NoWaitCastools, MinInstalledGB: o.MinInstalledGb, Refresh: o.Refresh, DryRun: o.DryRun,
 	}
 	var err error
 	if ret.InstallTimeout, err = time.ParseDuration(o.InstallTimeout); err != nil || ret.InstallTimeout <= 0 {
@@ -241,7 +241,7 @@ func provider(cli ICloudProvider, cmd string) (*casprovider.SCasProvider, error)
 	return p, nil
 }
 
-const windowsTemplateHelp = "Install Windows from an ISO unattended (autounattend.xml on a generated answer ISO, virtio drivers from the CAS floppy) in a temporary VM, Sysprep it and clone it to a template; --dry-run prints the plan with the answer file redacted. Install media are always disconnected and the boot order set to disk-first before cloning; any doubt (disk-wipe guard, media, boot order, install evidence) keeps the temporary VM. UNVERIFIED on live CAS: the virtio floppy layout and driver paths, two CDs plus a floppy in vm/add, the boot-order behaviour and the bootDev body, BIOS vs UEFI, the vm/modify disconnect bodies, the CAStools silent switch, the answer-file cleanup before Sysprep"
+const windowsTemplateHelp = "Install Windows from an ISO unattended (autounattend.xml on a generated answer ISO, virtio drivers from the CAS floppy) in a temporary VM, Sysprep it and clone it to a template; --dry-run prints the plan with the answer file redacted. Install media are always disconnected and the boot order set to disk-first before cloning; any doubt (disk-wipe guard, media, boot order or any other setting changed by it, install evidence: disk allocation and, with --castools, CAStools seen running) keeps the temporary VM. UNVERIFIED on live CAS: the virtio floppy layout and driver paths, two CDs plus a floppy in vm/add, the boot-order behaviour and the bootDev body (bootFirmware echoed back), BIOS vs UEFI, the vm/modify disconnect bodies, the CAStools silent switch, the answer-file cleanup before Sysprep"
 
 // writeAnswerISO writes data to out, which must not exist, as 0600.
 func writeAnswerISO(out string, data []byte) error {

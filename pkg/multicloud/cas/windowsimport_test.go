@@ -91,10 +91,20 @@ type winFake struct {
 	cdPathRewrite    bool
 	modifyStatusBoot int
 	bootFirst        bool
+
+	// N-R1 / N-R3 knobs
+	firmware       interface{}  // boot.detail.bootFirmware (default 0; nil omits it)
+	firmwareAfter  interface{}  // ... after the bootDev write, when set
+	detailAllFail  bool         // GET vm/50/detail/all -> 500
+	autoStart      interface{}  // vm/detail bootDev.autoStart (default 0; nil omits it)
+	bootTouched    bool         // a bootDev write was applied
+	bootSideEffect func(d dict) // edits vm/detail once bootTouched
+	answerDelCode  int          // answer ISO delete -> this status
+	answerDelNoop  bool         // answer ISO delete "succeeds" but stays listed
 }
 
 func newWinFake(t *testing.T) *winFake {
-	return &winFake{t: t, polls: map[int64]int{}, fail: map[int64]bool{}, installPolls: 3, castools: "running", installAlloc: 9000, refreshed: map[string]int{},
+	return &winFake{t: t, polls: map[int64]int{}, fail: map[int64]bool{}, installPolls: 3, castools: "running", installAlloc: 9000, refreshed: map[string]int{}, firmware: 0, autoStart: 0,
 		vols: map[string][]dict{
 			"isopool":     {{"name": winISO, "format": "raw", "size": 5000, "storagePoolName": "isopool"}},
 			"defaultpool": {},
@@ -214,7 +224,33 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(w, dict{"domain": append([]dict{}, f.vms...)})
 	case r.Method == "GET" && p == "vm/detail/50":
-		reply(w, dict{"id": 50, "name": winTempVM, "uuid": "uuid-win", "status": "shutOff", "storage": append(append([]dict{}, f.storage...), f.extraStorage...)})
+		d := dict{"id": 50, "name": winTempVM, "uuid": "uuid-win", "status": "shutOff", "uptime": f.running, "title": "",
+			"cpu": dict{"cpuSockets": 1, "cpuCores": 2}, "memory": dict{"size": 4096, "unit": "MB"},
+			"network":  []dict{{"mac": "0c:da:41:1d:00:01", "vsName": "vswitch0", "deviceModel": "virtio"}},
+			"graphics": dict{"type": "vnc", "password": "vnc-secret-xyz"},
+			"bootDev":  dict{},
+			"storage":  append(append([]dict{}, f.storage...), f.extraStorage...)}
+		if f.autoStart != nil {
+			d["bootDev"] = dict{"autoStart": f.autoStart}
+		}
+		if f.bootTouched && f.bootSideEffect != nil {
+			f.bootSideEffect(d)
+		}
+		reply(w, d)
+	case r.Method == "GET" && p == "vm/50/detail/all":
+		if f.detailAllFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		bd := dict{"autoRun": false, "bootList": []dict{{"bootdev": "vda", "order": 1}}}
+		fw := f.firmware
+		if f.bootTouched && f.firmwareAfter != nil {
+			fw = f.firmwareAfter
+		}
+		if fw != nil {
+			bd["bootFirmware"] = fw
+		}
+		reply(w, dict{"id": 50, "domainName": winTempVM, "boot": dict{"dispName": "boot", "detail": bd}})
 	case r.Method == "GET" && p == "vm/bootDev/50":
 		if f.bootGetFail {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -331,6 +367,7 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if !f.bootNoop {
 				f.bootdevs = strings.Split(bd, ",")
 			}
+			f.bootTouched = true
 			f.task(w, 8008)
 			return
 		}
@@ -376,6 +413,15 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.task(w, 8004)
 	case r.Method == "DELETE" && strings.HasPrefix(p, "storage/volume/delete/1/isopool/"):
 		name := strings.TrimPrefix(p, "storage/volume/delete/1/isopool/")
+		if f.answerDelCode != 0 {
+			w.Header().Set("Error-Code", "999")
+			w.WriteHeader(f.answerDelCode)
+			return
+		}
+		if f.answerDelNoop {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		kept := []dict{}
 		for _, v := range f.vols["isopool"] {
 			if v["name"] != name {
@@ -519,8 +565,7 @@ func (r *winRun) addBody(t *testing.T) jsonutils.JSONObject {
 
 func TestWindowsImportHappyPath(t *testing.T) {
 	r := newWinRun(t)
-	r.opts.Castools = true
-	r.opts.WaitCastools = true
+	r.opts.Castools = true // N-R5: waits for CAStools by default
 	r.opts.Unattend.CastoolsArgs = "/S"
 	res, err := r.run(t)
 	if err != nil {
@@ -543,6 +588,7 @@ func TestWindowsImportHappyPath(t *testing.T) {
 		"POST /cas/casrs/vmTemplate/addVmTemplate?",
 		"DELETE /cas/casrs/vm/delete/uuid/uuid-win?delBase0=false&isWipeVolume=false&type=3",
 		"DELETE /cas/casrs/storage/volume/delete/1/isopool/" + winAnswer,
+		"GET /cas/casrs/storage/refresh?id=1&poolName=isopool", // N-R3 confirm
 	}
 	w := r.f.writes()
 	if len(w) != len(want) {
@@ -607,7 +653,7 @@ func TestWindowsImportHappyPath(t *testing.T) {
 			detach = append(detach, b)
 		}
 	}
-	if len(detach) != 5 || !strings.Contains(detach[4], `{"bootDev":{"bootdevs":"vda,hda,fda"},"id":50}`) || !strings.Contains(detach[1], `"operation":"disconnect"`) || !strings.Contains(detach[1], winAnswer) || !strings.Contains(detach[1], `"device":"hdb"`) || !strings.Contains(detach[3], `"floppy":{"deviceName":"fda","operation":"disconnect"}`) {
+	if len(detach) != 5 || !strings.Contains(detach[4], `{"bootDev":{"autoStart":0,"bootFirmware":0,"bootdevs":"vda,hda,fda"},"id":50}`) || !strings.Contains(detach[1], `"operation":"disconnect"`) || !strings.Contains(detach[1], winAnswer) || !strings.Contains(detach[1], `"device":"hdb"`) || !strings.Contains(detach[3], `"floppy":{"deviceName":"fda","operation":"disconnect"}`) {
 		t.Errorf("detach bodies:\n%s", strings.Join(detach, "\n"))
 	}
 	// the answer ISO: 0600 temp file, removed, holds the real answer file
@@ -635,7 +681,7 @@ func TestWindowsImportHappyPath(t *testing.T) {
 		t.Error("castoolStatus not polled")
 	}
 	for _, wn := range res.Warnings {
-		if strings.Contains(wn, "never reported running") || strings.Contains(wn, "contains the encoded") {
+		if strings.Contains(wn, "never reported running") || strings.Contains(wn, "SECRET LEFT") {
 			t.Errorf("unexpected warning %s", wn)
 		}
 	}
@@ -750,22 +796,22 @@ func TestWindowsImportPreplacedAnswer(t *testing.T) {
 
 func TestWindowsImportRefusals(t *testing.T) {
 	for name, c := range map[string]func(r *winRun){
-		"not an iso":            func(r *winRun) { r.opts.IsoFile = "win.qcow2" },
-		"qcow2 volume":          func(r *winRun) { r.f.vols["isopool"][0]["format"] = "qcow2" },
-		"missing iso":           func(r *winRun) { r.opts.IsoFile = "nope.iso" },
-		"template exists":       func(r *winRun) { r.f.tpls = []dict{{"id": 1, "name": winTpl}} },
-		"vm exists":             func(r *winRun) { r.f.vms = []dict{{"id": 9, "uuid": "u9", "name": winTempVM, "vmStatus": "shutOff"}} },
-		"disk exists":           func(r *winRun) { r.f.vols["defaultpool"] = []dict{{"name": winDisk, "format": "qcow2"}} },
-		"answer exists":         func(r *winRun) { r.f.vols["isopool"] = append(r.f.vols["isopool"], dict{"name": winAnswer}) },
-		"no answer transport":   func(r *winRun) { r.opts.AnswerStager = nil },
-		"both answer sources":   func(r *winRun) { r.opts.AnswerIsoFile = "a.iso" },
-		"linux os":              func(r *winRun) { r.opts.OsVersion = "CentOS 7" },
-		"small memory":          func(r *winRun) { r.opts.MemoryMB = 1024 },
-		"bad boot order":        func(r *winRun) { r.opts.BootOrder = "net" },
-		"castools no cd":        func(r *winRun) { r.opts.Unattend.CastoolsInstaller = "x.exe" },
-		"answer is install":     func(r *winRun) { r.opts.AnswerStager = nil; r.opts.AnswerIsoFile = winISO },
-		"wait castools no cd":   func(r *winRun) { r.opts.WaitCastools = true },
-		"min installed >= disk": func(r *winRun) { r.opts.MinInstalledGB = 60 },
+		"not an iso":             func(r *winRun) { r.opts.IsoFile = "win.qcow2" },
+		"qcow2 volume":           func(r *winRun) { r.f.vols["isopool"][0]["format"] = "qcow2" },
+		"missing iso":            func(r *winRun) { r.opts.IsoFile = "nope.iso" },
+		"template exists":        func(r *winRun) { r.f.tpls = []dict{{"id": 1, "name": winTpl}} },
+		"vm exists":              func(r *winRun) { r.f.vms = []dict{{"id": 9, "uuid": "u9", "name": winTempVM, "vmStatus": "shutOff"}} },
+		"disk exists":            func(r *winRun) { r.f.vols["defaultpool"] = []dict{{"name": winDisk, "format": "qcow2"}} },
+		"answer exists":          func(r *winRun) { r.f.vols["isopool"] = append(r.f.vols["isopool"], dict{"name": winAnswer}) },
+		"no answer transport":    func(r *winRun) { r.opts.AnswerStager = nil },
+		"both answer sources":    func(r *winRun) { r.opts.AnswerIsoFile = "a.iso" },
+		"linux os":               func(r *winRun) { r.opts.OsVersion = "CentOS 7" },
+		"small memory":           func(r *winRun) { r.opts.MemoryMB = 1024 },
+		"bad boot order":         func(r *winRun) { r.opts.BootOrder = "net" },
+		"castools no cd":         func(r *winRun) { r.opts.Unattend.CastoolsInstaller = "x.exe" },
+		"answer is install":      func(r *winRun) { r.opts.AnswerStager = nil; r.opts.AnswerIsoFile = winISO },
+		"no-wait castools no cd": func(r *winRun) { r.opts.NoWaitCastools = true },
+		"min installed >= disk":  func(r *winRun) { r.opts.MinInstalledGB = 60 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newWinRun(t)
@@ -819,7 +865,7 @@ func TestWindowsImportInstallTimeoutKeepsVM(t *testing.T) {
 	if errors.Cause(err) != cloudprovider.ErrTimeout && !strings.Contains(err.Error(), "did not shut off within") {
 		t.Fatalf("err %v", err)
 	}
-	if !hasWarning(res, "contains the encoded Administrator password") {
+	if !hasWarning(res, "SECRET LEFT ON THE CAS NODE: answer ISO") {
 		t.Error("no answer ISO warning")
 	}
 	if r.f.wrote("POST /cas/casrs/vmTemplate") || r.f.wrote("PUT /cas/casrs/vm/modify") {
@@ -864,7 +910,7 @@ func TestWindowsImportInterruptedBeforeWrites(t *testing.T) {
 
 func TestWindowsImportCastoolsNeverSeenKeepsVM(t *testing.T) {
 	r := newWinRun(t)
-	r.opts.Castools, r.opts.WaitCastools = true, true
+	r.opts.Castools = true // the default: wait for CAStools
 	r.f.castools = "not running"
 	_, err := r.run(t)
 	assertKept(t, r, err)
@@ -881,7 +927,7 @@ func TestWindowsImportFailureCleanup(t *testing.T) {
 		"answer upload fails": {
 			func(r *winRun) { r.answer.fail = errors.Error("injected upload failure") },
 			func(t *testing.T, r *winRun, res *SWindowsImportResult, err error) {
-				if r.f.wrote("POST /cas/casrs/vm/add") || !hasWarning(res, "contains the encoded") {
+				if r.f.wrote("POST /cas/casrs/vm/add") || !hasWarning(res, "SECRET LEFT ON THE CAS NODE: answer ISO") {
 					t.Fatal("went on, or no warning about a partial answer ISO")
 				}
 				if _, serr := os.Stat(r.answer.local); !os.IsNotExist(serr) {
@@ -916,7 +962,7 @@ func TestWindowsImportFailureCleanup(t *testing.T) {
 		"vm/add ambiguous, no VM": {
 			func(r *winRun) { r.f.vmAddStatus = http.StatusInternalServerError },
 			func(t *testing.T, r *winRun, res *SWindowsImportResult, err error) {
-				if r.f.wrote("DELETE") || !hasWarning(res, "contains the encoded") {
+				if r.f.wrote("DELETE") || !hasWarning(res, "SECRET LEFT ON THE CAS NODE: answer ISO") {
 					t.Fatalf("want answer ISO kept with a warning: %v", r.f.writes())
 				}
 			},
@@ -976,7 +1022,7 @@ func TestWindowsImportFailureCleanup(t *testing.T) {
 		"temp VM delete fails": {
 			func(r *winRun) { r.f.deleteVMFail = true },
 			func(t *testing.T, r *winRun, res *SWindowsImportResult, err error) {
-				if res.Template == nil || r.f.deleteAnswers != 0 || !hasWarning(res, "contains the encoded") {
+				if res.Template == nil || r.f.deleteAnswers != 0 || !hasWarning(res, "SECRET LEFT ON THE CAS NODE: answer ISO") {
 					t.Fatalf("want template + answer kept with warning: %v", err)
 				}
 			},
@@ -1037,6 +1083,9 @@ func TestWindowsImportDiskGuardFailsClosed(t *testing.T) {
 		"base file level":      func(f *winFake) { f.diskVol = func(v dict) { v["level"] = 1 } },
 		"foreign user":         func(f *winFake) { f.diskVol = func(v dict) { v["users"] = "prod-db" } },
 		"renamed volume":       func(f *winFake) { f.diskVol = func(v dict) { v["name"] = "other.qcow2" } },
+		"no allocation key":    func(f *winFake) { f.diskVol = func(v dict) { delete(v, "allocation") } }, // N-R4
+		"null allocation":      func(f *winFake) { f.diskVol = func(v dict) { v["allocation"] = nil } },
+		"text allocation":      func(f *winFake) { f.diskVol = func(v dict) { v["allocation"] = "n/a" } },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newWinRun(t)
@@ -1186,5 +1235,161 @@ func TestGetVMBootDevsParse(t *testing.T) {
 func TestWindowsImportNoKeepMediaOption(t *testing.T) {
 	if _, ok := reflect.TypeOf(SWindowsImportOptions{}).FieldByName("KeepMedia"); ok {
 		t.Fatal("KeepMedia must not exist")
+	}
+}
+
+// N-R5: with --castools CAStools must be seen running unless opted out.
+func TestWindowsImportCastoolsWaitDefault(t *testing.T) {
+	r := newWinRun(t)
+	r.opts.Castools, r.opts.NoWaitCastools = true, true
+	r.f.castools = "not running"
+	res, err := r.run(t)
+	if err != nil || res.Template == nil {
+		t.Fatalf("opt-out still waits: %v", err)
+	}
+	for _, h := range r.f.hits {
+		if strings.Contains(h, "castoolStatus") {
+			t.Fatal("castoolStatus polled although opted out")
+		}
+	}
+	o := SWindowsImportOptions{Castools: true}
+	if !o.waitCastools() {
+		t.Fatal("castools must wait by default")
+	}
+	o.NoWaitCastools = true
+	if o.waitCastools() {
+		t.Fatal("opt-out ignored")
+	}
+}
+
+// N-R1: the current firmware is sent back; autoStart is echoed.
+func TestWindowsImportBootFirmwareEchoed(t *testing.T) {
+	for name, c := range map[string]struct {
+		fw, as interface{}
+		want   string
+	}{
+		"bios":            {0, 0, `{"bootDev":{"autoStart":0,"bootFirmware":0,"bootdevs":"vda,hda,fda"},"id":50}`},
+		"efi autostart":   {1, 1, `{"bootDev":{"autoStart":1,"bootFirmware":1,"bootdevs":"vda,hda,fda"},"id":50}`},
+		"string, no auto": {"1", nil, `{"bootDev":{"bootFirmware":1,"bootdevs":"vda,hda,fda"},"id":50}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newWinRun(t)
+			r.f.firmware, r.f.autoStart = c.fw, c.as
+			res, err := r.run(t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := ""
+			for _, b := range r.f.bodies {
+				if strings.HasPrefix(b, "PUT vm/modify ") && strings.Contains(b, "bootDev") {
+					got = strings.TrimPrefix(b, "PUT vm/modify ")
+				}
+			}
+			if got != c.want {
+				t.Fatalf("body %s, want %s", got, c.want)
+			}
+			found := false
+			for _, st := range res.Steps {
+				found = found || st.Step == "verify-vm-unchanged"
+			}
+			if !found {
+				t.Fatal("vm/detail diff not recorded")
+			}
+		})
+	}
+}
+
+// N-R1: any change outside the boot order (or an unknown firmware) keeps
+// the VM and makes no template; values are never printed.
+func TestWindowsImportBootChangeSideEffects(t *testing.T) {
+	for name, c := range map[string]struct {
+		setup func(f *winFake)
+		want  string
+	}{
+		"memory":      {func(f *winFake) { f.bootSideEffect = func(d dict) { d["memory"] = dict{"size": 2048, "unit": "MB"} } }, "memory.size"},
+		"cpu removed": {func(f *winFake) { f.bootSideEffect = func(d dict) { delete(d, "cpu") } }, "cpu"},
+		"nic dropped": {func(f *winFake) { f.bootSideEffect = func(d dict) { d["network"] = []dict{} } }, "network"},
+		"disk added": {func(f *winFake) {
+			f.bootSideEffect = func(d dict) {
+				d["storage"] = append(d["storage"].([]dict), dict{"device": "disk", "deviceName": "vdb", "path": "/vms/images/x.qcow2"})
+			}
+		}, "storage"},
+		"description": {func(f *winFake) { f.bootSideEffect = func(d dict) { d["title"] = "changed" } }, "title"},
+		"console pw": {func(f *winFake) {
+			f.bootSideEffect = func(d dict) { d["graphics"] = dict{"type": "vnc", "password": "other-secret"} }
+		}, "graphics.password"},
+		"autostart":      {func(f *winFake) { f.bootSideEffect = func(d dict) { d["bootDev"] = dict{"autoStart": 1} } }, "bootDev.autoStart"},
+		"firmware flip":  {func(f *winFake) { f.firmware, f.firmwareAfter = 1, 0 }, "boot.detail.bootFirmware (1 -> 0)"},
+		"firmware gone":  {func(f *winFake) { f.firmware = nil }, "no boot.detail.bootFirmware"},
+		"firmware odd":   {func(f *winFake) { f.firmware = 2 }, "unknown bootFirmware"},
+		"detail/all 500": {func(f *winFake) { f.detailAllFail = true }, "boot firmware"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newWinRun(t)
+			c.setup(r.f)
+			_, err := r.run(t)
+			assertKept(t, r, err)
+			if !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), "refused to clone it") || r.f.wrote("POST /cas/casrs/vmTemplate") {
+				t.Fatalf("want %q: %v", c.want, err)
+			}
+			if strings.Contains(err.Error(), "secret") {
+				t.Fatalf("a value leaked: %v", err)
+			}
+		})
+	}
+	// status/uptime may change: not a side effect
+	r := newWinRun(t)
+	r.f.bootSideEffect = func(d dict) { d["status"], d["uptime"] = "running", 99 }
+	if _, err := r.run(t); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJSONDiffPaths(t *testing.T) {
+	a := jsonutils.Marshal(dict{"x": 1, "s": []dict{{"p": "a"}}, "bootDev": dict{"bootdevs": "a", "autoStart": 0}, "status": "a"})
+	b := jsonutils.Marshal(dict{"x": 1, "s": []dict{{"p": "b"}}, "bootDev": dict{"bootdevs": "b", "autoStart": 0}, "status": "b", "n": 1})
+	got, err := jsonDiffPaths(a, b, winBootDiffIgnore)
+	if err != nil || strings.Join(got, ",") != "n,s[0].p" {
+		t.Fatalf("%v %v", got, err)
+	}
+	if got, _ := jsonDiffPaths(a, a, nil); len(got) != 0 {
+		t.Fatal(got)
+	}
+}
+
+// N-R3: the pool answer ISO delete is confirmed by a rescan; otherwise a
+// loud SECRET LEFT warning names it.
+func TestWindowsImportAnswerDeleteConfirmed(t *testing.T) {
+	r := newWinRun(t)
+	res, err := r.run(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, st := range res.Steps {
+		found = found || st.Step == "confirm-answer-iso-gone"
+	}
+	if !found || hasWarning(res, "SECRET LEFT") {
+		t.Fatalf("not confirmed: %v", res.Warnings)
+	}
+	for name, setup := range map[string]func(f *winFake){
+		"delete 500":  func(f *winFake) { f.answerDelCode = http.StatusInternalServerError },
+		"still there": func(f *winFake) { f.answerDelNoop = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newWinRun(t)
+			setup(r.f)
+			res, err := r.run(t)
+			if err == nil || res == nil || res.Template == nil {
+				t.Fatalf("want template plus error: %v", err)
+			}
+			if !hasWarning(res, "SECRET LEFT ON THE CAS NODE: answer ISO /vms/isos/"+winAnswer) {
+				t.Fatalf("no loud warning: %v", res.Warnings)
+			}
+			if !r.f.hasVol("isopool", winAnswer) {
+				t.Fatal("fake: answer ISO should still be listed")
+			}
+			assertNoWinSecret(t, r.f, res, err)
+		})
 	}
 }

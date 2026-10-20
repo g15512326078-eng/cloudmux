@@ -41,18 +41,22 @@ package cas
 //     API cannot see a marker inside the guest, so a crash or a manual
 //     power-off cannot be told apart from Sysprep directly; as evidence
 //     the system disk must have >= MinInstalledGB allocated and, with
-//     WaitCastools, CAStools (installed at first logon) must have been
-//     seen running. Otherwise the VM is kept.
+//     Castools (unless NoWaitCastools), CAStools (installed at first
+//     logon) must have been seen running. Otherwise the VM is kept.
 //  6. always disconnect the install, answer and CAStools CDs and the
 //     floppy (PUT vm/modify cdrom/floppy operation=disconnect), each
 //     must have been listed before and none may be listed afterwards;
 //     then put the system disk first in the boot order (vm/modify
-//     bootDev, re-read with GET vm/bootDev). Otherwise the VM is kept
-//     and no template is made, so a template never boots Setup media.
+//     bootDev with the current bootFirmware sent back, N-R1; vm/detail
+//     and the firmware must be unchanged otherwise; re-read with GET
+//     vm/bootDev). Otherwise the VM is kept and no template is made, so
+//     a template never boots Setup media.
 //  7. addVmTemplate opType=1 (clone; opType 2 is never sent), the B1
 //     backing-file check, recycle the temp VM (delBase0=false,
 //     isWipeVolume=false), delete the answer ISO uploaded by this run
-//     (http mode also deletes its /vms/nova staging copy, B-W3).
+//     and confirm it is gone after a rescan (N-R3; http mode also
+//     deletes its /vms/nova staging copy, B-W3). An answer ISO left
+//     behind is reported as SECRET LEFT ON THE CAS NODE.
 //
 // The "Press any key to boot from CD or DVD" prompt (user concern 2):
 // with BIOS media it is shown by the CD boot sector only when the hard
@@ -79,9 +83,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
+	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -173,10 +181,11 @@ type SWindowsImportOptions struct {
 
 	InstallTimeout time.Duration
 	PollInterval   time.Duration
-	// WaitCastools also polls vm/{id}/castoolStatus while installing; a
-	// guest that shut off without CAStools ever reported running is then
-	// treated as an unfinished install (the VM is kept). Needs Castools.
-	WaitCastools bool
+	// With Castools, vm/{id}/castoolStatus is polled while installing
+	// and a guest that shut off without CAStools ever reported running
+	// is treated as an unfinished install (the VM is kept): the stronger
+	// crash signal (N-R5). NoWaitCastools opts out; it needs Castools.
+	NoWaitCastools bool
 	// MinInstalledGB: after the guest shut off, the system disk must have
 	// at least this much allocated (default 4 GB), else the install is
 	// treated as unfinished (the VM is kept).
@@ -281,8 +290,8 @@ func (o *SWindowsImportOptions) normalize() error {
 	if o.MemoryMB < 2048 {
 		return errors.Wrapf(cloudprovider.ErrInputParameter, "memory %d MB: Windows Setup needs at least 2048", o.MemoryMB)
 	}
-	if o.WaitCastools && !o.Castools {
-		return errors.Wrap(cloudprovider.ErrInputParameter, "waiting for CAStools needs the CAStools CD (castools)")
+	if o.NoWaitCastools && !o.Castools {
+		return errors.Wrap(cloudprovider.ErrInputParameter, "not waiting for CAStools only applies with the CAStools CD (castools)")
 	}
 	if o.MinInstalledGB <= 0 {
 		o.MinInstalledGB = DEFAULT_WIN_MIN_INSTALLED_GB
@@ -698,14 +707,14 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 		res.add("start-vm", "PUT", "vm/start/<id>", "", true, false)
 		res.add("recheck-vm-disks", "GET", "vm/detail/<id>", "same disk set right after the start; else power off and keep the VM", false, false)
 		res.add("wait-install", "GET", "vm/vmList (+ vm/<id>/castoolStatus)", fmt.Sprintf("until the guest shuts itself off after Sysprep; poll %s, timeout %s", opts.PollInterval, opts.InstallTimeout), false, false)
-		res.add("check-install", "GET", "storage/volume", fmt.Sprintf("system disk allocation >= %d GB%s", opts.MinInstalledGB, map[bool]string{true: " and CAStools seen running", false: ""}[opts.WaitCastools]), false, false)
+		res.add("check-install", "GET", "storage/volume", fmt.Sprintf("system disk allocation >= %d GB%s", opts.MinInstalledGB, map[bool]string{true: " and CAStools seen running", false: ""}[opts.waitCastools()]), false, false)
 		res.add("detach-media", "PUT", "vm/modify", "cdrom/floppy operation=disconnect for "+strings.Join(media, ", ")+" and the virtio floppy; re-read vm/detail", true, false)
-		res.add("boot-disk-first", "PUT", "vm/modify + GET vm/bootDev/<id>", "bootDev.bootdevs with the system disk first; re-read", true, false)
+		res.add("boot-disk-first", "PUT", "vm/modify + GET vm/bootDev/<id>", "bootDev.bootdevs with the system disk first and the current bootFirmware (vm/<id>/detail/all); diff vm/detail and the firmware before/after, re-read vm/bootDev; any other change keeps the VM", true, false)
 		res.add("clone-to-template", "POST", "vmTemplate/addVmTemplate", fmt.Sprintf("id=<temp vm id>&domainName=%s&opType=%s", opts.TemplateName, TEMPLATE_OP_CLONE), true, false)
 		res.add("check-template-flat", "GET", "vmTemplate/storage?vmId=<template id> + storage/volume", "fail if a template disk has a backingStore", false, false)
 		res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/<temp vm uuid>", deleteTempVMDetail, true, false)
 		if opts.AnswerStager != nil {
-			res.add("delete-answer-iso", "DELETE", fmt.Sprintf("storage/volume/delete/%d/%s/%s", host.Id, isoPool.Name, answerName), "only once it is detached", true, false)
+			res.add("delete-answer-iso", "DELETE", fmt.Sprintf("storage/volume/delete/%d/%s/%s", host.Id, isoPool.Name, answerName), "only once it is detached; then rescan and confirm it is gone, else a loud SECRET LEFT warning", true, false)
 		}
 		return res, nil
 	}
@@ -857,7 +866,7 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	// power-off. The API cannot read a marker inside the guest, so ask
 	// for what it can see: CAStools (installed at first logon, i.e. after
 	// Setup finished) and the disk allocation.
-	if opts.WaitCastools && !castoolsSeen {
+	if opts.waitCastools() && !castoolsSeen {
 		return keepVM(errors.Wrapf(cloudprovider.ErrInvalidStatus, "CAStools was never reported running on %s before it shut off; Setup may not have reached the first logon", vm.Name), "the install may be incomplete")
 	}
 	if vol, err := c.GetStorageVolume(host.Id, diskPool.Name, diskName); err != nil {
@@ -873,7 +882,7 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	}
 	// ---- boot order (N-W4/N-W6): templates boot the disk first ----
 	if err := c.setBootDiskFirst(res, vm, sysDisk.DeviceName); err != nil {
-		return keepVM(err, "refused to clone it: the boot order is not disk-first")
+		return keepVM(err, "refused to clone it: the boot order is not verified disk-first, or the change touched other settings")
 	}
 
 	// ---- template ----
@@ -924,8 +933,18 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	return res, nil
 }
 
+// waitCastools: CAStools must be seen running (default with Castools).
+func (o *SWindowsImportOptions) waitCastools() bool {
+	return o.Castools && !o.NoWaitCastools
+}
+
+// answerWarning is the loud form (N-R3), as for the HTTP staging copy:
+// the answer ISO this run uploaded was not (confirmed) deleted. It is
+// logged at once and returned for cmx to print as a WARNING.
 func answerWarning(p string) string {
-	return fmt.Sprintf("answer ISO %s contains the encoded Administrator password (and product key): delete it as soon as no VM uses it", p)
+	msg := fmt.Sprintf("SECRET LEFT ON THE CAS NODE: answer ISO %s holds the encoded Administrator password (and product key) and was NOT deleted; delete it as soon as no VM uses it (rm -f %s on the CAS node, or delete the storage volume)", p, p)
+	log.Errorf("cas windows import: %s", msg)
+	return msg
 }
 
 // writeSecretTemp writes data to a new 0600 temp file.
@@ -1012,6 +1031,13 @@ func (c *SCasClient) checkNewSystemDisk(hostId int64, pool, name, diskPath strin
 	if b, _ := bs.GetString(); len(strings.TrimSpace(b)) > 0 {
 		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s has backing file %s", diskPath, b)
 	}
+	// N-R4: a missing allocation would read as 0 and pass the
+	// nearly-unallocated check, so it must be present and numeric
+	if av, err := raw.Get("allocation"); err != nil {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s: no allocation field, cannot prove it is empty", diskPath)
+	} else if _, err := strconv.ParseFloat(strings.Trim(av.String(), `"`), 64); err != nil {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s: allocation is %s, not a number", diskPath, av.String())
+	}
 	vol := &SStorageVolume{}
 	if err := raw.Unmarshal(vol); err != nil {
 		return errors.Wrapf(err, "decode system disk %s", diskPath)
@@ -1077,7 +1103,7 @@ func (c *SCasClient) waitWindowsInstall(ctx context.Context, vm *SInstance, o *S
 		case err != nil:
 		case vm.GetStatus() == api.VM_RUNNING:
 			sawRunning, offPolls = true, 0
-			if o.WaitCastools && !castools {
+			if o.waitCastools() && !castools {
 				if st, err := c.GetCastoolStatus(vm.Id); err == nil && st == "running" {
 					castools = true
 				}
@@ -1194,23 +1220,122 @@ func (cli *SCasClient) GetVMBootDevs(id int64) ([]string, error) {
 	return ret, nil
 }
 
-// SVmModifyBootDev is RsDomainModifyBasic with only id and bootDev
-// (VMModifyBootDevConfig). bootFirmware is left out: api.yaml says 0 or
-// null clears the loader, which only matters to UEFI guests (not
-// supported here). UNVERIFIED on CAS.
-type SVmModifyBootDev struct {
-	Id      int64          `json:"id"`
-	BootDev SVmBootDevsCfg `json:"bootDev"`
+// GetVMBootFirmware reads boot.detail.bootFirmware (0 BIOS, 1 EFI) from
+// GET vm/{id}/detail/all (RsDomainDetail4Edit, api.yaml A:24866,
+// A:88963). Anything but a present 0 or 1 is an error.
+func (cli *SCasClient) GetVMBootFirmware(id int64) (int64, error) {
+	resp, err := cli.request(httputils.GET, fmt.Sprintf("vm/%d/detail/all", id), nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	v, err := unwrapRoot(resp).Get("boot", "detail", "bootFirmware")
+	if err != nil {
+		return 0, errors.Wrapf(cloudprovider.ErrInvalidStatus, "vm/%d/detail/all: no boot.detail.bootFirmware", id)
+	}
+	n, err := strconv.ParseInt(strings.Trim(v.String(), `"`), 10, 64)
+	if err != nil || (n != 0 && n != 1) {
+		return 0, errors.Wrapf(cloudprovider.ErrInvalidStatus, "vm/%d/detail/all: unknown bootFirmware %s", id, v.String())
+	}
+	return n, nil
 }
 
-type SVmBootDevsCfg struct {
-	Bootdevs string `json:"bootdevs"`
+// getVMDetailRaw is vm/detail/{id} as returned, for the before/after diff.
+func (cli *SCasClient) getVMDetailRaw(id int64) (jsonutils.JSONObject, error) {
+	resp, err := cli.request(httputils.GET, fmt.Sprintf("vm/detail/%d", id), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	return unwrapRoot(resp), nil
+}
+
+// winBootDiffIgnore are the vm/detail fields the bootDev write may (or
+// may by itself) change. Everything else must be identical before and
+// after; an unknown volatile field only keeps the VM (fail closed).
+var winBootDiffIgnore = map[string]bool{"status": true, "uptime": true, "bootDev.bootdevs": true}
+
+// jsonDiffPaths returns the paths (never the values: vm/detail may hold
+// a console password) at which a and b differ.
+func jsonDiffPaths(a, b jsonutils.JSONObject, ignore map[string]bool) ([]string, error) {
+	var av, bv interface{}
+	if err := json.Unmarshal([]byte(a.String()), &av); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(b.String()), &bv); err != nil {
+		return nil, err
+	}
+	out := []string{}
+	diffJSONValues("", av, bv, ignore, &out)
+	return out, nil
+}
+
+func diffJSONValues(at string, a, b interface{}, ignore map[string]bool, out *[]string) {
+	if ignore[at] {
+		return
+	}
+	name := at
+	if len(name) == 0 {
+		name = "(root)"
+	}
+	switch av := a.(type) {
+	case map[string]interface{}:
+		bv, ok := b.(map[string]interface{})
+		if !ok {
+			*out = append(*out, name)
+			return
+		}
+		keys := []string{}
+		for k := range av {
+			keys = append(keys, k)
+		}
+		for k := range bv {
+			if _, ok := av[k]; !ok {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			p := k
+			if len(at) > 0 {
+				p = at + "." + k
+			}
+			va, oka := av[k]
+			vb, okb := bv[k]
+			if oka != okb {
+				if !ignore[p] {
+					*out = append(*out, p)
+				}
+				continue
+			}
+			diffJSONValues(p, va, vb, ignore, out)
+		}
+	case []interface{}:
+		bv, ok := b.([]interface{})
+		if !ok || len(av) != len(bv) {
+			*out = append(*out, name)
+			return
+		}
+		for i := range av {
+			diffJSONValues(fmt.Sprintf("%s[%d]", at, i), av[i], bv[i], ignore, out)
+		}
+	default:
+		if !reflect.DeepEqual(a, b) {
+			*out = append(*out, name)
+		}
+	}
 }
 
 // setBootDiskFirst (N-W4): put the system disk first in the boot order
 // (keeping the other devices after it), then re-read and verify. The
 // vm/add bootingDevice field cannot be used for the check: api.yaml
 // (A:54886) says it does not follow later boot-order changes.
+//
+// N-R1: VMModifyBootDevConfig.bootFirmware "0 or null clears the
+// loader" (A:58852), so the VM's current firmware (vm/{id}/detail/all
+// boot.detail.bootFirmware: 0 BIOS, 1 EFI) is sent back explicitly, and
+// autoStart is echoed from vm/detail bootDev.autoStart when listed.
+// UNVERIFIED on CAS that 1 keeps the loader an EFI VM already has. The
+// whole vm/detail and the firmware are compared before and after the
+// write; any change outside the boot order is an error (no template).
 func (c *SCasClient) setBootDiskFirst(res *SWindowsImportResult, vm *SInstance, disk string) error {
 	cur, err := c.GetVMBootDevs(vm.Id)
 	if err != nil {
@@ -1222,12 +1347,47 @@ func (c *SCasClient) setBootDiskFirst(res *SWindowsImportResult, vm *SInstance, 
 			order = append(order, d)
 		}
 	}
-	body := jsonutils.Marshal(&SVmModifyBootDev{Id: vm.Id, BootDev: SVmBootDevsCfg{Bootdevs: strings.Join(order, ",")}})
 	if len(cur) == 0 || cur[0] != disk {
+		fw, err := c.GetVMBootFirmware(vm.Id)
+		if err != nil {
+			return errors.Wrapf(err, "read the boot firmware of %s", vm.Name)
+		}
+		before, err := c.getVMDetailRaw(vm.Id)
+		if err != nil {
+			return errors.Wrapf(err, "read vm/detail of %s before the boot-order change", vm.Name)
+		}
+		cfg := jsonutils.NewDict()
+		cfg.Set("bootdevs", jsonutils.NewString(strings.Join(order, ",")))
+		cfg.Set("bootFirmware", jsonutils.NewInt(fw))
+		if as, err := before.Get("bootDev", "autoStart"); err == nil {
+			if n, err := strconv.ParseInt(strings.Trim(as.String(), `"`), 10, 64); err == nil {
+				cfg.Set("autoStart", jsonutils.NewInt(n))
+			}
+		}
+		body := jsonutils.NewDict()
+		body.Set("id", jsonutils.NewInt(vm.Id))
+		body.Set("bootDev", cfg)
 		if _, err := c.doAsync(httputils.PUT, "vm/modify", nil, body); err != nil {
 			return errors.Wrapf(err, "set the boot order of %s to %s first", vm.Name, disk)
 		}
 		res.add("boot-disk-first", "PUT", "vm/modify", body.String(), true, true)
+		after, err := c.getVMDetailRaw(vm.Id)
+		if err != nil {
+			return errors.Wrapf(err, "re-read vm/detail of %s after the boot-order change", vm.Name)
+		}
+		diffs, err := jsonDiffPaths(before, after, winBootDiffIgnore)
+		if err != nil {
+			return errors.Wrapf(err, "compare vm/detail of %s", vm.Name)
+		}
+		if fw2, err := c.GetVMBootFirmware(vm.Id); err != nil {
+			return errors.Wrapf(err, "re-read the boot firmware of %s", vm.Name)
+		} else if fw2 != fw {
+			diffs = append(diffs, fmt.Sprintf("boot.detail.bootFirmware (%d -> %d)", fw, fw2))
+		}
+		if len(diffs) > 0 {
+			return errors.Wrapf(cloudprovider.ErrInvalidStatus, "the boot-order change also changed %s of %s", strings.Join(diffs, ", "), vm.Name)
+		}
+		res.add("verify-vm-unchanged", "GET", fmt.Sprintf("vm/detail/%d + vm/%d/detail/all", vm.Id, vm.Id), fmt.Sprintf("nothing but the boot order changed; firmware %d kept", fw), false, true)
 	}
 	got, err := c.GetVMBootDevs(vm.Id)
 	if err != nil {
@@ -1257,5 +1417,17 @@ func (c *SCasClient) deleteAnswerISO(res *SWindowsImportResult, hostId int64, po
 		return errors.Wrapf(err, "delete answer ISO %s", p)
 	}
 	res.add("delete-answer-iso", "DELETE", fmt.Sprintf("storage/volume/delete/%d/%s/%s", hostId, pool, name), "contained the encoded Administrator password", true, true)
+	// N-R3: confirm, as for the HTTP staging copy: rescan, then the
+	// volume must be gone. The caller turns an error into the loud
+	// SECRET LEFT warning.
+	if err := c.RefreshStoragePool(hostId, pool); err != nil {
+		return errors.Wrapf(err, "answer ISO %s: refresh pool %s to confirm the delete", p, pool)
+	}
+	if _, err := c.GetStorageVolume(hostId, pool, name); err == nil {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "answer ISO %s is still listed after the delete", p)
+	} else if errors.Cause(err) != cloudprovider.ErrNotFound {
+		return errors.Wrapf(err, "answer ISO %s: cannot confirm the delete", p)
+	}
+	res.add("confirm-answer-iso-gone", "GET", fmt.Sprintf("storage/refresh + storage/volume %s", name), "not listed any more", false, true)
 	return nil
 }

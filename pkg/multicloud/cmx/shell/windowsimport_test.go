@@ -86,9 +86,13 @@ func TestWindowsTemplateOptions(t *testing.T) {
 		t.Fatalf("http install ISO: %v", err)
 	}
 	m := winOpts()
-	m.MinInstalledGb, m.WaitCastools, m.Castools = 7, true, true
-	if mi, err := m.importOptions(); err != nil || mi.MinInstalledGB != 7 || !mi.WaitCastools {
+	m.MinInstalledGb, m.Castools = 7, true
+	if mi, err := m.importOptions(); err != nil || mi.MinInstalledGB != 7 || !mi.Castools || mi.NoWaitCastools {
 		t.Fatalf("min installed / castools: %v", err)
+	}
+	m.NoWaitCastools = true
+	if mi, err := m.importOptions(); err != nil || !mi.NoWaitCastools {
+		t.Fatalf("no-wait-castools: %v", err)
 	}
 
 	for name, mod := range map[string]func(o *WindowsTemplateOptions){
@@ -162,5 +166,25 @@ func TestRunWindowsAnswerISO(t *testing.T) {
 func TestWindowsTemplateNoKeepMediaFlag(t *testing.T) {
 	if _, ok := reflect.TypeOf(WindowsTemplateOptions{}).FieldByName("KeepMedia"); ok {
 		t.Fatal("--keep-media must not exist")
+	}
+}
+
+// N-R5: --castools waits for CAStools by default; --no-wait-castools opts
+// out and --wait-castools is gone.
+func TestWindowsTemplateCastoolsWaitFlag(t *testing.T) {
+	ty := reflect.TypeOf(WindowsTemplateOptions{})
+	if _, ok := ty.FieldByName("WaitCastools"); ok {
+		t.Fatal("WaitCastools flag must be gone (it is the default)")
+	}
+	f, ok := ty.FieldByName("NoWaitCastools")
+	if !ok || !strings.Contains(f.Tag.Get("help"), "With --castools") {
+		t.Fatal("NoWaitCastools flag")
+	}
+	c, _ := ty.FieldByName("Castools")
+	if !strings.Contains(c.Tag.Get("help"), "seen running") {
+		t.Fatal("castools help does not say it waits")
+	}
+	if !strings.Contains(windowsTemplateHelp, "with --castools, CAStools seen running") || !strings.Contains(windowsTemplateHelp, "bootFirmware echoed back") {
+		t.Fatal("help text")
 	}
 }
