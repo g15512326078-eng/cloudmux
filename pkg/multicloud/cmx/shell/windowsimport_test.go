@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -64,7 +65,7 @@ func TestWindowsTemplateOptions(t *testing.T) {
 	}
 	st, err := hi.AnswerStager("/tmp/answer.iso")
 	hs, ok := st.(*cas.SHTTPStager)
-	if err != nil || !ok || hs.Options.LocalPath != "/tmp/answer.iso" || hs.Options.ImageType != "raw" {
+	if err != nil || !ok || hs.Options.LocalPath != "/tmp/answer.iso" || hs.Options.ImageType != "raw" || !hs.Options.Sensitive {
 		t.Fatalf("answer stager %v %+v", err, st)
 	}
 
@@ -81,8 +82,13 @@ func TestWindowsTemplateOptions(t *testing.T) {
 	good := filepath.Join(dir, "good.iso")
 	os.WriteFile(good, isoData, 0600)
 	b.HttpUpload = good
-	if bi, err := b.importOptions(); err != nil || bi.IsoStager == nil {
+	if bi, err := b.importOptions(); err != nil || bi.IsoStager == nil || bi.IsoStager.(*cas.SHTTPStager).Options.Sensitive {
 		t.Fatalf("http install ISO: %v", err)
+	}
+	m := winOpts()
+	m.MinInstalledGb, m.WaitCastools, m.Castools = 7, true, true
+	if mi, err := m.importOptions(); err != nil || mi.MinInstalledGB != 7 || !mi.WaitCastools {
+		t.Fatalf("min installed / castools: %v", err)
 	}
 
 	for name, mod := range map[string]func(o *WindowsTemplateOptions){
@@ -121,7 +127,7 @@ func TestWriteAnswerISO(t *testing.T) {
 }
 
 func TestWindowsTemplateHelpMarksUnverified(t *testing.T) {
-	for _, want := range []string{"UNVERIFIED", "virtio", "boot-order"} {
+	for _, want := range []string{"UNVERIFIED", "virtio", "boot-order", "always disconnected", "keeps the temporary VM"} {
 		if want == "boot-order" {
 			want = "boot-order behaviour"
 		}
@@ -150,5 +156,11 @@ func TestRunWindowsAnswerISO(t *testing.T) {
 	}
 	if _, err := os.Stat(a.Out); !os.IsNotExist(err) {
 		t.Fatal("file written on error")
+	}
+}
+
+func TestWindowsTemplateNoKeepMediaFlag(t *testing.T) {
+	if _, ok := reflect.TypeOf(WindowsTemplateOptions{}).FieldByName("KeepMedia"); ok {
+		t.Fatal("--keep-media must not exist")
 	}
 }

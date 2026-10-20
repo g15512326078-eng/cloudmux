@@ -28,15 +28,31 @@ package cas
 //     cdrom = install ISO, cdrom = answer ISO, optional cdrom = CAStools,
 //     floppy storeFile=autoVirtio, system=0, osVersion, bootingDevice per
 //     BootOrder, autoBooting=0.
-//  4. check the VM has exactly one disk and it is that new file (the
-//     answer file wipes disk 0), then PUT vm/start.
+//  4. disk-wipe guard (the answer file wipes disk 0), failing closed:
+//     the disk pool is refreshed before the name-free check; vm/detail
+//     must list exactly one device that is not a CD or floppy, at
+//     exactly the new path, with no backing file, not shared; the
+//     re-read volume must be a qcow2 leaf of exactly the requested size,
+//     nearly unallocated, an empty-string backingStore, no other user.
+//     Any doubt keeps the VM unstarted. Then PUT vm/start, and vm/detail
+//     is re-checked at once (power off and keep the VM if it changed).
 //  5. poll vm/vmList until the guest shut itself off (Sysprep /shutdown),
-//     having been seen running; optional GET vm/{id}/castoolStatus.
-//  6. disconnect the install, answer and CAStools CDs and the floppy
-//     (PUT vm/modify cdrom/floppy operation=disconnect) and check it.
+//     having been seen running; optional GET vm/{id}/castoolStatus. The
+//     API cannot see a marker inside the guest, so a crash or a manual
+//     power-off cannot be told apart from Sysprep directly; as evidence
+//     the system disk must have >= MinInstalledGB allocated and, with
+//     WaitCastools, CAStools (installed at first logon) must have been
+//     seen running. Otherwise the VM is kept.
+//  6. always disconnect the install, answer and CAStools CDs and the
+//     floppy (PUT vm/modify cdrom/floppy operation=disconnect), each
+//     must have been listed before and none may be listed afterwards;
+//     then put the system disk first in the boot order (vm/modify
+//     bootDev, re-read with GET vm/bootDev). Otherwise the VM is kept
+//     and no template is made, so a template never boots Setup media.
 //  7. addVmTemplate opType=1 (clone; opType 2 is never sent), the B1
 //     backing-file check, recycle the temp VM (delBase0=false,
-//     isWipeVolume=false), delete the answer ISO uploaded by this run.
+//     isWipeVolume=false), delete the answer ISO uploaded by this run
+//     (http mode also deletes its /vms/nova staging copy, B-W3).
 //
 // The "Press any key to boot from CD or DVD" prompt (user concern 2):
 // with BIOS media it is shown by the CD boot sector only when the hard
@@ -99,8 +115,15 @@ const (
 	// winStoppedGrace: a VM that is shut off this many polls in a row
 	// without ever having been seen running did not install anything.
 	winStoppedGrace = 3
-	// winListErrors: consecutive vm/vmList failures tolerated while waiting.
+	// winListErrors: consecutive vm/vmList failures (or unknown statuses)
+	// tolerated while waiting.
 	winListErrors = 5
+	// DEFAULT_WIN_MIN_INSTALLED_GB: allocation of the system disk below
+	// which a shut-off guest counts as not installed.
+	DEFAULT_WIN_MIN_INSTALLED_GB = 4
+	// winNewDiskMaxAllocMB: a freshly created thin qcow2 holds only
+	// metadata; more than this before the first start is not a new disk.
+	winNewDiskMaxAllocMB = 64
 )
 
 // SWindowsImportOptions describes one Windows ISO -> template run.
@@ -150,15 +173,17 @@ type SWindowsImportOptions struct {
 
 	InstallTimeout time.Duration
 	PollInterval   time.Duration
-	// WaitCastools also polls vm/{id}/castoolStatus while installing and
-	// warns when CAStools was never seen running.
+	// WaitCastools also polls vm/{id}/castoolStatus while installing; a
+	// guest that shut off without CAStools ever reported running is then
+	// treated as an unfinished install (the VM is kept). Needs Castools.
 	WaitCastools bool
-	// KeepMedia skips disconnecting the CDs/floppy (the template then
-	// references them, including the answer ISO; not recommended).
-	KeepMedia bool
-	Refresh   bool
-	DryRun    bool
-	Context   context.Context
+	// MinInstalledGB: after the guest shut off, the system disk must have
+	// at least this much allocated (default 4 GB), else the install is
+	// treated as unfinished (the VM is kept).
+	MinInstalledGB int
+	Refresh        bool
+	DryRun         bool
+	Context        context.Context
 
 	now func() time.Time
 }
@@ -255,6 +280,15 @@ func (o *SWindowsImportOptions) normalize() error {
 	}
 	if o.MemoryMB < 2048 {
 		return errors.Wrapf(cloudprovider.ErrInputParameter, "memory %d MB: Windows Setup needs at least 2048", o.MemoryMB)
+	}
+	if o.WaitCastools && !o.Castools {
+		return errors.Wrap(cloudprovider.ErrInputParameter, "waiting for CAStools needs the CAStools CD (castools)")
+	}
+	if o.MinInstalledGB <= 0 {
+		o.MinInstalledGB = DEFAULT_WIN_MIN_INSTALLED_GB
+	}
+	if o.MinInstalledGB >= o.DiskSizeGB {
+		return errors.Wrapf(cloudprovider.ErrInputParameter, "minimum installed size %d GB must be below the disk size %d GB", o.MinInstalledGB, o.DiskSizeGB)
 	}
 	if o.InstallTimeout <= 0 {
 		o.InstallTimeout = DEFAULT_WIN_INSTALL_TIMEOUT
@@ -556,6 +590,21 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	} else if len(vms) > 0 {
 		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "a VM named %s already exists (%s; maybe kept by an earlier run): pick another --temp-vm-name", opts.TempVMName, vms[0].Uuid)
 	}
+	// B-W1: rescan first, so a file copied in by hand (not yet listed) is
+	// seen; CAS behaviour for a bare storeFile that already exists is
+	// undocumented, it might attach it
+	refreshDisk := fmt.Sprintf("storage/refresh?id=%d&poolName=%s", host.Id, diskPool.Name)
+	if opts.DryRun {
+		res.add("refresh-disk-pool", "GET", refreshDisk, "rescan before the system-disk name check (state-changing; skipped in dry-run)", true, false)
+	} else {
+		if err := interrupted("refreshing the disk pool"); err != nil {
+			return nil, err
+		}
+		if err := c.RefreshStoragePool(host.Id, diskPool.Name); err != nil {
+			return nil, errors.Wrapf(err, "refresh pool %s", diskPool.Name)
+		}
+		res.add("refresh-disk-pool", "GET", refreshDisk, "", true, true)
+	}
 	if _, err := c.GetStorageVolume(host.Id, diskPool.Name, diskName); err == nil {
 		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "system disk %s already exists in pool %s: pick another --temp-vm-name", diskName, diskPool.Name)
 	} else if errors.Cause(err) != cloudprovider.ErrNotFound {
@@ -645,12 +694,13 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	addJSON := jsonutils.Marshal(addBody).String()
 	if opts.DryRun {
 		res.add("create-vm", "POST", "vm/add", addJSON, true, false)
-		res.add("check-vm-disks", "GET", "vm/detail/<id>", "exactly one disk, the new "+diskPath+"; else refuse to start (the answer file wipes disk 0)", false, false)
+		res.add("check-vm-disks", "GET", "vm/detail/<id> + storage/volume", fmt.Sprintf("exactly one non-CD/floppy device, exactly %s, no backing file, not shared, %d MB, nearly unallocated; else keep the VM unstarted (the answer file wipes disk 0)", diskPath, opts.DiskSizeGB*1024), false, false)
 		res.add("start-vm", "PUT", "vm/start/<id>", "", true, false)
+		res.add("recheck-vm-disks", "GET", "vm/detail/<id>", "same disk set right after the start; else power off and keep the VM", false, false)
 		res.add("wait-install", "GET", "vm/vmList (+ vm/<id>/castoolStatus)", fmt.Sprintf("until the guest shuts itself off after Sysprep; poll %s, timeout %s", opts.PollInterval, opts.InstallTimeout), false, false)
-		if !opts.KeepMedia {
-			res.add("detach-media", "PUT", "vm/modify", "cdrom/floppy operation=disconnect for "+strings.Join(media, ", ")+" and the virtio floppy", true, false)
-		}
+		res.add("check-install", "GET", "storage/volume", fmt.Sprintf("system disk allocation >= %d GB%s", opts.MinInstalledGB, map[bool]string{true: " and CAStools seen running", false: ""}[opts.WaitCastools]), false, false)
+		res.add("detach-media", "PUT", "vm/modify", "cdrom/floppy operation=disconnect for "+strings.Join(media, ", ")+" and the virtio floppy; re-read vm/detail", true, false)
+		res.add("boot-disk-first", "PUT", "vm/modify + GET vm/bootDev/<id>", "bootDev.bootdevs with the system disk first; re-read", true, false)
 		res.add("clone-to-template", "POST", "vmTemplate/addVmTemplate", fmt.Sprintf("id=<temp vm id>&domainName=%s&opType=%s", opts.TemplateName, TEMPLATE_OP_CLONE), true, false)
 		res.add("check-template-flat", "GET", "vmTemplate/storage?vmId=<template id> + storage/volume", "fail if a template disk has a backingStore", false, false)
 		res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/<temp vm uuid>", deleteTempVMDetail, true, false)
@@ -762,22 +812,21 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 		return keepVM(errors.Wrapf(cloudprovider.ErrInvalidStatus, "temporary VM %s has status %s right after vm/add (autoBooting=0)", vm.Name, vm.VmStatus), "it may already be running Setup")
 	}
 
-	// the answer file wipes disk 0: the VM must have exactly one disk and
-	// it must be the new file in the disk pool
+	// B-W1: the answer file wipes disk 0. Any doubt about what disk 0 is
+	// keeps the VM unstarted (not recycled: it is evidence of what CAS did).
+	const refused = "refused to start it: the disk-wipe guard is not satisfied"
 	detail, err := c.GetInstanceDetail(vm.Id)
 	if err != nil {
-		return failBeforeStart(errors.Wrapf(err, "read the disks of %s before starting it", vm.Name))
+		return keepVM(errors.Wrapf(err, "read the disks of %s before starting it", vm.Name), refused)
 	}
-	if err := checkWindowsVMDisks(detail, diskPool.Path, opts.TempVMName); err != nil {
-		return failBeforeStart(err)
+	sysDisk, err := checkWindowsVMDisks(detail, diskPath)
+	if err != nil {
+		return keepVM(err, refused)
 	}
-	if vol, err := c.GetStorageVolume(host.Id, diskPool.Name, path.Base(detail.firstDisk().Path)); err != nil {
-		return failBeforeStart(errors.Wrapf(err, "system disk %s is not listed in pool %s", detail.firstDisk().Path, diskPool.Name))
-	} else if u := strings.TrimSpace(vol.Users); len(u) > 0 && u != vm.Name {
-		return failBeforeStart(errors.Errorf("system disk %s is used by %q, not only by %s; refusing to install onto it", detail.firstDisk().Path, u, vm.Name))
+	if err := c.checkNewSystemDisk(host.Id, diskPool.Name, diskName, diskPath, opts.DiskSizeGB, vm.Name); err != nil {
+		return keepVM(err, refused)
 	}
-	res.SystemDisk = detail.firstDisk().Path
-	res.add("check-vm-disks", "GET", fmt.Sprintf("vm/detail/%d", vm.Id), "one disk: "+res.SystemDisk, false, true)
+	res.add("check-vm-disks", "GET", fmt.Sprintf("vm/detail/%d", vm.Id), "one disk: "+diskPath+" ("+sysDisk.DeviceName+"), new and empty", false, true)
 
 	if err := interrupted("starting the VM"); err != nil {
 		return failBeforeStart(err)
@@ -789,6 +838,14 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 		return keepVM(errors.Wrapf(err, "start %s", vm.Name), "the start may have happened")
 	}
 	res.add("start-vm", "PUT", fmt.Sprintf("vm/start/%d", vm.Id), "", true, true)
+	// N-W1: Windows PE needs far longer than this to reach the disk
+	// configuration; if the disk set changed in the meantime, power off
+	if d2, err := c.GetInstanceDetail(vm.Id); err != nil {
+		return c.powerOffAndKeep(vm, keepVM, errors.Wrapf(err, "re-read the disks of %s after the start", vm.Name))
+	} else if _, err := checkWindowsVMDisks(d2, diskPath); err != nil {
+		return c.powerOffAndKeep(vm, keepVM, errors.Wrapf(err, "after the start"))
+	}
+	res.add("recheck-vm-disks", "GET", fmt.Sprintf("vm/detail/%d", vm.Id), "unchanged", false, true)
 	log.Infof("cas windows import: %s (%s) started; waiting up to %s for Setup and Sysprep to shut it off", vm.Name, vm.Uuid, opts.InstallTimeout)
 
 	castoolsSeen, err := c.waitWindowsInstall(ctx, vm, &opts)
@@ -796,15 +853,27 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 		return keepVM(err, "the install did not finish as expected")
 	}
 	res.add("wait-install", "GET", "vm/vmList", "guest shut itself off", false, true)
+	// N-W3: "shut off after running" alone could be a crash or a manual
+	// power-off. The API cannot read a marker inside the guest, so ask
+	// for what it can see: CAStools (installed at first logon, i.e. after
+	// Setup finished) and the disk allocation.
 	if opts.WaitCastools && !castoolsSeen {
-		res.Warnings = append(res.Warnings, fmt.Sprintf("CAStools was never reported running on %s; the template may lack CAStools", vm.Name))
+		return keepVM(errors.Wrapf(cloudprovider.ErrInvalidStatus, "CAStools was never reported running on %s before it shut off; Setup may not have reached the first logon", vm.Name), "the install may be incomplete")
 	}
+	if vol, err := c.GetStorageVolume(host.Id, diskPool.Name, diskName); err != nil {
+		return keepVM(errors.Wrapf(err, "re-read system disk %s after the install", diskPath), "the install cannot be confirmed")
+	} else if vol.Allocation < float64(opts.MinInstalledGB*1024) {
+		return keepVM(errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s has %.0f MB allocated after the guest shut off, below %d GB: Windows is probably not installed (crash or power-off?)", diskPath, vol.Allocation, opts.MinInstalledGB), "the install may be incomplete")
+	}
+	res.add("check-install", "GET", "storage/volume", fmt.Sprintf("system disk allocation >= %d GB", opts.MinInstalledGB), false, true)
 
-	// ---- media ----
-	if opts.KeepMedia {
-		res.Warnings = append(res.Warnings, "media were not disconnected (keep-media): the template references the install ISO and the answer ISO, which holds the encoded Administrator password")
-	} else if err := c.detachWindowsMedia(res, vm, media); err != nil {
-		return keepVM(err, "media could not be disconnected safely")
+	// ---- media (B-W2: always, verified) ----
+	if err := c.detachWindowsMedia(res, vm, media); err != nil {
+		return keepVM(err, "refused to clone it: install media may still be attached")
+	}
+	// ---- boot order (N-W4/N-W6): templates boot the disk first ----
+	if err := c.setBootDiskFirst(res, vm, sysDisk.DeviceName); err != nil {
+		return keepVM(err, "refused to clone it: the boot order is not disk-first")
 	}
 
 	// ---- template ----
@@ -837,7 +906,7 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 		keepAnswer()
 	} else {
 		res.add("delete-temp-vm", "DELETE", "vm/delete/uuid/"+vm.Uuid, deleteTempVMDetail+"; its system disk stays with it", true, true)
-		if answerOurs && !opts.KeepMedia {
+		if answerOurs {
 			if err := c.deleteAnswerISO(res, host.Id, isoPool.Name, answerName, answerPath); err != nil {
 				errs = append(errs, err)
 				keepAnswer()
@@ -883,33 +952,93 @@ func writeSecretTemp(data []byte) (string, error) {
 	return name, nil
 }
 
-func (d *SInstanceDetail) firstDisk() SInstanceStorage {
-	for _, st := range d.disks {
-		if st.Device == "disk" {
-			return st
-		}
-	}
-	return SInstanceStorage{}
+// isRemovableMedia: CD and floppy entries are not disks to Windows PE;
+// everything else (including an empty or unknown device kind) is
+// treated as a disk.
+func isRemovableMedia(st SInstanceStorage) bool {
+	d := strings.TrimSpace(st.Device)
+	return strings.EqualFold(d, "cdrom") || strings.EqualFold(d, "floppy")
 }
 
-// checkWindowsVMDisks: exactly one storage item of device "disk", in the
-// disk pool directory, named after the temp VM (CAS may add a suffix to a
-// bare storeFile; UNVERIFIED).
-func checkWindowsVMDisks(d *SInstanceDetail, poolPath, tempVM string) error {
+// checkWindowsVMDisks (B-W1, fail closed): exactly one storage entry that
+// is not a CD or floppy, at exactly diskPath, without a backing file and
+// not on shared storage. Returns that entry.
+func checkWindowsVMDisks(d *SInstanceDetail, diskPath string) (SInstanceStorage, error) {
 	disks := []SInstanceStorage{}
 	for _, st := range d.disks {
-		if st.Device == "disk" {
+		if !isRemovableMedia(st) {
 			disks = append(disks, st)
 		}
 	}
 	if len(disks) != 1 {
-		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s lists %d disks, want exactly the new system disk; refusing to start (the answer file wipes disk 0)", d.Name, len(disks))
+		kinds := []string{}
+		for _, st := range disks {
+			kinds = append(kinds, fmt.Sprintf("%q %s", st.Device, st.Path))
+		}
+		return SInstanceStorage{}, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s lists %d disk-like devices (%s), want exactly the new system disk (the answer file wipes disk 0)", d.Name, len(disks), strings.Join(kinds, ", "))
 	}
-	p := disks[0].Path
-	if path.Clean(path.Dir(p)) != path.Clean(poolPath) || !strings.HasPrefix(path.Base(p), tempVM) {
-		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s disk is %q, not a new file of %s in %s; refusing to start (the answer file wipes disk 0)", d.Name, p, tempVM, poolPath)
+	st := disks[0]
+	if path.Clean(st.Path) != path.Clean(diskPath) {
+		return st, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s disk is %q, not exactly the new file %s (the answer file wipes disk 0)", d.Name, st.Path, diskPath)
+	}
+	if b := strings.TrimSpace(st.BackingFile); len(b) > 0 {
+		return st, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s disk %s has backing file %s; not a new empty disk", d.Name, st.Path, b)
+	}
+	if st.IsShareStorage {
+		return st, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s disk %s is shared storage; not a new private disk", d.Name, st.Path)
+	}
+	if len(st.DeviceName) == 0 {
+		return st, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s disk %s has no device name", d.Name, st.Path)
+	}
+	return st, nil
+}
+
+// checkNewSystemDisk re-reads the disk volume: qcow2, level 0, an empty
+// string backingStore (missing or non-string counts as doubt), exactly
+// the requested size, nearly nothing allocated, used by no other VM.
+func (c *SCasClient) checkNewSystemDisk(hostId int64, pool, name, diskPath string, sizeGB int, vmName string) error {
+	raw, err := c.getStorageVolumeRaw(hostId, pool, name)
+	if err != nil {
+		return errors.Wrapf(err, "re-read system disk %s", diskPath)
+	}
+	bv, err := raw.Get("backingStore")
+	if err != nil {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s: no backingStore field, cannot prove it has no backing file", diskPath)
+	}
+	bs, ok := bv.(*jsonutils.JSONString)
+	if !ok {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s: backingStore is %s, not a string", diskPath, bv.String())
+	}
+	if b, _ := bs.GetString(); len(strings.TrimSpace(b)) > 0 {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s has backing file %s", diskPath, b)
+	}
+	vol := &SStorageVolume{}
+	if err := raw.Unmarshal(vol); err != nil {
+		return errors.Wrapf(err, "decode system disk %s", diskPath)
+	}
+	want := float64(sizeGB * 1024)
+	switch {
+	case vol.Name != name:
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk listed as %q, want %q", vol.Name, name)
+	case !strings.EqualFold(vol.Format, "qcow2") || vol.Level != 0:
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s has format %q level %d, want a qcow2 leaf", diskPath, vol.Format, vol.Level)
+	case vol.Size < want-1 || vol.Size > want+1:
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s is %.0f MB, want the requested %.0f MB", diskPath, vol.Size, want)
+	case vol.Allocation > winNewDiskMaxAllocMB:
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s already has %.0f MB allocated; not a new empty disk", diskPath, vol.Allocation)
+	}
+	if u := strings.TrimSpace(vol.Users); len(u) > 0 && u != vmName {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "system disk %s is used by %q, not only by %s", diskPath, u, vmName)
 	}
 	return nil
+}
+
+// powerOffAndKeep stops a VM that must not keep installing, then keeps it.
+func (c *SCasClient) powerOffAndKeep(vm *SInstance, keepVM func(error, string) (*SWindowsImportResult, error), cause error) (*SWindowsImportResult, error) {
+	if err := vm.StopVM(context.Background(), &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
+		return keepVM(errors.NewAggregate([]error{cause, errors.Wrapf(err, "power off %s", vm.Name)}), "POWER IT OFF BY HAND NOW: Setup may wipe its disk 0")
+	}
+	return keepVM(cause, "powered off: its disks changed after the start")
 }
 
 // waitWindowsInstall polls until the guest shut itself off after having
@@ -917,7 +1046,7 @@ func checkWindowsVMDisks(d *SInstanceDetail, poolPath, tempVM string) error {
 func (c *SCasClient) waitWindowsInstall(ctx context.Context, vm *SInstance, o *SWindowsImportOptions) (bool, error) {
 	deadline := o.now().Add(o.InstallTimeout)
 	sawRunning, castools := false, false
-	offPolls, listErrs := 0, 0
+	offPolls, listErrs, oddPolls := 0, 0, 0
 	for {
 		vms, err := c.findVMsByName(vm.Name)
 		status := ""
@@ -939,6 +1068,11 @@ func (c *SCasClient) waitWindowsInstall(ctx context.Context, vm *SInstance, o *S
 				return castools, errors.Wrapf(cloudprovider.ErrNotFound, "VM %s (%s) disappeared while installing", vm.Name, vm.Uuid)
 			}
 		}
+		if err == nil && vm.GetStatus() != api.VM_RUNNING && vm.GetStatus() != api.VM_READY {
+			oddPolls++
+		} else {
+			oddPolls = 0
+		}
 		switch {
 		case err != nil:
 		case vm.GetStatus() == api.VM_RUNNING:
@@ -956,7 +1090,11 @@ func (c *SCasClient) waitWindowsInstall(ctx context.Context, vm *SInstance, o *S
 				return castools, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s is shut off and was never seen running; Setup did not run", vm.Name)
 			}
 		default:
-			return castools, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s has status %q while installing", vm.Name, status)
+			// a transient state (e.g. while CAS updates the VM) is
+			// tolerated a few polls in a row
+			if oddPolls >= winListErrors {
+				return castools, errors.Wrapf(cloudprovider.ErrInvalidStatus, "VM %s has status %q for %d polls while installing", vm.Name, status, oddPolls)
+			}
 		}
 		if !o.now().Before(deadline) {
 			return castools, errors.Wrapf(cloudprovider.ErrTimeout, "VM %s did not shut off within %s (status %s); it may still be installing, or Setup may be waiting on its console", vm.Name, o.InstallTimeout, vm.VmStatus)
@@ -969,24 +1107,44 @@ func (c *SCasClient) waitWindowsInstall(ctx context.Context, vm *SInstance, o *S
 	}
 }
 
-// detachWindowsMedia disconnects every CD whose path is one of media and
-// every floppy, then re-reads the VM and fails if any of those CDs is
-// still attached.
+// detachWindowsMedia (B-W2) disconnects every CD whose path is one of
+// media (install ISO, answer ISO, CAStools ISO) and every floppy, then
+// re-reads vm/detail. Each of media must have been found attached
+// before (else the paths CAS reports do not match ours and the re-read
+// would prove nothing), and afterwards none of them and no floppy image
+// may be attached.
 func (c *SCasClient) detachWindowsMedia(res *SWindowsImportResult, vm *SInstance, media []string) error {
 	want := map[string]bool{}
 	for _, m := range media {
 		want[path.Clean(m)] = true
 	}
+	isOurCD := func(st SInstanceStorage) bool {
+		return strings.EqualFold(strings.TrimSpace(st.Device), "cdrom") && len(st.Path) > 0 && want[path.Clean(st.Path)]
+	}
+	isFloppy := func(st SInstanceStorage) bool {
+		return strings.EqualFold(strings.TrimSpace(st.Device), "floppy") && len(st.Path) > 0
+	}
 	detail, err := c.GetInstanceDetail(vm.Id)
 	if err != nil {
 		return errors.Wrapf(err, "read media of %s", vm.Name)
 	}
+	seen := map[string]bool{}
+	for _, st := range detail.disks {
+		if isOurCD(st) {
+			seen[path.Clean(st.Path)] = true
+		}
+	}
+	for _, m := range media {
+		if !seen[path.Clean(m)] {
+			return errors.Wrapf(cloudprovider.ErrInvalidStatus, "%s does not list %s as an attached CD; cannot prove it gets disconnected", vm.Name, m)
+		}
+	}
 	for _, st := range detail.disks {
 		var body *SVmModifyMedia
 		switch {
-		case st.Device == "cdrom" && len(st.Path) > 0 && want[path.Clean(st.Path)]:
+		case isOurCD(st):
 			body = &SVmModifyMedia{Id: vm.Id, Cdrom: &SVmModifyCdromCfg{Device: st.DeviceName, Operation: "disconnect", Type: "file", Path: st.Path}}
-		case st.Device == "floppy" && len(st.Path) > 0:
+		case isFloppy(st):
 			body = &SVmModifyMedia{Id: vm.Id, Floppy: &SVmModifyFloppyConf{DeviceName: st.DeviceName, Operation: "disconnect"}}
 		default:
 			continue
@@ -1005,13 +1163,80 @@ func (c *SCasClient) detachWindowsMedia(res *SWindowsImportResult, vm *SInstance
 		return errors.Wrapf(err, "re-read media of %s", vm.Name)
 	}
 	for _, st := range detail.disks {
-		if st.Device == "cdrom" && len(st.Path) > 0 && want[path.Clean(st.Path)] {
+		if isOurCD(st) || isFloppy(st) {
 			return errors.Errorf("%s still has %s attached at %s after disconnect", vm.Name, st.Path, st.DeviceName)
 		}
-		if st.Device == "floppy" && len(st.Path) > 0 {
-			res.Warnings = append(res.Warnings, fmt.Sprintf("the virtio floppy %s is still listed on %s; the template may keep it", st.Path, vm.Name))
+	}
+	res.add("verify-media-detached", "GET", fmt.Sprintf("vm/detail/%d", vm.Id), "no install/answer/CAStools CD and no floppy image attached", false, true)
+	return nil
+}
+
+// GetVMBootDevs is GET vm/bootDev/{id} (api.yaml A:21052):
+// bootdev.bootdevs, "dev1,dev2,..." where an item may carry a label after
+// ";" (example "vda;高速磁盘(Virtio) vda,sda;光驱 sda"). Returns the device
+// names in boot order.
+func (cli *SCasClient) GetVMBootDevs(id int64) ([]string, error) {
+	resp, err := cli.request(httputils.GET, fmt.Sprintf("vm/bootDev/%d", id), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp = unwrapRoot(resp)
+	s, err := resp.GetString("bootdev", "bootdevs")
+	if err != nil {
+		return nil, errors.Wrapf(ErrEmptyBody, "vm/bootDev/%d: no bootdev.bootdevs", id)
+	}
+	ret := []string{}
+	for _, item := range strings.Split(s, ",") {
+		if dev := strings.TrimSpace(strings.SplitN(item, ";", 2)[0]); len(dev) > 0 {
+			ret = append(ret, dev)
 		}
 	}
+	return ret, nil
+}
+
+// SVmModifyBootDev is RsDomainModifyBasic with only id and bootDev
+// (VMModifyBootDevConfig). bootFirmware is left out: api.yaml says 0 or
+// null clears the loader, which only matters to UEFI guests (not
+// supported here). UNVERIFIED on CAS.
+type SVmModifyBootDev struct {
+	Id      int64          `json:"id"`
+	BootDev SVmBootDevsCfg `json:"bootDev"`
+}
+
+type SVmBootDevsCfg struct {
+	Bootdevs string `json:"bootdevs"`
+}
+
+// setBootDiskFirst (N-W4): put the system disk first in the boot order
+// (keeping the other devices after it), then re-read and verify. The
+// vm/add bootingDevice field cannot be used for the check: api.yaml
+// (A:54886) says it does not follow later boot-order changes.
+func (c *SCasClient) setBootDiskFirst(res *SWindowsImportResult, vm *SInstance, disk string) error {
+	cur, err := c.GetVMBootDevs(vm.Id)
+	if err != nil {
+		return errors.Wrapf(err, "read the boot order of %s", vm.Name)
+	}
+	order := []string{disk}
+	for _, d := range cur {
+		if d != disk {
+			order = append(order, d)
+		}
+	}
+	body := jsonutils.Marshal(&SVmModifyBootDev{Id: vm.Id, BootDev: SVmBootDevsCfg{Bootdevs: strings.Join(order, ",")}})
+	if len(cur) == 0 || cur[0] != disk {
+		if _, err := c.doAsync(httputils.PUT, "vm/modify", nil, body); err != nil {
+			return errors.Wrapf(err, "set the boot order of %s to %s first", vm.Name, disk)
+		}
+		res.add("boot-disk-first", "PUT", "vm/modify", body.String(), true, true)
+	}
+	got, err := c.GetVMBootDevs(vm.Id)
+	if err != nil {
+		return errors.Wrapf(err, "re-read the boot order of %s", vm.Name)
+	}
+	if len(got) == 0 || got[0] != disk {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "boot order of %s is %v after the change, want %s first", vm.Name, got, disk)
+	}
+	res.add("verify-boot-order", "GET", fmt.Sprintf("vm/bootDev/%d", vm.Id), strings.Join(got, ","), false, true)
 	return nil
 }
 

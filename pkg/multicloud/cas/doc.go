@@ -62,11 +62,14 @@
 //     autounattend.xml with virtio driver paths on the autoVirtio floppy,
 //     a disk-0 wipe of the new disk only, encoded Administrator password,
 //     Sysprep /generalize /oobe /shutdown; isowriter.go: pure-Go ISO 9660
-//     with Joliet) boot a temporary VM; once it shut itself off its media are
-//     disconnected and it is cloned with addVmTemplate opType=1, checked
-//     flat and recycled. Secrets never reach logs, plans or errors. From
-//     the start on a failure keeps the VM. The floppy layout, boot-order
-//     behaviour, firmware and disconnect bodies are UNVERIFIED on CAS.
+//     with Joliet) boot a temporary VM behind a fail-closed disk-wipe
+//     guard; once it shut itself off (with install evidence) its media are
+//     always disconnected (verified), the boot order is set disk-first
+//     (verified) and it is cloned with addVmTemplate opType=1, checked
+//     flat and recycled. Secrets never reach logs, plans or errors; the
+//     answer file deletes its cached copies and autologon before Sysprep.
+//     Any doubt keeps the VM. The floppy layout, boot-order behaviour,
+//     firmware and the vm/modify bodies are UNVERIFIED on CAS.
 //
 // Storagecache.UploadImage (cloudpods image upload) and template storage
 // pool management are not implemented.

@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -73,10 +74,27 @@ type winFake struct {
 	castools      string
 	onStart       func()
 	deleteAnswers int
+
+	// disk-wipe guard knobs
+	diskVol          func(v dict)  // edit the new disk's volume entry
+	diskDetail       func(st dict) // edit the disk's vm/detail entry
+	extraStorage     []dict        // more vm/detail entries
+	diskHidden       bool          // disk name only listed after a refresh
+	installAlloc     float64       // allocation after the install (default 9000 MB)
+	oddStatus        int           // polls with an unknown status after the start
+	bootdevs         []string      // vm/bootDev order
+	bootNoop         bool          // bootDev change is ignored
+	bootGetFail      bool          // GET vm/bootDev -> 500
+	floppyStuck      bool          // floppy disconnect is ignored
+	powerOffs        int
+	refreshed        map[string]int
+	cdPathRewrite    bool
+	modifyStatusBoot int
+	bootFirst        bool
 }
 
 func newWinFake(t *testing.T) *winFake {
-	return &winFake{t: t, polls: map[int64]int{}, fail: map[int64]bool{}, installPolls: 3, castools: "running",
+	return &winFake{t: t, polls: map[int64]int{}, fail: map[int64]bool{}, installPolls: 3, castools: "running", installAlloc: 9000, refreshed: map[string]int{},
 		vols: map[string][]dict{
 			"isopool":     {{"name": winISO, "format": "raw", "size": 5000, "storagePoolName": "isopool"}},
 			"defaultpool": {},
@@ -178,15 +196,35 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && p == "vmTemplate/all":
 		reply(w, dict{"domain": append([]dict{}, f.tpls...)})
 	case r.Method == "GET" && p == "vm/vmList":
-		if vm := f.vm50(); vm != nil && vm["vmStatus"] == "running" {
+		if vm := f.vm50(); vm != nil && (vm["vmStatus"] == "running" || vm["vmStatus"] == "unknown") {
 			f.running++
+			vm["vmStatus"] = "running"
+			if f.oddStatus > 0 {
+				f.oddStatus--
+				vm["vmStatus"] = "unknown"
+			}
 			if f.installPolls > 0 && f.running > f.installPolls {
 				vm["vmStatus"] = "shutOff"
+				for _, v := range f.vols["defaultpool"] {
+					if v["name"] == winDisk {
+						v["allocation"] = f.installAlloc
+					}
+				}
 			}
 		}
 		reply(w, dict{"domain": append([]dict{}, f.vms...)})
 	case r.Method == "GET" && p == "vm/detail/50":
-		reply(w, dict{"id": 50, "name": winTempVM, "uuid": "uuid-win", "status": "shutOff", "storage": append([]dict{}, f.storage...)})
+		reply(w, dict{"id": 50, "name": winTempVM, "uuid": "uuid-win", "status": "shutOff", "storage": append(append([]dict{}, f.storage...), f.extraStorage...)})
+	case r.Method == "GET" && p == "vm/bootDev/50":
+		if f.bootGetFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		items := []string{}
+		for _, d := range f.bootdevs {
+			items = append(items, d+";label "+d)
+		}
+		reply(w, dict{"id": 50, "name": winTempVM, "bootdev": dict{"bootdevs": strings.Join(items, ",")}})
 	case r.Method == "GET" && p == "vm/50/castoolStatus":
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, f.castools)
@@ -200,12 +238,19 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		out := []dict{}
 		for _, v := range f.vols[pool] {
+			if v["name"] == winDisk && f.diskHidden {
+				continue
+			}
 			if n := q.Get("volumeName"); len(n) == 0 || v["name"] == n {
 				out = append(out, v)
 			}
 		}
 		reply(w, dict{"storageVolume": out})
 	case r.Method == "GET" && p == "storage/refresh":
+		f.refreshed[q.Get("poolName")]++
+		if q.Get("poolName") == "defaultpool" {
+			f.diskHidden = false
+		}
 		reply(w, dict{"state": 0, "errorCode": 0, "message": "ok"})
 	case r.Method == "POST" && p == "vm/add" && f.vmAddStatus != 0:
 		if f.vmAddCreates {
@@ -226,13 +271,30 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case "disk":
 				pool, _ := it.GetString("poolName")
 				dp := path.Join(winPoolPath(pool), sf)
-				f.storage = append(f.storage, dict{"device": "disk", "deviceName": "vda", "path": dp, "format": "qcow2"})
-				f.vols[pool] = append(f.vols[pool], dict{"name": sf, "format": "qcow2", "size": 61440, "users": name})
+				capacity, _ := it.Int("capacity")
+				st := dict{"device": "disk", "deviceName": "vda", "path": dp, "format": "qcow2", "backingFile": "", "isShareStorage": false}
+				if f.diskDetail != nil {
+					f.diskDetail(st)
+				}
+				f.storage = append(f.storage, st)
+				v := dict{"name": sf, "format": "qcow2", "size": capacity, "allocation": 0.19, "level": 0, "backingStore": "", "users": name}
+				if f.diskVol != nil {
+					f.diskVol(v)
+				}
+				f.vols[pool] = append(f.vols[pool], v)
+				f.bootdevs = []string{"hda", "vda", "fda"}
+				if f.bootFirst {
+					f.bootdevs = []string{"vda", "hda", "fda"}
+				}
 				if f.extraDisk {
 					f.storage = append(f.storage, dict{"device": "disk", "deviceName": "vdb", "path": "/vms/images/precious.qcow2"})
 				}
 			case "cdrom":
-				f.storage = append(f.storage, dict{"device": "cdrom", "deviceName": "hd" + string(hd), "path": sf})
+				cp := sf
+				if f.cdPathRewrite && sf == DEFAULT_CASTOOLS_ISO {
+					cp = "/vms/castools/castools.iso"
+				}
+				f.storage = append(f.storage, dict{"device": "cdrom", "deviceName": "hd" + string(hd), "path": cp})
 				hd++
 				f.setUsers(sf, name)
 			case "floppy":
@@ -260,11 +322,24 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		b, _ := jsonutils.Parse(body)
+		if bd, err := b.GetString("bootDev", "bootdevs"); err == nil {
+			if f.modifyStatusBoot != 0 {
+				w.Header().Set("Error-Code", "999")
+				w.WriteHeader(f.modifyStatusBoot)
+				return
+			}
+			if !f.bootNoop {
+				f.bootdevs = strings.Split(bd, ",")
+			}
+			f.task(w, 8008)
+			return
+		}
 		dev, _ := b.GetString("cdrom", "device")
-		if fl, _ := b.GetString("floppy", "deviceName"); len(fl) > 0 {
+		fl, _ := b.GetString("floppy", "deviceName")
+		if len(fl) > 0 {
 			dev = fl
 		}
-		if !f.modifyNoop {
+		if !f.modifyNoop && !(len(fl) > 0 && f.floppyStuck) {
 			kept := []dict{}
 			for _, st := range f.storage {
 				if st["deviceName"] == dev {
@@ -277,6 +352,7 @@ func (f *winFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		f.task(w, 8007)
 	case r.Method == "PUT" && p == "vm/powerOff/50":
+		f.powerOffs++
 		f.vm50()["vmStatus"] = "shutOff"
 		f.task(w, 8005)
 	case r.Method == "POST" && p == "vmTemplate/addVmTemplate":
@@ -454,6 +530,7 @@ func TestWindowsImportHappyPath(t *testing.T) {
 		t.Fatalf("result %+v", res)
 	}
 	want := []string{
+		"GET /cas/casrs/storage/refresh?id=1&poolName=defaultpool", // B-W1, before the name check
 		"GET /cas/casrs/storage/refresh?id=1&poolName=isopool",
 		"GET /cas/casrs/storage/refresh?id=1&poolName=isopool",
 		"POST /cas/casrs/vm/add",
@@ -462,6 +539,7 @@ func TestWindowsImportHappyPath(t *testing.T) {
 		"PUT /cas/casrs/vm/modify", // answer ISO
 		"PUT /cas/casrs/vm/modify", // castools
 		"PUT /cas/casrs/vm/modify", // floppy
+		"PUT /cas/casrs/vm/modify", // boot order
 		"POST /cas/casrs/vmTemplate/addVmTemplate?",
 		"DELETE /cas/casrs/vm/delete/uuid/uuid-win?delBase0=false&isWipeVolume=false&type=3",
 		"DELETE /cas/casrs/storage/volume/delete/1/isopool/" + winAnswer,
@@ -475,8 +553,8 @@ func TestWindowsImportHappyPath(t *testing.T) {
 			t.Errorf("write %d = %s, want %s", i, w[i], want[i])
 		}
 	}
-	if !strings.Contains(w[8], "opType=1") || strings.Contains(w[8], "opType=2") || strings.Contains(w[8], "disConnect") {
-		t.Errorf("addVmTemplate %s", w[8])
+	if !strings.Contains(w[10], "opType=1") || strings.Contains(w[10], "opType=2") || strings.Contains(w[10], "disConnect") {
+		t.Errorf("addVmTemplate %s", w[10])
 	}
 	add := r.addBody(t)
 	for k, v := range map[string]interface{}{"system": int64(0), "bootingDevice": int64(2), "autoBooting": int64(0), "memory": int64(4096), "cpu": int64(2)} {
@@ -529,7 +607,7 @@ func TestWindowsImportHappyPath(t *testing.T) {
 			detach = append(detach, b)
 		}
 	}
-	if len(detach) != 4 || !strings.Contains(detach[1], `"operation":"disconnect"`) || !strings.Contains(detach[1], winAnswer) || !strings.Contains(detach[1], `"device":"hdb"`) || !strings.Contains(detach[3], `"floppy":{"deviceName":"fda","operation":"disconnect"}`) {
+	if len(detach) != 5 || !strings.Contains(detach[4], `{"bootDev":{"bootdevs":"vda,hda,fda"},"id":50}`) || !strings.Contains(detach[1], `"operation":"disconnect"`) || !strings.Contains(detach[1], winAnswer) || !strings.Contains(detach[1], `"device":"hdb"`) || !strings.Contains(detach[3], `"floppy":{"deviceName":"fda","operation":"disconnect"}`) {
 		t.Errorf("detach bodies:\n%s", strings.Join(detach, "\n"))
 	}
 	// the answer ISO: 0600 temp file, removed, holds the real answer file
@@ -588,10 +666,10 @@ func TestWindowsImportDryRunZeroWrites(t *testing.T) {
 			t.Errorf("step %s done in dry-run", s.Step)
 		}
 	}
-	if got := strings.Join(steps, ","); got != "refresh-pool-before-answer-iso,upload-answer-iso,create-vm,check-vm-disks,start-vm,wait-install,detach-media,clone-to-template,check-template-flat,delete-temp-vm,delete-answer-iso" {
+	if got := strings.Join(steps, ","); got != "refresh-disk-pool,refresh-pool-before-answer-iso,upload-answer-iso,create-vm,check-vm-disks,start-vm,recheck-vm-disks,wait-install,check-install,detach-media,boot-disk-first,clone-to-template,check-template-flat,delete-temp-vm,delete-answer-iso" {
 		t.Errorf("steps %s", got)
 	}
-	add := res.Steps[2].Detail
+	add := res.Steps[3].Detail
 	if !strings.Contains(add, `"bootingDevice":1`) || !strings.Contains(add, `"autoLoadVirtio":true`) || strings.Contains(add, "floppy") {
 		t.Errorf("vm/add plan %s", add)
 	}
@@ -672,20 +750,22 @@ func TestWindowsImportPreplacedAnswer(t *testing.T) {
 
 func TestWindowsImportRefusals(t *testing.T) {
 	for name, c := range map[string]func(r *winRun){
-		"not an iso":          func(r *winRun) { r.opts.IsoFile = "win.qcow2" },
-		"qcow2 volume":        func(r *winRun) { r.f.vols["isopool"][0]["format"] = "qcow2" },
-		"missing iso":         func(r *winRun) { r.opts.IsoFile = "nope.iso" },
-		"template exists":     func(r *winRun) { r.f.tpls = []dict{{"id": 1, "name": winTpl}} },
-		"vm exists":           func(r *winRun) { r.f.vms = []dict{{"id": 9, "uuid": "u9", "name": winTempVM, "vmStatus": "shutOff"}} },
-		"disk exists":         func(r *winRun) { r.f.vols["defaultpool"] = []dict{{"name": winDisk, "format": "qcow2"}} },
-		"answer exists":       func(r *winRun) { r.f.vols["isopool"] = append(r.f.vols["isopool"], dict{"name": winAnswer}) },
-		"no answer transport": func(r *winRun) { r.opts.AnswerStager = nil },
-		"both answer sources": func(r *winRun) { r.opts.AnswerIsoFile = "a.iso" },
-		"linux os":            func(r *winRun) { r.opts.OsVersion = "CentOS 7" },
-		"small memory":        func(r *winRun) { r.opts.MemoryMB = 1024 },
-		"bad boot order":      func(r *winRun) { r.opts.BootOrder = "net" },
-		"castools no cd":      func(r *winRun) { r.opts.Unattend.CastoolsInstaller = "x.exe" },
-		"answer is install":   func(r *winRun) { r.opts.AnswerStager = nil; r.opts.AnswerIsoFile = winISO },
+		"not an iso":            func(r *winRun) { r.opts.IsoFile = "win.qcow2" },
+		"qcow2 volume":          func(r *winRun) { r.f.vols["isopool"][0]["format"] = "qcow2" },
+		"missing iso":           func(r *winRun) { r.opts.IsoFile = "nope.iso" },
+		"template exists":       func(r *winRun) { r.f.tpls = []dict{{"id": 1, "name": winTpl}} },
+		"vm exists":             func(r *winRun) { r.f.vms = []dict{{"id": 9, "uuid": "u9", "name": winTempVM, "vmStatus": "shutOff"}} },
+		"disk exists":           func(r *winRun) { r.f.vols["defaultpool"] = []dict{{"name": winDisk, "format": "qcow2"}} },
+		"answer exists":         func(r *winRun) { r.f.vols["isopool"] = append(r.f.vols["isopool"], dict{"name": winAnswer}) },
+		"no answer transport":   func(r *winRun) { r.opts.AnswerStager = nil },
+		"both answer sources":   func(r *winRun) { r.opts.AnswerIsoFile = "a.iso" },
+		"linux os":              func(r *winRun) { r.opts.OsVersion = "CentOS 7" },
+		"small memory":          func(r *winRun) { r.opts.MemoryMB = 1024 },
+		"bad boot order":        func(r *winRun) { r.opts.BootOrder = "net" },
+		"castools no cd":        func(r *winRun) { r.opts.Unattend.CastoolsInstaller = "x.exe" },
+		"answer is install":     func(r *winRun) { r.opts.AnswerStager = nil; r.opts.AnswerIsoFile = winISO },
+		"wait castools no cd":   func(r *winRun) { r.opts.WaitCastools = true },
+		"min installed >= disk": func(r *winRun) { r.opts.MinInstalledGB = 60 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newWinRun(t)
@@ -693,8 +773,10 @@ func TestWindowsImportRefusals(t *testing.T) {
 			if _, err := r.run(t); err == nil {
 				t.Fatal("want error")
 			}
-			if w := r.f.writes(); len(w) > 1 || (len(w) == 1 && !strings.Contains(w[0], "storage/refresh")) {
-				t.Fatalf("writes on refusal: %v", w)
+			for _, w := range r.f.writes() {
+				if !strings.Contains(w, "storage/refresh") {
+					t.Fatalf("writes on refusal: %v", r.f.writes())
+				}
 			}
 			if r.f.wrote("POST /cas/casrs/vm/add") {
 				t.Fatal("vm/add sent")
@@ -780,16 +862,14 @@ func TestWindowsImportInterruptedBeforeWrites(t *testing.T) {
 	}
 }
 
-func TestWindowsImportNoCastoolsWarning(t *testing.T) {
+func TestWindowsImportCastoolsNeverSeenKeepsVM(t *testing.T) {
 	r := newWinRun(t)
 	r.opts.Castools, r.opts.WaitCastools = true, true
 	r.f.castools = "not running"
-	res, err := r.run(t)
-	if err != nil {
+	_, err := r.run(t)
+	assertKept(t, r, err)
+	if !strings.Contains(err.Error(), "CAStools was never reported running") || r.f.wrote("PUT /cas/casrs/vm/modify") {
 		t.Fatal(err)
-	}
-	if !hasWarning(res, "never reported running") {
-		t.Fatal("no CAStools warning")
 	}
 }
 
@@ -844,8 +924,9 @@ func TestWindowsImportFailureCleanup(t *testing.T) {
 		"second disk": {
 			func(r *winRun) { r.f.extraDisk = true },
 			func(t *testing.T, r *winRun, res *SWindowsImportResult, err error) {
-				if r.f.wrote("PUT /cas/casrs/vm/start") || !r.f.wrote("DELETE /cas/casrs/vm/delete/uuid/uuid-win") || !strings.Contains(err.Error(), "wipes disk 0") {
-					t.Fatalf("want refuse-to-start + recycle: %v %v", err, r.f.writes())
+				assertKept(t, r, err)
+				if r.f.wrote("PUT /cas/casrs/vm/start") || !strings.Contains(err.Error(), "wipes disk 0") {
+					t.Fatalf("want refuse-to-start, VM kept: %v %v", err, r.f.writes())
 				}
 			},
 		},
@@ -927,5 +1008,183 @@ func TestCastoolStatusBodies(t *testing.T) {
 		if err != nil || got != want {
 			t.Errorf("%q: got %q %v", body, got, err)
 		}
+	}
+}
+
+// B-W1: every doubt about disk 0 keeps the VM unstarted.
+func TestWindowsImportDiskGuardFailsClosed(t *testing.T) {
+	for name, setup := range map[string]func(f *winFake){
+		"extra lun device": func(f *winFake) { f.extraStorage = []dict{{"device": "lun", "deviceName": "sdb", "path": "/dev/sdb"}} },
+		"extra empty device": func(f *winFake) {
+			f.extraStorage = []dict{{"device": "", "deviceName": "vdb", "path": "/vms/images/x.qcow2"}}
+		},
+		"extra Disk (case)": func(f *winFake) {
+			f.extraStorage = []dict{{"device": "Disk", "deviceName": "vdb", "path": "/vms/images/x.qcow2"}}
+		},
+		"prefix-only path": func(f *winFake) {
+			f.diskDetail = func(st dict) { st["path"] = "/vms/images/tplwin-win2019-precious.qcow2" }
+		},
+		"other directory":      func(f *winFake) { f.diskDetail = func(st dict) { st["path"] = "/vms/other/" + winDisk } },
+		"detail backing file":  func(f *winFake) { f.diskDetail = func(st dict) { st["backingFile"] = "/vms/images/base.qcow2" } },
+		"shared storage":       func(f *winFake) { f.diskDetail = func(st dict) { st["isShareStorage"] = true } },
+		"no device name":       func(f *winFake) { f.diskDetail = func(st dict) { st["deviceName"] = "" } },
+		"volume backing store": func(f *winFake) { f.diskVol = func(v dict) { v["backingStore"] = "/vms/images/base.qcow2" } },
+		"no backingStore key":  func(f *winFake) { f.diskVol = func(v dict) { delete(v, "backingStore") } },
+		"numeric backingStore": func(f *winFake) { f.diskVol = func(v dict) { v["backingStore"] = 0 } },
+		"wrong size":           func(f *winFake) { f.diskVol = func(v dict) { v["size"] = 40960 } },
+		"already allocated":    func(f *winFake) { f.diskVol = func(v dict) { v["allocation"] = 20480 } },
+		"raw format":           func(f *winFake) { f.diskVol = func(v dict) { v["format"] = "raw" } },
+		"base file level":      func(f *winFake) { f.diskVol = func(v dict) { v["level"] = 1 } },
+		"foreign user":         func(f *winFake) { f.diskVol = func(v dict) { v["users"] = "prod-db" } },
+		"renamed volume":       func(f *winFake) { f.diskVol = func(v dict) { v["name"] = "other.qcow2" } },
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newWinRun(t)
+			setup(r.f)
+			_, err := r.run(t)
+			assertKept(t, r, err)
+			if !strings.Contains(err.Error(), "refused to start it") || r.f.wrote("PUT /cas/casrs/vm/start") {
+				t.Fatalf("want refuse-to-start: %v %v", err, r.f.writes())
+			}
+		})
+	}
+}
+
+func TestWindowsImportRefreshesDiskPoolBeforeNameCheck(t *testing.T) {
+	r := newWinRun(t)
+	r.f.vols["defaultpool"] = []dict{{"name": winDisk, "format": "qcow2", "size": 61440}}
+	r.f.diskHidden = true // copied in by hand, not yet listed
+	_, err := r.run(t)
+	if errors.Cause(err) != cloudprovider.ErrDuplicateId {
+		t.Fatalf("err %v", err)
+	}
+	if w := r.f.writes(); len(w) != 1 || !strings.Contains(w[0], "poolName=defaultpool") {
+		t.Fatalf("writes %v", w)
+	}
+}
+
+// N-W1: disks changed between the guard and the start: power off, keep.
+func TestWindowsImportDisksChangedAfterStart(t *testing.T) {
+	r := newWinRun(t)
+	r.f.onStart = func() {
+		r.f.extraStorage = []dict{{"device": "disk", "deviceName": "vdb", "path": "/vms/images/precious.qcow2"}}
+	}
+	_, err := r.run(t)
+	assertKept(t, r, err)
+	if r.f.powerOffs != 1 || !strings.Contains(err.Error(), "powered off") {
+		t.Fatalf("powerOffs %d: %v", r.f.powerOffs, err)
+	}
+}
+
+// N-W3: a shut-off guest with a nearly empty disk did not install.
+func TestWindowsImportShutOffWithoutInstallKeepsVM(t *testing.T) {
+	r := newWinRun(t)
+	r.f.installAlloc = 300
+	_, err := r.run(t)
+	assertKept(t, r, err)
+	if !strings.Contains(err.Error(), "probably not installed") || r.f.wrote("PUT /cas/casrs/vm/modify") || r.f.wrote("POST /cas/casrs/vmTemplate") {
+		t.Fatal(err)
+	}
+}
+
+func TestWindowsImportTransientStatusTolerated(t *testing.T) {
+	r := newWinRun(t)
+	r.f.oddStatus = 2
+	r.f.installPolls = 6
+	if _, err := r.run(t); err != nil {
+		t.Fatal(err)
+	}
+	r = newWinRun(t)
+	r.f.oddStatus = 100
+	r.f.installPolls = 200
+	_, err := r.run(t)
+	assertKept(t, r, err)
+}
+
+// B-W2: media are always detached and verified.
+func TestWindowsImportMediaDetachVerified(t *testing.T) {
+	for name, c := range map[string]struct {
+		setup func(r *winRun)
+		want  string
+	}{
+		"floppy stays": {func(r *winRun) { r.f.floppyStuck = true }, "still has /vms/isos/virtio-win.vfd"},
+		"CD not listed as ours": {func(r *winRun) {
+			r.opts.Castools = true
+			r.opts.CastoolsISO = "/vms/isos/castools.iso"
+			r.f.diskDetail = nil
+			r.f.extraStorage = nil
+			r.f.cdPathRewrite = true
+		}, "does not list"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newWinRun(t)
+			c.setup(r)
+			_, err := r.run(t)
+			assertKept(t, r, err)
+			if !strings.Contains(err.Error(), c.want) || r.f.wrote("POST /cas/casrs/vmTemplate") {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// N-W4: boot order disk-first before cloning, verified.
+func TestWindowsImportBootOrder(t *testing.T) {
+	for name, c := range map[string]struct {
+		setup func(f *winFake)
+		ok    bool
+	}{
+		"ignored":     {func(f *winFake) { f.bootNoop = true }, false},
+		"unreadable":  {func(f *winFake) { f.bootGetFail = true }, false},
+		"modify fail": {func(f *winFake) { f.bootNoop = true; f.modifyStatusBoot = http.StatusInternalServerError }, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newWinRun(t)
+			c.setup(r.f)
+			_, err := r.run(t)
+			assertKept(t, r, err)
+			if !strings.Contains(err.Error(), "boot order") || r.f.wrote("POST /cas/casrs/vmTemplate") {
+				t.Fatal(err)
+			}
+		})
+	}
+	// already disk-first: no change sent, still verified
+	r := newWinRun(t)
+	r.f.bootFirst = true
+	res, err := r.run(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range r.f.bodies {
+		if strings.Contains(b, "bootDev") {
+			t.Fatal("bootDev sent although already disk-first")
+		}
+	}
+	found := false
+	for _, st := range res.Steps {
+		found = found || st.Step == "verify-boot-order"
+	}
+	if !found {
+		t.Fatal("boot order not verified")
+	}
+}
+
+func TestGetVMBootDevsParse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// api.yaml A:21052 example
+		reply(w, dict{"id": 5, "bootdev": dict{"bootdevs": "vda;高速磁盘(Virtio) vda,sda;光驱 sda,fda;FDC磁盘 fda,0c:da:41:1d:90:56;网络0c:da:41:1d:90:56"}})
+	}))
+	defer srv.Close()
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig(srv.URL, testUser, testPass)}
+	got, err := cli.GetVMBootDevs(5)
+	if err != nil || strings.Join(got, ",") != "vda,sda,fda,0c:da:41:1d:90:56" {
+		t.Fatalf("%v %v", got, err)
+	}
+}
+
+// B-W2: there is no way to keep the media attached.
+func TestWindowsImportNoKeepMediaOption(t *testing.T) {
+	if _, ok := reflect.TypeOf(SWindowsImportOptions{}).FieldByName("KeepMedia"); ok {
+		t.Fatal("KeepMedia must not exist")
 	}
 }
