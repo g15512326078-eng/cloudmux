@@ -116,6 +116,10 @@ type SImageImportOptions struct {
 	// Stager, when set, makes the file present in the pool first. nil is
 	// mode a (the file is already there). NewSSHStager is mode b.
 	Stager ImportSourceStager
+	// Context, when cancelled (cmx: Ctrl-C), stops the run between steps
+	// and stops the HTTP stub. A CAS task already sent is still waited
+	// for, and cleanup follows the usual rules. nil = never cancelled.
+	Context context.Context
 }
 
 // SImportTarget is where a stager must put the source file.
@@ -130,9 +134,18 @@ type SImportTarget struct {
 	// cli is the importer's client (the read-only clone in dry-run), for
 	// stagers that drive CAS themselves (HTTP mode).
 	cli *SCasClient
+	// ctx is SImageImportOptions.Context (interrupts).
+	ctx context.Context
 }
 
 func (t SImportTarget) Path() string { return path.Join(t.PoolPath, t.FileName) }
+
+func (t SImportTarget) context() context.Context {
+	if t.ctx == nil {
+		return context.Background()
+	}
+	return t.ctx
+}
 
 // SImportStagePlan describes a staging step without performing it.
 type SImportStagePlan struct {
@@ -535,14 +548,39 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return nil, err
 	}
 
-	// ---- stage the file (mode b: SSH upload), then refresh ----
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	interrupted := func(before string) error {
+		if err := ctx.Err(); err != nil {
+			return errors.Wrapf(err, "interrupted before %s", before)
+		}
+		return nil
+	}
+
+	// ---- stage the file (ssh / http), then refresh ----
+	refreshPath := fmt.Sprintf("storage/refresh?id=%d&poolName=%s", host.Id, url.QueryEscape(pool.Name))
 	if opts.Stager != nil {
+		// N-H3: rescan first, so a file that is on disk but not listed yet
+		// is seen by the name-free check below and never written over.
+		if opts.DryRun {
+			res.add("refresh-pool-before-upload", "GET", refreshPath, "rescan so the name-free check sees unlisted files (state-changing; skipped in dry-run, so the check below only sees listed files)", true, false)
+		} else {
+			if err := interrupted("the upload"); err != nil {
+				return res, err
+			}
+			if err := c.RefreshStoragePool(host.Id, pool.Name); err != nil {
+				return res, errors.Wrapf(err, "refresh pool %s before the upload", pool.Name)
+			}
+			res.add("refresh-pool-before-upload", "GET", refreshPath, "", true, true)
+		}
 		if _, err := c.GetStorageVolume(host.Id, pool.Name, fileName); err == nil {
 			return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "%s already exists in pool %s; refusing to upload over it. If it is your earlier upload, rerun with --file %s and without the upload option", fileName, pool.Name, fileName)
 		} else if errors.Cause(err) != cloudprovider.ErrNotFound {
 			return nil, errors.Wrapf(err, "check %s", fileName)
 		}
-		target := SImportTarget{HostId: host.Id, HostIp: host.Ip, HostPoolId: host.HostPoolId, PoolName: pool.Name, PoolPath: pool.Path, FileName: fileName, cli: c}
+		target := SImportTarget{HostId: host.Id, HostIp: host.Ip, HostPoolId: host.HostPoolId, PoolName: pool.Name, PoolPath: pool.Path, FileName: fileName, cli: c, ctx: ctx}
 		plan, err := opts.Stager.Plan(target)
 		if err != nil {
 			return nil, err
@@ -560,7 +598,11 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		}
 		opts.Refresh = true
 	}
-	refreshPath := fmt.Sprintf("storage/refresh?id=%d&poolName=%s", host.Id, url.QueryEscape(pool.Name))
+	if !opts.DryRun {
+		if err := interrupted("the pool refresh"); err != nil {
+			return res, err
+		}
+	}
 	if opts.Refresh {
 		if opts.DryRun {
 			res.add("refresh-pool", "GET", refreshPath, "rescan pool (state-changing; skipped in dry-run)", true, false)
@@ -666,6 +708,9 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return res, errors.NewAggregate(errs)
 	}
 
+	if err := interrupted("creating the overlay"); err != nil {
+		return res, err
+	}
 	if err := c.CreateStorageVolume(volBody); err != nil {
 		// the volume may exist even if the call failed
 		if _, gerr := c.GetStorageVolume(host.Id, pool.Name, overlay); gerr == nil {
@@ -683,6 +728,9 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return fail(errors.Errorf("overlay %s reports backing store %q, want %s", overlayPath, ov.BackingStore, srcPath))
 	}
 
+	if err := interrupted("vm/add"); err != nil {
+		return fail(err)
+	}
 	vmAddSent = true
 	// rawRequest keeps the exact HTTP status for isDefiniteRejection
 	addData, addErr, err := c.rawRequest(httputils.POST, "vm/add", nil, []byte(jsonutils.Marshal(addBody).String()), "application/json; charset=UTF-8")
@@ -723,6 +771,9 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return fail(errors.Errorf("temporary VM %s has unexpected status %q", vm.Name, vm.VmStatus))
 	}
 
+	if err := interrupted("addVmTemplate"); err != nil {
+		return fail(err)
+	}
 	tpl, err := c.CreateVmTemplateFromVM(vm, opts.TemplateName, opts.Description)
 	if err != nil {
 		cause := errors.Wrapf(err, "clone temporary VM to template")
@@ -909,7 +960,14 @@ func (c *SCasClient) checkTemplateFlat(hostId int64, tpl *SVmTemplate, srcPath, 
 		if !raw.Contains("backingStore") {
 			return "", unverified("volume %s in pool %s has no backingStore field", name, pool.Name)
 		}
-		b, _ := raw.GetString("backingStore")
+		// N-R2: only a string is a path; null, numbers, arrays, objects
+		// are an unknown shape, not a backing file called "null"
+		bv, _ := raw.Get("backingStore")
+		bs, ok := bv.(*jsonutils.JSONString)
+		if !ok {
+			return "", unverified("volume %s in pool %s has a non-string backingStore (%s)", name, pool.Name, bv.String())
+		}
+		b, _ := bs.GetString()
 		if b = strings.TrimSpace(b); len(b) > 0 {
 			return "", errors.Wrapf(ErrTemplateHasBackingFile, "%s, but its disk %s/%s has backing file %s, so the template depends on it (source %s, overlay %s): do NOT delete, move or overwrite those files. addVmTemplate did not flatten; the fallback is a full copy (vm/clone cloneMode=0), not implemented yet", keep, path.Clean(dir), name, b, srcPath, overlayPath)
 		}

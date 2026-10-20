@@ -36,12 +36,17 @@ func TestImageImportOptions(t *testing.T) {
 	if err != nil || !ok || hs.Options.ServeAddr != "0.0.0.0:9292" || hs.Options.AdvertiseAddr != "198.51.100.7:9292" {
 		t.Fatalf("mode http: %v %v", err, hi.Stager)
 	}
+	h.ServeAnyAddr = true
+	if hi, err := h.importOptions(); err != nil || !hi.Stager.(*cas.SHTTPStager).Options.AllowAnyAddr {
+		t.Fatalf("--serve-any-addr not passed: %v", err)
+	}
 	for name, bad := range map[string]ImageImportTemplateOptions{
 		"http without serve-addr": {HttpUpload: "/tmp/x"},
 		"ssh and http":            {HttpUpload: "/tmp/x", ServeAddr: "a:1", SshUpload: "/tmp/y"},
 		"serve-addr in pool-file": {ServeAddr: "a:1", UploadMode: "pool-file"},
 		"ssh flag in http mode":   {HttpUpload: "/tmp/x", ServeAddr: "a:1", SshKnownHosts: "k"},
 		"http mode, no file":      {UploadMode: "http", ServeAddr: "a:1"},
+		"serve-any in pool-file":  {ServeAnyAddr: true},
 	} {
 		if _, err := bad.importOptions(); err == nil {
 			t.Errorf("%s: want error", name)

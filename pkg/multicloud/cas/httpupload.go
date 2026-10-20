@@ -27,7 +27,8 @@ package cas
 //     shape from the CAS OpenStack drivers, see research doc 9.2); on a
 //     plain HTTP 404 (endpoint missing) fall back to the deprecated
 //     PUT cinder/download, JSON body              (api.yaml A:44865)
-//  3. GET  nova/image/ifExists again: the file must now be present
+//  3. GET  nova/image/ifExists again: the file must now be present, i.e.
+//     the result is the planned size (api.yaml) or 1 (drivers)
 //  4. POST cinder/volume/createFromImage, JSON    (api.yaml A:44522):
 //     copy /vms/nova/<uuid> into the target pool as <file name>.
 //
@@ -44,6 +45,7 @@ package cas
 // novaCleanupSafe. Otherwise it is kept and reported.
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
@@ -73,13 +75,31 @@ import (
 const (
 	NOVA_IMAGE_DIR = "/vms/nova/"
 
-	// nova/image/ifExists results, from the drivers (api.yaml only
-	// documents 0 = absent).
+	// nova/image/ifExists: api.yaml A:45267 says it returns the file size
+	// when the file exists and 0 when it does not ("如果存在，返回文件的大小",
+	// "0文件不存在"). The CAS OpenStack drivers compare it with 1 (present)
+	// and 2 (downloading). See novaImagePresent.
 	NOVA_IMAGE_ABSENT      = 0
 	NOVA_IMAGE_PRESENT     = 1
 	NOVA_IMAGE_DOWNLOADING = 2
 
 	glanceTokenHeader = "x-auth-token"
+
+	// Stub limits. GET/HEAD only, so a request has no body: the header
+	// timeout bounds slow clients, and no ReadTimeout is set (it would
+	// also arm the server's background read during a long response).
+	// There is deliberately no total WriteTimeout: a 50 GiB image at
+	// 10 MB/s takes ~85 min, so a whole-response cap would either be
+	// meaningless or cut real transfers. Instead every 1 MiB chunk must
+	// be written within httpStubWriteStall (a peer that takes 5 min to
+	// accept 1 MiB is stalled, not slow). Idle keep-alive connections are
+	// closed after a minute, and at most httpStubMaxConns connections are
+	// open at once (the CAS helper needs one; a HEAD plus a retry fit).
+	httpStubReadHeaderTimeout = 30 * time.Second
+	httpStubIdleTimeout       = 60 * time.Second
+	httpStubWriteStall        = 5 * time.Minute
+	httpStubChunk             = 1 << 20
+	httpStubMaxConns          = 4
 )
 
 type SHTTPUploadOptions struct {
@@ -93,6 +113,9 @@ type SHTTPUploadOptions struct {
 	ImageType string
 	// SkipChecksum leaves the md5 out of ifExists and nova/download.
 	SkipChecksum bool
+	// AllowAnyAddr permits a wildcard or empty serve host (0.0.0.0, ::,
+	// ":port"), which exposes the stub on every interface. Off by default.
+	AllowAnyAddr bool
 }
 
 func (o *SHTTPUploadOptions) String() string {
@@ -110,8 +133,12 @@ func (o *SHTTPUploadOptions) validate() (string, int, error) {
 	if len(o.LocalPath) == 0 {
 		return "", 0, errors.Wrap(cloudprovider.ErrMissingParameter, "local file")
 	}
-	if _, _, err := net.SplitHostPort(o.ServeAddr); err != nil {
+	serveHost, _, err := net.SplitHostPort(o.ServeAddr)
+	if err != nil {
 		return "", 0, errors.Wrapf(cloudprovider.ErrInputParameter, "serve address %q must be host:port", o.ServeAddr)
+	}
+	if ip := net.ParseIP(serveHost); !o.AllowAnyAddr && (len(serveHost) == 0 || (ip != nil && ip.IsUnspecified())) {
+		return "", 0, errors.Wrapf(cloudprovider.ErrInputParameter, "serve address %q listens on every interface; give the IP of the interface facing the CAS management network (or pass --serve-any-addr explicitly)", o.ServeAddr)
 	}
 	host, portStr, err := net.SplitHostPort(o.advertise())
 	if err != nil {
@@ -152,6 +179,9 @@ type SHTTPStager struct {
 
 	// listen is net.Listen; tests may replace it.
 	listen func(network, addr string) (net.Listener, error)
+	// test overrides of httpStubMaxConns / httpStubWriteStall
+	maxConns   int
+	writeStall time.Duration
 }
 
 func NewHTTPStager(o SHTTPUploadOptions) *SHTTPStager {
@@ -230,6 +260,7 @@ type glanceStub struct {
 	size        int64
 	md5         string
 	diskFormat  string
+	writeStall  time.Duration // 0 = httpStubWriteStall
 
 	lock     sync.Mutex
 	served   int // full GETs completed
@@ -278,7 +309,7 @@ func (g *glanceStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(w, h), f)
+	n, err := g.copyBody(w, io.TeeReader(f, h))
 	log.Infof("cas http upload: served %d bytes of image %s to %s (err %v)", n, g.uuid, r.RemoteAddr, err)
 	if err == nil && n == g.size {
 		g.lock.Lock()
@@ -286,6 +317,68 @@ func (g *glanceStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		g.sentSHA = append(g.sentSHA, hex.EncodeToString(h.Sum(nil)))
 		g.lock.Unlock()
 	}
+}
+
+// copyBody writes r in chunks, giving each chunk its own write deadline
+// (see httpStubWriteStall) instead of a whole-response timeout.
+func (g *glanceStub) copyBody(w http.ResponseWriter, r io.Reader) (int64, error) {
+	stall := g.writeStall
+	if stall <= 0 {
+		stall = httpStubWriteStall
+	}
+	rc := http.NewResponseController(w)
+	buf := make([]byte, httpStubChunk)
+	var n int64
+	for {
+		m, rerr := r.Read(buf)
+		if m > 0 {
+			rc.SetWriteDeadline(time.Now().Add(stall))
+			k, werr := w.Write(buf[:m])
+			n += int64(k)
+			if werr != nil {
+				return n, werr
+			}
+		}
+		if rerr == io.EOF {
+			return n, nil
+		}
+		if rerr != nil {
+			return n, rerr
+		}
+	}
+}
+
+// limitListener caps the number of open connections: Accept blocks while
+// max connections are open.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func newLimitListener(l net.Listener, max int) *limitListener {
+	return &limitListener{Listener: l, sem: make(chan struct{}, max)}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.sem <- struct{}{}
+	c, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
+}
+
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
 }
 
 // SNovaDownload is the XML body of POST nova/download (driver shape).
@@ -328,7 +421,7 @@ var intBodyRe = regexp.MustCompile(`^\s*(?:<[^>]+>\s*)*(-?\d+)\s*(?:<[^>]+>\s*)*
 // NovaImageExists is GET nova/image/ifExists. The documented response is a
 // bare integer; a JSON number or a single XML element around it is
 // accepted too.
-func (cli *SCasClient) NovaImageExists(uuid string, size int64, checksum string) (int, error) {
+func (cli *SCasClient) NovaImageExists(uuid string, size int64, checksum string) (int64, error) {
 	params := url.Values{}
 	params.Set("uuid", uuid)
 	params.Set("size", strconv.FormatInt(size, 10))
@@ -346,22 +439,27 @@ func (cli *SCasClient) NovaImageExists(uuid string, size int64, checksum string)
 	if obj, err := jsonutils.ParseString(body); err == nil {
 		switch v := obj.(type) {
 		case *jsonutils.JSONInt:
-			n, _ := v.Int()
-			return int(n), nil
+			return v.Int()
 		case *jsonutils.JSONDict:
 			// (JSONDict.Int() without a key recurses forever; always pass one)
 			for _, k := range []string{"result", "status", "data"} {
 				if n, err := v.Int(k); err == nil {
-					return int(n), nil
+					return n, nil
 				}
 			}
 		}
 	}
 	if m := intBodyRe.FindStringSubmatch(body); m != nil {
-		v, _ := strconv.Atoi(m[1])
-		return v, nil
+		return strconv.ParseInt(m[1], 10, 64)
 	}
 	return 0, errors.Errorf("nova/image/ifExists: unexpected body (%d bytes)", len(data))
+}
+
+// novaImagePresent reads an ifExists result for a file of size bytes: the
+// size itself (api.yaml) or 1 (the drivers' "present") means present.
+// A 1-byte or 2-byte file is ambiguous with the driver codes; size wins.
+func novaImagePresent(v, size int64) bool {
+	return v == size || (v == NOVA_IMAGE_PRESENT && size != NOVA_IMAGE_DOWNLOADING)
 }
 
 // novaDownload sends POST nova/download and, only when CAS answers HTTP
@@ -473,7 +571,7 @@ func (s *SHTTPStager) Stage(t SImportTarget) ([]string, error) {
 	if s.Options.SkipChecksum {
 		checksum = ""
 	}
-	stub := &glanceStub{uuid: uuid, token: token, path: s.Options.LocalPath, size: s.size, md5: checksum, diskFormat: s.Options.imageType()}
+	stub := &glanceStub{uuid: uuid, token: token, path: s.Options.LocalPath, size: s.size, md5: checksum, diskFormat: s.Options.imageType(), writeStall: s.writeStall}
 
 	listen := s.listen
 	if listen == nil {
@@ -486,7 +584,12 @@ func (s *SHTTPStager) Stage(t SImportTarget) ([]string, error) {
 	if port == 0 {
 		port = ln.Addr().(*net.TCPAddr).Port
 	}
-	srv := &http.Server{Handler: stub, ReadHeaderTimeout: 30 * time.Second}
+	maxConns := s.maxConns
+	if maxConns <= 0 {
+		maxConns = httpStubMaxConns
+	}
+	ln = newLimitListener(ln, maxConns)
+	srv := &http.Server{Handler: stub, ReadHeaderTimeout: httpStubReadHeaderTimeout, IdleTimeout: httpStubIdleTimeout}
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
@@ -498,11 +601,22 @@ func (s *SHTTPStager) Stage(t SImportTarget) ([]string, error) {
 		log.Infof("cas http upload: stub on %s stopped", s.Options.ServeAddr)
 	}()
 
-	warns, err := s.pull(t, stub, host, port, hpName, checksum)
+	// Ctrl-C (t.ctx cancelled): stop serving at once. The CAS download
+	// then fails or finishes, pull waits for its task as usual and the
+	// normal keep-on-ambiguity cleanup applies; createFromImage is not
+	// sent after an interrupt.
+	ctx := t.context()
+	stopAfter := context.AfterFunc(ctx, func() {
+		log.Warningf("cas http upload: interrupted, stub on %s stopped; waiting for the CAS task so cleanup can follow the usual rules", s.Options.ServeAddr)
+		srv.Close()
+	})
+	defer stopAfter()
+
+	warns, err := s.pull(ctx, t, stub, host, port, hpName, checksum)
 	return warns, redactToken(err, token)
 }
 
-func (s *SHTTPStager) pull(t SImportTarget, stub *glanceStub, host string, port int, hpName, checksum string) ([]string, error) {
+func (s *SHTTPStager) pull(ctx context.Context, t SImportTarget, stub *glanceStub, host string, port int, hpName, checksum string) ([]string, error) {
 	cli := t.cli
 	destFile := NOVA_IMAGE_DIR + stub.uuid
 	keepMsg := func(why string) string {
@@ -536,6 +650,11 @@ func (s *SHTTPStager) pull(t SImportTarget, stub *glanceStub, host string, port 
 		return nil, cause
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Wrapf(err, "interrupted before nova/download")
+	}
+	// N-H5: name the staging file before anything can create it
+	log.Infof("cas http upload: CAS will stage the image as %s (uuid %s) on its node; if this run is killed, check that file by hand", destFile, stub.uuid)
 	body := &SNovaDownload{Token: stub.token, Host: host, Port: port, Uuid: stub.uuid, DestFile: destFile,
 		ImageType: s.Options.imageType(), Size: s.size, Checksum: checksum}
 	endpoint, accepted, err := cli.novaDownload(body)
@@ -557,10 +676,23 @@ func (s *SHTTPStager) pull(t SImportTarget, stub *glanceStub, host string, port 
 	if err != nil {
 		return cleanup(errors.Wrapf(err, "nova/image/ifExists after download"), true)
 	}
-	if st != NOVA_IMAGE_PRESENT {
-		return cleanup(errors.Errorf("after %s, nova/image/ifExists for %s returned %d, want %d (present with size %d)", endpoint, destFile, st, NOVA_IMAGE_PRESENT, s.size), true)
+	// H1: only "present" continues. Anything else fails WITHOUT deleting
+	// the staging file: 0 after a finished download contradicts the task,
+	// and another value (a different size, 2 = downloading, a checksum
+	// result we cannot read) means the file may exist in some state.
+	if !novaImagePresent(st, s.size) {
+		what := fmt.Sprintf("ifExists returned %d, expected the size %d (or 1)", st, s.size)
+		if st == NOVA_IMAGE_ABSENT {
+			what = "ifExists returned 0 (absent) although the download task ended"
+		}
+		return []string{keepMsg(what + "; not deleted because its state is unclear")},
+			errors.Errorf("after %s, nova/image/ifExists for %s: %s", endpoint, destFile, what)
 	}
 
+	if err := ctx.Err(); err != nil {
+		// the download task ended and createFromImage was never sent
+		return cleanup(errors.Wrapf(err, "interrupted before createFromImage"), true)
+	}
 	cfi := &SCreateFromImage{Name: t.FileName, Image: stub.uuid, HpName: hpName, Location: t.PoolName, Format: s.Options.imageType()}
 	if _, err := cli.doAsync(httputils.POST, "cinder/volume/createFromImage", nil, jsonutils.Marshal(cfi)); err != nil {
 		return []string{keepMsg("createFromImage was sent; the pool copy may still read it")}, errors.Wrapf(err, "cinder/volume/createFromImage %s into %s", t.FileName, t.PoolName)

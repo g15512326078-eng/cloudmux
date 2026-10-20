@@ -15,6 +15,7 @@
 package cas
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/xml"
@@ -50,6 +51,10 @@ type httpCAS struct {
 	fetchBytes         []int  // body bytes received per fetch
 	lastToken          string // token CAS was given
 	lastUuid           string
+	existsAfter        *string                     // ifExists body once the file exists
+	beforeFetch        func(host string, port int) // runs before "CAS" fetches
+	afterExists        func()                      // runs after an ifExists that found the file
+	fetchQuiet         bool                        // a failed dial is expected
 }
 
 func newHTTPCAS(t *testing.T) *httpCAS {
@@ -67,7 +72,9 @@ func (h *httpCAS) fetch(host string, port int, uuid, token string) bool {
 	req.Header.Set("x-auth-token", token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		h.t.Errorf("fetch: %v", err)
+		if !h.fetchQuiet {
+			h.t.Errorf("fetch: %v", err)
+		}
 		return false
 	}
 	defer resp.Body.Close()
@@ -86,19 +93,18 @@ func (h *httpCAS) serve(w http.ResponseWriter, r *http.Request, path string, q u
 	case r.Method == "GET" && path == "hostpool/all":
 		reply(w, dict{"hostPool": []dict{{"id": 1, "name": "hp1"}}})
 	case r.Method == "GET" && path == "nova/image/ifExists":
+		// api.yaml A:45267: the file size if it exists, 0 otherwise
 		data, ok := h.nova[q.Get("uuid")]
 		switch {
+		case h.existsAfter != nil && ok:
+			w.Write([]byte(*h.existsAfter))
 		case !ok:
 			w.Write([]byte("0"))
-		case fmt.Sprint(len(data)) != q.Get("size"):
-			w.Write([]byte("0"))
 		default:
-			sum := md5.Sum(data)
-			if c := q.Get("checksum"); len(c) > 0 && c != hex.EncodeToString(sum[:]) {
-				w.Write([]byte("0"))
-			} else {
-				w.Write([]byte("1"))
-			}
+			w.Write([]byte(fmt.Sprint(len(data))))
+		}
+		if ok && h.afterExists != nil {
+			h.afterExists()
 		}
 	case r.Method == "POST" && path == "nova/download":
 		if h.nova404 {
@@ -126,6 +132,9 @@ func (h *httpCAS) serve(w http.ResponseWriter, r *http.Request, path string, q u
 		if h.novaNever {
 			h.task(w, 8010)
 			return true
+		}
+		if h.beforeFetch != nil {
+			h.beforeFetch(b.Host, b.Port)
 		}
 		if !h.fetch(b.Host, b.Port, b.Uuid, b.Token) {
 			h.failTask[8010] = true
@@ -245,7 +254,7 @@ func TestImportQcow2HTTPUpload(t *testing.T) {
 	if lc, err := cfi.Bool("linkClone"); err != nil || lc {
 		t.Errorf("linkClone must be sent as false: %v %v", lc, err)
 	}
-	want := []string{"POST /cas/casrs/nova/download", "POST /cas/casrs/cinder/volume/createFromImage", "GET /cas/casrs/storage/refresh", "POST /cas/casrs/storage/volume", "POST /cas/casrs/vm/add"}
+	want := []string{"GET /cas/casrs/storage/refresh", "POST /cas/casrs/nova/download", "POST /cas/casrs/cinder/volume/createFromImage", "GET /cas/casrs/storage/refresh", "POST /cas/casrs/storage/volume", "POST /cas/casrs/vm/add"}
 	w := h.writes()
 	for i := range want {
 		if !strings.HasPrefix(w[i], want[i]) {
@@ -262,7 +271,7 @@ func TestImportQcow2HTTPUpload(t *testing.T) {
 		c.Close()
 		t.Fatalf("stub still listening on %s after the import", bound)
 	}
-	if res.Steps[0].Step != "http-upload" || !res.Steps[0].Done {
+	if res.Steps[0].Step != "refresh-pool-before-upload" || res.Steps[1].Step != "http-upload" || !res.Steps[1].Done {
 		t.Fatalf("steps %+v", res.Steps)
 	}
 	if !strings.Contains(strings.Join(res.Warnings, "\n"), "/vms/nova/"+h.lastUuid+" was kept") {
@@ -412,7 +421,8 @@ func TestImportQcow2HTTPDryRunAndReadOnlyNoServer(t *testing.T) {
 			}
 			res, err := cli.ImportQcow2AsTemplate(o)
 			if mode == "dry-run" {
-				if err != nil || res.Steps[0].Step != "http-upload" || res.Steps[0].Done || !strings.Contains(res.Steps[0].Detail, "redacted") {
+				if err != nil || res.Steps[0].Step != "refresh-pool-before-upload" || res.Steps[0].Done ||
+					res.Steps[1].Step != "http-upload" || res.Steps[1].Done || !strings.Contains(res.Steps[1].Detail, "redacted") {
 					t.Fatalf("%v %+v", err, res)
 				}
 			} else if errors.Cause(err) != cloudprovider.ErrAccountReadOnly {
@@ -436,6 +446,9 @@ func TestHTTPStagerValidate(t *testing.T) {
 	for name, o := range map[string]SHTTPUploadOptions{
 		"no serve addr":      {LocalPath: local},
 		"unspecified host":   {LocalPath: local, ServeAddr: "0.0.0.0:9292"},
+		"wildcard bind v4":   {LocalPath: local, ServeAddr: "0.0.0.0:9292", AdvertiseAddr: "198.51.100.7:9292"},
+		"wildcard bind v6":   {LocalPath: local, ServeAddr: "[::]:9292", AdvertiseAddr: "198.51.100.7:9292"},
+		"empty bind host":    {LocalPath: local, ServeAddr: ":9292", AdvertiseAddr: "198.51.100.7:9292"},
 		"advertise port 0":   {LocalPath: local, ServeAddr: "0.0.0.0:0", AdvertiseAddr: "198.51.100.7:0"},
 		"bad image type":     {LocalPath: local, ServeAddr: "127.0.0.1:1", ImageType: "vmdk"},
 		"missing local file": {LocalPath: "/nonexistent/x.qcow2", ServeAddr: "127.0.0.1:1"},
@@ -444,9 +457,15 @@ func TestHTTPStagerValidate(t *testing.T) {
 			t.Errorf("%s: want error", name)
 		}
 	}
-	ok := NewHTTPStager(SHTTPUploadOptions{LocalPath: local, ServeAddr: "0.0.0.0:9292", AdvertiseAddr: "198.51.100.7:9292"})
-	if plan, err := ok.Plan(SImportTarget{FileName: "a.qcow2", PoolName: "p"}); err != nil || !strings.Contains(plan.Detail, "http://198.51.100.7:9292") {
-		t.Fatalf("%v %+v", err, plan)
+	for _, o := range []SHTTPUploadOptions{
+		{LocalPath: local, ServeAddr: "198.51.100.7:9292"},
+		// a wildcard bind only with the explicit opt-in
+		{LocalPath: local, ServeAddr: "0.0.0.0:9292", AdvertiseAddr: "198.51.100.7:9292", AllowAnyAddr: true},
+		{LocalPath: local, ServeAddr: ":9292", AdvertiseAddr: "198.51.100.7:9292", AllowAnyAddr: true},
+	} {
+		if plan, err := NewHTTPStager(o).Plan(SImportTarget{FileName: "a.qcow2", PoolName: "p"}); err != nil || !strings.Contains(plan.Detail, "http://198.51.100.7:9292") {
+			t.Fatalf("%+v: %v %+v", o, err, plan)
+		}
 	}
 }
 
@@ -497,7 +516,7 @@ func TestGlanceStub(t *testing.T) {
 }
 
 func TestNovaImageExistsBodies(t *testing.T) {
-	for body, want := range map[string]int{"0": 0, " 1\n": 1, "<int>2</int>": 2, `{"result":1}`: 1} {
+	for body, want := range map[string]int64{"0": 0, " 1\n": 1, "<int>2</int>": 2, `{"result":1}`: 1, "5368709120": 5368709120} {
 		f := newImpFake(t)
 		b := body
 		f.extra = func(w http.ResponseWriter, r *http.Request, path string, q url.Values, _ []byte) bool {
@@ -518,5 +537,196 @@ func TestRedactToken(t *testing.T) {
 	}
 	if redactToken(nil, "t") != nil {
 		t.Fatal("nil")
+	}
+}
+
+// H1: ifExists returns the file size when present (api.yaml A:45267);
+// 1 (drivers) is accepted too. 0 or any other value fails WITHOUT
+// deleting the staging file and reports it.
+func TestImportQcow2HTTPIfExistsResults(t *testing.T) {
+	str := func(s string) *string { return &s }
+	for name, c := range map[string]struct {
+		body *string
+		ok   bool
+	}{
+		"size (api.yaml)": {nil, true},
+		"1 (drivers)":     {str("1"), true},
+		"0 after done":    {str("0"), false},
+		"other size":      {str("4"), false},
+		"2 downloading":   {str("2"), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHTTPCAS(t)
+			h.existsAfter = c.body
+			var listens int32
+			o := impOpts()
+			o.Stager = httpStager(t, []byte("img-bytes"), &listens, nil)
+			res, err := h.client(t).ImportQcow2AsTemplate(o)
+			if c.ok {
+				if err != nil || res.Template == nil {
+					t.Fatalf("%v %+v", err, res)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "nova/image/ifExists for /vms/nova/"+h.lastUuid) {
+				t.Fatalf("err = %v", err)
+			}
+			if h.hasWrite("DELETE /cas/casrs/nova/image/") || h.hasWrite("POST /cas/casrs/cinder/volume/createFromImage") {
+				t.Fatalf("writes %v", h.writes())
+			}
+			if !strings.Contains(strings.Join(res.Warnings, "\n"), "/vms/nova/"+h.lastUuid+" was kept") {
+				t.Fatalf("staging file not reported: %v", res.Warnings)
+			}
+		})
+	}
+	if !novaImagePresent(9, 9) || !novaImagePresent(1, 9) || novaImagePresent(0, 9) || novaImagePresent(2, 9) || novaImagePresent(1, 2) || !novaImagePresent(2, 2) {
+		t.Fatal("novaImagePresent")
+	}
+}
+
+// N-H3: the pool is refreshed before the name-free check, so a file that
+// is on disk but not listed yet is found and nothing is uploaded over it.
+func TestImportQcow2UploadRefreshesBeforeNameCheck(t *testing.T) {
+	h := newHTTPCAS(t)
+	h.volumes = []dict{{"name": impSource, "format": "qcow2", "size": 2252.5, "storagePoolName": "defaultpool"}}
+	h.srcHidden = true
+	var listens int32
+	o := impOpts()
+	o.Stager = httpStager(t, []byte("img"), &listens, nil)
+	_, err := h.client(t).ImportQcow2AsTemplate(o)
+	if errors.Cause(err) != cloudprovider.ErrDuplicateId {
+		t.Fatalf("err = %v", err)
+	}
+	if w := h.writes(); len(w) != 1 || !strings.HasPrefix(w[0], "GET /cas/casrs/storage/refresh") || listens != 0 {
+		t.Fatalf("writes %v listens %d", w, listens)
+	}
+}
+
+// Ctrl-C while CAS downloads: the stub stops at once, the failed download
+// task ends, so the staging file is removed (safe: ended, no
+// createFromImage); createFromImage is never sent.
+func TestImportQcow2HTTPInterruptedDuringDownload(t *testing.T) {
+	h := newHTTPCAS(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.fetchQuiet = true
+	h.beforeFetch = func(host string, port int) {
+		cancel()
+		addr := net.JoinHostPort(host, fmt.Sprint(port))
+		for i := 0; i < 200; i++ {
+			c, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+			if err != nil {
+				return // stub stopped
+			}
+			c.Close()
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Error("stub still listening after cancel")
+	}
+	var listens int32
+	o := impOpts()
+	o.Context = ctx
+	o.Stager = httpStager(t, []byte("img"), &listens, nil)
+	_, err := h.client(t).ImportQcow2AsTemplate(o)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if h.hasWrite("POST /cas/casrs/cinder/volume/createFromImage") || h.hasWrite("POST /cas/casrs/vm/add") {
+		t.Fatalf("writes %v", h.writes())
+	}
+	if !h.hasWrite("DELETE /cas/casrs/nova/image/" + h.lastUuid) {
+		t.Fatalf("ended download not cleaned: %v", h.writes())
+	}
+	assertNoToken(t, h.lastToken, err)
+}
+
+// Ctrl-C after the download finished: no createFromImage, staging file
+// removed (task ended, createFromImage not sent).
+func TestImportQcow2HTTPInterruptedAfterDownload(t *testing.T) {
+	h := newHTTPCAS(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.afterExists = cancel
+	var listens int32
+	o := impOpts()
+	o.Context = ctx
+	o.Stager = httpStager(t, []byte("img"), &listens, nil)
+	_, err := h.client(t).ImportQcow2AsTemplate(o)
+	if errors.Cause(err) != context.Canceled || !strings.Contains(err.Error(), "interrupted before createFromImage") {
+		t.Fatalf("err = %v", err)
+	}
+	if h.hasWrite("POST /cas/casrs/cinder/volume/createFromImage") || !h.hasWrite("DELETE /cas/casrs/nova/image/"+h.lastUuid) {
+		t.Fatalf("writes %v", h.writes())
+	}
+}
+
+// The connection cap: with max 1, a second Accept waits until the first
+// connection is closed.
+func TestHTTPStubConnectionCap(t *testing.T) {
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := newLimitListener(raw, 1)
+	defer ln.Close()
+	accepted := make(chan net.Conn, 2)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+	c1, _ := net.Dial("tcp", raw.Addr().String())
+	defer c1.Close()
+	first := <-accepted
+	c2, _ := net.Dial("tcp", raw.Addr().String())
+	defer c2.Close()
+	select {
+	case <-accepted:
+		t.Fatal("second connection accepted while the first is open")
+	case <-time.After(200 * time.Millisecond):
+	}
+	first.Close()
+	select {
+	case c := <-accepted:
+		c.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("second connection not accepted after the first closed")
+	}
+}
+
+// A peer that stops reading: the per-chunk write deadline ends the
+// response, the GET does not count as served.
+func TestGlanceStubWriteStall(t *testing.T) {
+	const size = 64 << 20
+	local := writeLocal(t, make([]byte, size))
+	g := &glanceStub{uuid: "u-1", token: "tok", path: local, size: size, diskFormat: "qcow2", writeStall: 100 * time.Millisecond}
+	done := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		g.ServeHTTP(w, r)
+	})}
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go srv.Serve(ln)
+	defer srv.Close()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fmt.Fprintf(c, "GET /v1/images/u-1 HTTP/1.1\r\nHost: x\r\nx-auth-token: tok\r\n\r\n")
+	// never read: the server must give up on its own
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("handler still writing to a stalled peer")
+	}
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	if g.served != 0 {
+		t.Fatalf("served = %d", g.served)
 	}
 }
