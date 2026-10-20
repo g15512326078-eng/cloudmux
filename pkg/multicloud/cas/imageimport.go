@@ -120,11 +120,16 @@ type SImageImportOptions struct {
 
 // SImportTarget is where a stager must put the source file.
 type SImportTarget struct {
-	HostId   int64
-	HostIp   string
-	PoolName string
-	PoolPath string
-	FileName string
+	HostId     int64
+	HostIp     string
+	HostPoolId int64
+	PoolName   string
+	PoolPath   string
+	FileName   string
+
+	// cli is the importer's client (the read-only clone in dry-run), for
+	// stagers that drive CAS themselves (HTTP mode).
+	cli *SCasClient
 }
 
 func (t SImportTarget) Path() string { return path.Join(t.PoolPath, t.FileName) }
@@ -142,14 +147,17 @@ type SImportStagePlan struct {
 // list the file and that the account is writable; it calls Plan first
 // (also in dry-run), then Stage once (never in dry-run), then refreshes
 // the pool. Implementations must never overwrite an existing file and
-// must not log secrets. SSH (sshupload.go) is the only one today; an HTTP
-// upload can implement the same interface.
+// must not log secrets. Modes: nil stager = pool-file (the file is already
+// there), SSSHStager (ssh, sshupload.go), SHTTPStager (http pull through
+// nova/download, httpupload.go).
 type ImportSourceStager interface {
 	// Plan validates the options against t and describes the step. No
-	// network access, no side effects.
+	// writes, no listener, no outbound connection.
 	Plan(t SImportTarget) (*SImportStagePlan, error)
-	// Stage makes t.Path() exist with the planned content.
-	Stage(t SImportTarget) error
+	// Stage makes t.Path() exist with the planned content. The returned
+	// warnings (for example files left for manual cleanup) are added to
+	// the result, also when an error is returned.
+	Stage(t SImportTarget) ([]string, error)
 }
 
 // SImportStep is one planned or executed call.
@@ -534,7 +542,7 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		} else if errors.Cause(err) != cloudprovider.ErrNotFound {
 			return nil, errors.Wrapf(err, "check %s", fileName)
 		}
-		target := SImportTarget{HostId: host.Id, HostIp: host.Ip, PoolName: pool.Name, PoolPath: pool.Path, FileName: fileName}
+		target := SImportTarget{HostId: host.Id, HostIp: host.Ip, HostPoolId: host.HostPoolId, PoolName: pool.Name, PoolPath: pool.Path, FileName: fileName, cli: c}
 		plan, err := opts.Stager.Plan(target)
 		if err != nil {
 			return nil, err
@@ -543,7 +551,9 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		if opts.DryRun {
 			res.add(plan.Step, plan.Method, srcPath, plan.Detail, true, false)
 		} else {
-			if err := opts.Stager.Stage(target); err != nil {
+			warns, err := opts.Stager.Stage(target)
+			res.Warnings = append(res.Warnings, warns...)
+			if err != nil {
 				return res, errors.Wrapf(err, "%s", plan.Step)
 			}
 			res.add(plan.Step, plan.Method, srcPath, plan.Detail, true, true)

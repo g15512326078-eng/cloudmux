@@ -148,14 +148,6 @@ func (f *flipFirst) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func writeLocal(t *testing.T, content []byte) string {
-	p := filepath.Join(t.TempDir(), "cloud.qcow2")
-	if err := os.WriteFile(p, content, 0600); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
 func dirEntries(t *testing.T, dir string) []string {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
@@ -400,7 +392,7 @@ func TestSSHUploadLocalFileChanged(t *testing.T) {
 
 func TestSSHStagerStageNeedsPlan(t *testing.T) {
 	s := startSSHServer(t)
-	err := NewSSHStager(*s.opts(writeLocal(t, []byte("x")), "")).Stage(SImportTarget{HostIp: "127.0.0.1", PoolPath: t.TempDir(), FileName: "a.qcow2"})
+	_, err := NewSSHStager(*s.opts(writeLocal(t, []byte("x")), "")).Stage(SImportTarget{HostIp: "127.0.0.1", PoolPath: t.TempDir(), FileName: "a.qcow2"})
 	if err == nil || !strings.Contains(err.Error(), "before Plan") {
 		t.Fatalf("err = %v", err)
 	}

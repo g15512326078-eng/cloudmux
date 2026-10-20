@@ -173,7 +173,7 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 		case TASK_RESULT_SUCCESS:
 			return true, nil
 		case TASK_RESULT_FAILURE, TASK_RESULT_PARTIAL_SUCCESS:
-			return false, errors.Errorf("cas task %d result=%d: %s", msg.MsgId, msg.Result, msg.failText())
+			return false, errors.Wrapf(ErrTaskFailed, "cas task %d result=%d: %s", msg.MsgId, msg.Result, msg.failText())
 		default:
 			return false, errors.Errorf("cas task %d unknown result=%d detail=%q", msg.MsgId, msg.Result, msg.Detail)
 		}
@@ -183,6 +183,10 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 	}
 	return last, nil
 }
+
+// ErrTaskFailed is the cause of a waitTask error for a task that ended
+// with result 1 or 2: the task is over (unlike a timeout).
+const ErrTaskFailed = errors.Error("CasTaskFailed")
 
 // MSG_ID_NO_TASK is the msgId CAS returns when a write finished inline
 // and no task was created (observed CAS clients skip waiting on "-1" after

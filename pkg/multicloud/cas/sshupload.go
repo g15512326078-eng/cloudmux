@@ -334,15 +334,15 @@ func (s *SSSHStager) Plan(t SImportTarget) (*SImportStagePlan, error) {
 }
 
 // Stage uploads the file; the bytes sent must match the planned hash.
-func (s *SSSHStager) Stage(t SImportTarget) error {
+func (s *SSSHStager) Stage(t SImportTarget) ([]string, error) {
 	up, err := s.prepare(t)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(s.sum) == 0 {
-		return errors.Errorf("ssh stager: Stage called before Plan")
+		return nil, errors.Errorf("ssh stager: Stage called before Plan")
 	}
 	up.ExpectSHA256 = s.sum
 	_, err = uploadFileSSH(up)
-	return err
+	return nil, err
 }

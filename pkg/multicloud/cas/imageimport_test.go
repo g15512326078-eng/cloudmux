@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -69,6 +70,10 @@ type impFake struct {
 	tplBacking     string // backingStore of the template's disk volume
 	tplStorageFail bool   // GET vmTemplate/storage -> 500
 	tplNoBackKey   bool   // template volume JSON has no backingStore key
+
+	// extra, when set, handles a request first (true = handled); called
+	// with f.lock held.
+	extra func(w http.ResponseWriter, r *http.Request, path string, q url.Values, body []byte) bool
 }
 
 func newImpFake(t *testing.T) *impFake {
@@ -109,6 +114,9 @@ func (f *impFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	if len(body) > 0 {
 		f.bodies[r.Method+" "+path] = string(body)
+	}
+	if f.extra != nil && f.extra(w, r, path, q, body) {
+		return
 	}
 	switch {
 	case r.Method == "GET" && path == "host/id/1":
@@ -281,7 +289,8 @@ func (f *impFake) assertSourceUntouched(t *testing.T) {
 		}
 	}
 	for k, b := range f.bodies {
-		if strings.Contains(b, impSource) && k != "POST storage/volume" {
+		// createFromImage creates the source in http mode
+		if strings.Contains(b, impSource) && k != "POST storage/volume" && k != "POST cinder/volume/createFromImage" {
 			t.Errorf("%s body names the source: %s", k, b)
 		}
 	}

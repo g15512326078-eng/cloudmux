@@ -52,6 +52,57 @@ type ImageImportTemplateOptions struct {
 	SshKnownHosts            string `help:"known_hosts file used to verify the host key"`
 	SshHostKeySha256         string `help:"Pinned host key fingerprint, e.g. SHA256:... (ssh-keygen -lf)"`
 	SshInsecureIgnoreHostKey bool   `help:"Explicitly skip host key verification (not recommended)"`
+
+	UploadMode       string `help:"How the file gets into the pool: pool-file (already there, default), ssh (--ssh-upload), http (--http-upload; CAS pulls it from cmx)" choices:"pool-file|ssh|http"`
+	HttpUpload       string `help:"Mode http: local qcow2 that CAS pulls from a temporary Glance-V1 stub served by cmx"`
+	ServeAddr        string `help:"Mode http: host:port the stub listens on, only while the import runs"`
+	ServeAdvertise   string `help:"Mode http: host:port CAS is told to fetch from (default --serve-addr); must be reachable from the CAS node"`
+	HttpSkipChecksum bool   `help:"Mode http: do not send the md5 checksum to nova/download and ifExists"`
+}
+
+func (o *ImageImportTemplateOptions) uploadMode() (string, error) {
+	mode := o.UploadMode
+	if len(mode) == 0 {
+		switch {
+		case len(o.SshUpload) > 0 && len(o.HttpUpload) > 0:
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-upload and --http-upload are exclusive")
+		case len(o.SshUpload) > 0:
+			mode = "ssh"
+		case len(o.HttpUpload) > 0:
+			mode = "http"
+		default:
+			mode = "pool-file"
+		}
+	}
+	sshSet := len(o.SshUpload) > 0
+	for _, s := range []string{o.SshAddr, o.SshPassword, o.SshKeyFile, o.SshKnownHosts, o.SshHostKeySha256} {
+		sshSet = sshSet || len(s) > 0
+	}
+	sshSet = sshSet || o.SshInsecureIgnoreHostKey
+	httpSet := len(o.HttpUpload) > 0 || len(o.ServeAddr) > 0 || len(o.ServeAdvertise) > 0 || o.HttpSkipChecksum
+	switch mode {
+	case "pool-file":
+		if sshSet || httpSet {
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-* / --http-* / --serve-* options need --upload-mode ssh or http")
+		}
+	case "ssh":
+		if httpSet {
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--http-* / --serve-* options are for --upload-mode http")
+		}
+		if len(o.SshUpload) == 0 {
+			return "", errors.Wrap(cloudprovider.ErrMissingParameter, "--upload-mode ssh needs --ssh-upload <local file>")
+		}
+	case "http":
+		if sshSet {
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-* options are for --upload-mode ssh")
+		}
+		if len(o.HttpUpload) == 0 || len(o.ServeAddr) == 0 {
+			return "", errors.Wrap(cloudprovider.ErrMissingParameter, "--upload-mode http needs --http-upload <local file> and --serve-addr host:port")
+		}
+	default:
+		return "", errors.Wrapf(cloudprovider.ErrInputParameter, "upload mode %q", mode)
+	}
+	return mode, nil
 }
 
 func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, error) {
@@ -60,12 +111,17 @@ func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, e
 		OsVersion: o.OsVersion, CpuCores: o.Cpu, MemoryMB: o.MemoryMb, VSwitchName: o.Vswitch, ProfileName: o.Profile,
 		TempVMName: o.TempVmName, Refresh: o.Refresh, DryRun: o.DryRun,
 	}
-	if len(o.SshUpload) == 0 {
-		for _, s := range []string{o.SshAddr, o.SshPassword, o.SshKeyFile, o.SshKnownHosts, o.SshHostKeySha256} {
-			if len(s) > 0 {
-				return ret, errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-* options need --ssh-upload")
-			}
-		}
+	mode, err := o.uploadMode()
+	if err != nil {
+		return ret, err
+	}
+	switch mode {
+	case "pool-file":
+		return ret, nil
+	case "http":
+		ret.Stager = cas.NewHTTPStager(cas.SHTTPUploadOptions{
+			LocalPath: o.HttpUpload, ServeAddr: o.ServeAddr, AdvertiseAddr: o.ServeAdvertise, SkipChecksum: o.HttpSkipChecksum,
+		})
 		return ret, nil
 	}
 	stager, err := o.sshStager()
@@ -78,7 +134,7 @@ func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, e
 
 func init() {
 	cmd := NewCommand("image-import")
-	NewCO[ImageImportTemplateOptions](cmd).RawRun("template", "Turn a qcow2 cloud image in a CAS pool (or uploaded over SSH) into a VM template; --dry-run prints the plan", func(cli ICloudProvider, args *ImageImportTemplateOptions) error {
+	NewCO[ImageImportTemplateOptions](cmd).RawRun("template", "Turn a qcow2 cloud image in a CAS pool (or uploaded over SSH, or pulled by CAS over HTTP from cmx) into a VM template; --dry-run prints the plan", func(cli ICloudProvider, args *ImageImportTemplateOptions) error {
 		opts, err := args.importOptions()
 		if err != nil {
 			return err

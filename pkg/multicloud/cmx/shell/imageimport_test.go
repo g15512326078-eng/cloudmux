@@ -16,6 +16,8 @@ package shell
 
 import (
 	"testing"
+
+	"yunion.io/x/cloudmux/pkg/multicloud/cas"
 )
 
 func TestImageImportOptions(t *testing.T) {
@@ -27,5 +29,22 @@ func TestImageImportOptions(t *testing.T) {
 	o.SshAddr = "h:22"
 	if _, err := o.importOptions(); err == nil {
 		t.Fatal("--ssh-* without --ssh-upload must fail")
+	}
+	h := &ImageImportTemplateOptions{HostId: 1, Pool: "p", File: "f.qcow2", TemplateName: "t", Vswitch: "vs", HttpUpload: "/tmp/x.qcow2", ServeAddr: "0.0.0.0:9292", ServeAdvertise: "198.51.100.7:9292"}
+	hi, err := h.importOptions()
+	hs, ok := hi.Stager.(*cas.SHTTPStager)
+	if err != nil || !ok || hs.Options.ServeAddr != "0.0.0.0:9292" || hs.Options.AdvertiseAddr != "198.51.100.7:9292" {
+		t.Fatalf("mode http: %v %v", err, hi.Stager)
+	}
+	for name, bad := range map[string]ImageImportTemplateOptions{
+		"http without serve-addr": {HttpUpload: "/tmp/x"},
+		"ssh and http":            {HttpUpload: "/tmp/x", ServeAddr: "a:1", SshUpload: "/tmp/y"},
+		"serve-addr in pool-file": {ServeAddr: "a:1", UploadMode: "pool-file"},
+		"ssh flag in http mode":   {HttpUpload: "/tmp/x", ServeAddr: "a:1", SshKnownHosts: "k"},
+		"http mode, no file":      {UploadMode: "http", ServeAddr: "a:1"},
+	} {
+		if _, err := bad.importOptions(); err == nil {
+			t.Errorf("%s: want error", name)
+		}
 	}
 }
