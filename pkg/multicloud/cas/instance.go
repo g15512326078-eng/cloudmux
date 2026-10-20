@@ -185,6 +185,10 @@ func (cli *SCasClient) waitVMNotLive(uuid string) error {
 		}
 		live, err := cli.vmIsLiveInList(uuid)
 		if err != nil {
+			// A cancel during the read surfaces as a transport error.
+			if cerr := cli.ctxErr(); cerr != nil {
+				return false, errors.Wrap(cerr, "cancelled while waiting")
+			}
 			return false, err
 		}
 		return !live, nil

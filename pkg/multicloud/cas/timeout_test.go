@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"yunion.io/x/pkg/errors"
+
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
 
@@ -210,5 +212,53 @@ func TestClonesKeepTimeouts(t *testing.T) {
 		_, err := c.GetHostBriefs()
 		assertFast(t, start, 5*time.Second, err)
 		_ = name
+	}
+}
+
+// MF-1: a cancel that lands while a poll is in flight still reports the
+// task as possibly running, not a bare "context canceled". The server
+// holds every poll until the client gives up, so the cancel always hits
+// an in-flight request.
+func TestWaitTaskCancelDuringPoll(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	cli := timeoutClient(srv.URL, sClientTimeouts{})
+	cli.taskPollInterval, cli.taskTimeout = 10*time.Millisecond, time.Minute
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	_, err := cli.WithContext(ctx).waitTask(5)
+	assertFast(t, start, 5*time.Second, err)
+	if !strings.Contains(err.Error(), "may still run on CAS") || errors.Cause(err) != context.Canceled {
+		t.Fatalf("err %v", err)
+	}
+}
+
+// The same for the other cancellable waits: the error says it was a
+// cancel.
+func TestWaitLoopsCancelDuringPoll(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	for name, fn := range map[string]func(*SCasClient) error{
+		"waitVMNotLive": func(c *SCasClient) error { return c.waitVMNotLive("u1") },
+		"waitStorageVolume": func(c *SCasClient) error {
+			_, err := c.waitStorageVolume(1, "pool", "vol")
+			return err
+		},
+	} {
+		cli := timeoutClient(srv.URL, sClientTimeouts{})
+		cli.taskPollInterval, cli.taskTimeout = 10*time.Millisecond, time.Minute
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(100*time.Millisecond, cancel)
+		start := time.Now()
+		err := fn(cli.WithContext(ctx))
+		assertFast(t, start, 5*time.Second, err)
+		if !strings.Contains(err.Error(), "cancelled while waiting") || errors.Cause(err) != context.Canceled {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

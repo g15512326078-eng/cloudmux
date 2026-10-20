@@ -163,6 +163,12 @@ func (cli *SCasClient) waitStorageVolume(hostId int64, poolName, volName string)
 			return false, err
 		}
 		vol, err := cli.GetStorageVolume(hostId, poolName, volName)
+		if err != nil {
+			// A cancel during the read surfaces as a transport error.
+			if cerr := cli.ctxErr(); cerr != nil {
+				return false, errors.Wrapf(cerr, "cancelled while waiting for volume %s", volName)
+			}
+		}
 		if err == nil {
 			found = vol
 			last = nil

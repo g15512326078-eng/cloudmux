@@ -165,6 +165,11 @@ func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
 		}
 		msg, err := cli.GetMessage(msgId)
 		if err != nil {
+			// A cancel during the poll surfaces as a transport error;
+			// report it as the cancel, not as a raw url.Error.
+			if cerr := cli.ctxErr(); cerr != nil {
+				return false, errors.Wrapf(cerr, "cancelled while waiting; task %d may still run on CAS", msgId)
+			}
 			if isTransportError(err) && cli.ctxErr() == nil {
 				transportErrs++
 				if transportErrs >= MAX_TASK_TRANSPORT_ERRS {
