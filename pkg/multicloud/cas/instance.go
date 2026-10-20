@@ -619,14 +619,24 @@ const DELETE_VM_TYPE = "3"
 // false for P1; never combine with type=3 unless real CAS requires it.
 const DELETE_VM_WIPE_VOLUME = "false"
 
+// DELETE_VM_DEL_BASE0 is api.yaml delBase0 ("删除base0 true 是 false 否",
+// delete base0). Always sent as "false" instead of leaving CAS to pick an
+// undocumented default: a VM disk can be a qcow2 overlay whose base is a
+// file someone else owns (the image importer's temp VM is backed by the
+// user's cloud image). UNVERIFIED: whether CAS honours it when the
+// recycle bin is purged later.
+const DELETE_VM_DEL_BASE0 = "false"
+
 // DeleteVM stops a running/paused guest first (force powerOff), then
 // DELETE /cas/casrs/vm/delete/uuid/{uuid} with DELETE_VM_TYPE /
-// DELETE_VM_WIPE_VOLUME, then waits until the VM is absent from the live
+// DELETE_VM_WIPE_VOLUME / DELETE_VM_DEL_BASE0, then waits until the VM is absent from the live
 // vmList (missing, or present with delTime set). waitTask completion alone
 // is not enough: type=3 leaves the domain in the recycle bin and it can
 // still appear in vm/vmList until delTime is set / it disappears.
-// UNVERIFIED: whether CAS rejects delete while running, delBase0, and
-// recycle-bin restore.
+// UNVERIFIED: whether CAS rejects delete while running, what delBase0
+// does on purge, and recycle-bin restore. Shared by cloudpods DeleteVM,
+// the deploy rollback and the image importer; delBase0=false is the
+// conservative value for all of them.
 func (self *SInstance) DeleteVM(ctx context.Context) error {
 	status := self.GetStatus()
 	if status == api.VM_RUNNING || status == api.VM_SUSPEND {
@@ -637,6 +647,7 @@ func (self *SInstance) DeleteVM(ctx context.Context) error {
 	params := url.Values{}
 	params.Set("type", DELETE_VM_TYPE)
 	params.Set("isWipeVolume", DELETE_VM_WIPE_VOLUME)
+	params.Set("delBase0", DELETE_VM_DEL_BASE0)
 	_, err := self.region.cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
 	if err != nil {
 		return err

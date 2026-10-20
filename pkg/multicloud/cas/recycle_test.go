@@ -119,7 +119,7 @@ func TestDeleteVMWaitsUntilRecycledInList(t *testing.T) {
 		t.Fatalf("GetInstance(recycled) = %v, want ErrNotFound", err)
 	}
 	got := strings.Join(f.hits, "\n")
-	if !strings.Contains(got, "isWipeVolume=false&type=3") || !strings.Contains(got, "vm/vmList") {
+	if !strings.Contains(got, "delBase0=false&isWipeVolume=false&type=3") || !strings.Contains(got, "vm/vmList") {
 		t.Errorf("hits missing recycle delete or vmList wait: %s", got)
 	}
 }

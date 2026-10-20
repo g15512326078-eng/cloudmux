@@ -218,7 +218,7 @@ func TestLifecycleOps(t *testing.T) {
 		"GET /cas/casrs/message/1003",
 		"PUT /cas/casrs/vm/restart/9",
 		"GET /cas/casrs/message/1004",
-		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?isWipeVolume=false&type=3",
+		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?delBase0=false&isWipeVolume=false&type=3",
 		"GET /cas/casrs/message/1005",
 	}
 	f.lock.Lock()
@@ -438,7 +438,7 @@ func TestDeleteVMRecycleAndStopFirst(t *testing.T) {
 	want := []string{
 		"PUT /cas/casrs/vm/powerOff/9",
 		"GET /cas/casrs/message/1003",
-		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?isWipeVolume=false&type=3",
+		"DELETE /cas/casrs/vm/delete/uuid/uuid-9?delBase0=false&isWipeVolume=false&type=3",
 		"GET /cas/casrs/message/1005",
 	}
 	if strings.Join(compact, "\n") != strings.Join(want, "\n") {
