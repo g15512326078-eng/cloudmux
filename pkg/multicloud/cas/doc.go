@@ -22,7 +22,10 @@
 //     vswitch-based networks, VMs with disks/NICs, VM templates as images.
 //
 //   - VM lifecycle: create from template, start/stop/restart, delete into
-//     the CAS recycle bin (never wipes volumes), VNC info.
+//     the CAS recycle bin (never wipes volumes), VNC info. Create refuses
+//     a name a live VM already has, and an ambiguous deploy (timeout,
+//     transport error, failed task) names any VM it may have created
+//     instead of retrying or adopting it.
 //
 //   - Disks and snapshots: create/attach/detach data disks (detach keeps
 //     the volume), VM snapshots create/revert/delete.
@@ -30,7 +33,8 @@
 //   - Idle analysis: read-only monitor/report metrics and the idle
 //     scoring in the idle subpackage (cmx instance-idle-list).
 //
-//   - Templates: create from a VM (clone, the VM is kept), rename
+//   - Templates: create from a shut-off VM (clone, the VM is kept; the
+//     template must be proven flat, else it is kept and reported), rename
 //     (refused unless the current storages can be sent back unchanged),
 //     delete (refused while fast-deployed or referenced by any VM).
 //
@@ -81,6 +85,10 @@
 //
 // Storagecache.UploadImage (cloudpods image upload) and template storage
 // pool management are not implemented.
+//
+// Every CAS request is bounded (10s dial, 10s TLS handshake, 30s response
+// header, 5 min per request; the probe 30s) and follows the ctx of the
+// cloudpods call; task waits keep their own overall deadline.
 //
 // A read-only cloud account (ProviderConfig.ReadOnly) is enforced in the
 // HTTP transport: every request other than GET/HEAD fails with
