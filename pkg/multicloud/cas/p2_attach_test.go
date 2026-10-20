@@ -111,11 +111,13 @@ func TestAttachDiskTaskFailure(t *testing.T) {
 
 func TestCreateVMWithDataDisks(t *testing.T) {
 	f, region, host, _ := newP2Env(t)
+	f.undeployed = true
 	// deploy is routed to the lifecycle shape: reply a task with targetId 9
 	mux := http.NewServeMux()
 	mux.HandleFunc(API_PREFIX+"/vm/deploy", func(w http.ResponseWriter, r *http.Request) {
 		f.lock.Lock()
 		f.hits = append(f.hits, r.Method+" "+r.URL.RequestURI())
+		f.undeployed = false
 		f.nextMsg++
 		id := f.nextMsg
 		f.lock.Unlock()
@@ -164,9 +166,11 @@ func TestCreateVMWithDataDisks(t *testing.T) {
 
 func TestCreateVMDataDiskFailureRollsBack(t *testing.T) {
 	f, region, host, _ := newP2Env(t)
+	f.undeployed = true
 	mux := http.NewServeMux()
 	mux.HandleFunc(API_PREFIX+"/vm/deploy", func(w http.ResponseWriter, r *http.Request) {
 		f.lock.Lock()
+		f.undeployed = false
 		f.nextMsg++
 		id := f.nextMsg
 		f.lock.Unlock()
@@ -201,6 +205,7 @@ func TestCreateVMDataDiskFailureRollsBack(t *testing.T) {
 
 func TestCreateVMDataDiskCollisionRefused(t *testing.T) {
 	f, region, host, _ := newP2Env(t)
+	f.undeployed = true
 	f.vols["vm9-data1"] = &p2Vol{name: "vm9-data1", format: "qcow2", sizeMB: 1}
 	mux := http.NewServeMux()
 	mux.HandleFunc(API_PREFIX+"/vm/deploy", func(w http.ResponseWriter, r *http.Request) {

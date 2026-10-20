@@ -68,6 +68,8 @@ type p2Fake struct {
 	resized   bool            // vm/modify really changes the size
 	volDelay  map[string]int  // volumeName -> GETs to skip before appearing
 	recycled  bool            // after DeleteVM type=3
+	// undeployed: vm/vmList is empty until the deploy (S-1 name check)
+	undeployed bool
 }
 
 func newP2Fake(t *testing.T) *p2Fake {
@@ -131,6 +133,10 @@ func (f *p2Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "GET" && p == "host/id/7":
 		reply(w, dict{"id": 7, "name": "cvk7", "hostPoolId": 1, "status": 1})
 	case r.Method == "GET" && p == "vm/vmList":
+		if f.undeployed {
+			reply(w, dict{"domain": []dict{}})
+			return
+		}
 		if f.recycled {
 			reply(w, dict{"domain": []dict{{"id": 9, "uuid": "uuid-9", "name": "vm9", "title": "vm9", "hostId": 7, "hostPoolId": 1, "cpu": 1, "memory": 1024, "vmStatus": "shutOff", "system": 1, "delTime": 1603983250000}}})
 			return

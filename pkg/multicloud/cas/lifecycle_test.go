@@ -44,6 +44,14 @@ type lifeFake struct {
 
 	deployBody     string
 	deployVmStatus string // vmList/detail status after deploy; default shutOff
+	// S-1: vm/vmList before the deploy lists only existing; after it,
+	// also the new VM unless deployHidden (an ambiguous deploy that
+	// created nothing)
+	existing     []dict
+	deployHidden bool
+	deployCode   int  // vm/deploy -> this HTTP status
+	deployHang   bool // vm/deploy never answers (the client times out)
+	deployFail   bool // the deploy task ends with result 1
 }
 
 func (f *lifeFake) record(r *http.Request) {
@@ -78,7 +86,20 @@ func (f *lifeFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n, _ := r.Body.Read(buf)
 		f.lock.Lock()
 		f.deployBody = string(buf[:n])
+		code, hang := f.deployCode, f.deployHang
+		if f.deployFail {
+			f.messages[1006] = &SMessage{MsgId: 1006, Result: TASK_RESULT_FAILURE, FailMsg: "injected"}
+		}
 		f.lock.Unlock()
+		if hang {
+			<-r.Context().Done()
+			return
+		}
+		if code != 0 {
+			w.Header().Set("Error-Code", "999")
+			w.WriteHeader(code)
+			return
+		}
 		reply(w, dict{"msgId": 1006, "completed": false, "targetName": "newvm"})
 	case r.Method == http.MethodGet && len(parts) == 2 && parts[0] == "message":
 		var id int64
@@ -128,7 +149,13 @@ func (f *lifeFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if len(st) == 0 {
 			st = "shutOff"
 		}
-		reply(w, dict{"domain": []dict{{"id": 42, "uuid": "uuid-new", "name": "newvm", "title": "newvm", "hostId": 1, "hostPoolId": 1, "cpu": 2, "memory": 2048, "vmStatus": st, "system": 1}}})
+		f.lock.Lock()
+		out := append([]dict{}, f.existing...)
+		if len(f.deployBody) > 0 && !f.deployHidden {
+			out = append(out, dict{"id": 42, "uuid": "uuid-new", "name": "newvm", "title": "newvm", "hostId": 1, "hostPoolId": 1, "cpu": 2, "memory": 2048, "vmStatus": st, "system": 1})
+		}
+		f.lock.Unlock()
+		reply(w, dict{"domain": out})
 	case r.Method == http.MethodGet && path == "hostpool/all":
 		reply(w, dict{"hostPool": []dict{{"id": 1, "name": "hp1"}}})
 	default:
@@ -472,9 +499,13 @@ func TestCreateVMRequiresTargetId(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "targetId") {
 		t.Fatalf("CreateVM without targetId: %v", err)
 	}
+	// S-1: the VM found by name is surfaced, never adopted or touched
+	if !strings.Contains(err.Error(), "uuid-new") || !strings.Contains(err.Error(), "NOT adopted") {
+		t.Fatalf("leftover not named: %v", err)
+	}
 	for _, h := range f.hits {
-		if strings.Contains(h, "vm/vmList") {
-			t.Errorf("must not name-scan: %s", h)
+		if !strings.HasPrefix(h, "GET ") && h != "POST /cas/casrs/vm/deploy" {
+			t.Errorf("write after an unresolved deploy: %s", h)
 		}
 	}
 }
@@ -505,5 +536,111 @@ func TestCreateVMStopsIfRunning(t *testing.T) {
 	}
 	if vm.GetStatus() != api.VM_READY {
 		t.Errorf("after CreateVM status=%s, want VM_READY", vm.GetStatus())
+	}
+}
+
+func newDeployHost(t *testing.T, f *lifeFake) *SHost {
+	cli := newLifeClient(t, f)
+	region := &SRegion{cli: cli}
+	zone := &SZone{SHostPool: SHostPool{Id: 1}, region: region}
+	return &SHost{Id: 7, HostPoolId: 1, zone: zone}
+}
+
+func deployOpts() *cloudprovider.SManagedVMCreateConfig {
+	return &cloudprovider.SManagedVMCreateConfig{Name: "newvm", ExternalImageId: "11", Cpu: 1, MemoryMB: 512}
+}
+
+func deploys(f *lifeFake) int {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	n := 0
+	for _, h := range f.hits {
+		if h == "POST /cas/casrs/vm/deploy" {
+			n++
+		}
+	}
+	return n
+}
+
+// S-1: a live VM with the name means an earlier create may have
+// succeeded: refuse, name it, send nothing.
+func TestCreateVMRefusesExistingName(t *testing.T) {
+	f := &lifeFake{t: t, existing: []dict{{"id": 40, "uuid": "uuid-old", "name": "newvm", "vmStatus": "shutOff", "hostId": 1}}}
+	_, err := newDeployHost(t, f).CreateVM(deployOpts())
+	if errors.Cause(err) != cloudprovider.ErrDuplicateId || !strings.Contains(err.Error(), "uuid-old") || deploys(f) != 0 {
+		t.Fatalf("err %v deploys %d", err, deploys(f))
+	}
+	// a recycled VM with the name does not block, and is not reported as new
+	f = &lifeFake{t: t, messages: map[int64]*SMessage{1006: {MsgId: 1006, Result: TASK_RESULT_SUCCESS, TargetId: 42}},
+		existing: []dict{{"id": 40, "uuid": "uuid-old", "name": "newvm", "vmStatus": "shutOff", "delTime": "2026-10-20T12:00:00+08:00"}}}
+	if vm, err := newDeployHost(t, f).CreateVM(deployOpts()); err != nil || vm.GetGlobalId() != "uuid-new" {
+		t.Fatalf("recycled namesake: %v", err)
+	}
+}
+
+// S-1: an ambiguous deploy (timeout, transport error, 409, 5xx, failed
+// task) is never retried; a VM it created is named, not adopted.
+func TestCreateVMAmbiguousDeploySurfacesVM(t *testing.T) {
+	for name, c := range map[string]struct {
+		setup   func(f *lifeFake)
+		created bool
+	}{
+		"client timeout, created": {func(f *lifeFake) { f.deployHang = true }, true},
+		"client timeout, nothing": {func(f *lifeFake) { f.deployHang = true; f.deployHidden = true }, false},
+		"409 created":             {func(f *lifeFake) { f.deployCode = http.StatusConflict }, true},
+		"502 nothing":             {func(f *lifeFake) { f.deployCode = http.StatusBadGateway; f.deployHidden = true }, false},
+		"task failed, created":    {func(f *lifeFake) { f.deployFail = true }, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := &lifeFake{t: t}
+			c.setup(f)
+			host := newDeployHost(t, f)
+			host.zone.region.cli.timeouts = sClientTimeouts{Request: 300 * time.Millisecond}
+			vm, err := host.CreateVM(deployOpts())
+			if err == nil || vm != nil {
+				t.Fatalf("vm %v err %v", vm, err)
+			}
+			if !strings.Contains(err.Error(), "outcome unknown") || deploys(f) != 1 {
+				t.Fatalf("err %v deploys %d", err, deploys(f))
+			}
+			if c.created != strings.Contains(err.Error(), "uuid-new") {
+				t.Fatalf("created=%v but err %v", c.created, err)
+			}
+			if !c.created && !strings.Contains(err.Error(), "check CAS before retrying") {
+				t.Fatal(err)
+			}
+			for _, h := range f.hits {
+				if !strings.HasPrefix(h, "GET ") && h != "POST /cas/casrs/vm/deploy" {
+					t.Errorf("write after an ambiguous deploy: %s", h)
+				}
+			}
+			// the retry cloudpods may send is refused while the VM exists
+			if c.created {
+				if _, err := host.CreateVM(deployOpts()); errors.Cause(err) != cloudprovider.ErrDuplicateId || deploys(f) != 1 {
+					t.Fatalf("retry: %v deploys %d", err, deploys(f))
+				}
+			}
+		})
+	}
+}
+
+// S-1: a definite rejection (400) created nothing: no lookup text.
+func TestCreateVMDefiniteRejection(t *testing.T) {
+	f := &lifeFake{t: t, deployCode: http.StatusBadRequest}
+	_, err := newDeployHost(t, f).CreateVM(deployOpts())
+	if err == nil || strings.Contains(err.Error(), "outcome unknown") || !isDefiniteRejection(err) {
+		t.Fatalf("err %v", err)
+	}
+}
+
+func TestDeployTimeout(t *testing.T) {
+	cli := &SCasClient{CasClientConfig: NewCasClientConfig("http://127.0.0.1:1", testUser, testPass)}
+	if got := cli.deployTaskTimeout(); got != DEFAULT_DEPLOY_TIMEOUT || DEFAULT_DEPLOY_TIMEOUT <= DEFAULT_TASK_TIMEOUT {
+		t.Fatalf("deploy timeout %s", got)
+	}
+	cli = &SCasClient{CasClientConfig: NewCasClientConfig("http://127.0.0.1:1", testUser, testPass).DeployTimeout(time.Hour)}
+	cli.taskTimeout = time.Second
+	if got := cli.deployTaskTimeout(); got != time.Hour {
+		t.Fatalf("configured deploy timeout %s", got)
 	}
 }

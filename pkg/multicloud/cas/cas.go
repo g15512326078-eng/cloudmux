@@ -64,6 +64,10 @@ type CasClientConfig struct {
 	// time; CN deployments commonly use Asia/Shanghai.
 	snapshotTimeZone string
 
+	// deployTimeout is the vm/deploy task wait (DEFAULT_DEPLOY_TIMEOUT
+	// if 0).
+	deployTimeout time.Duration
+
 	debug bool
 }
 
@@ -86,6 +90,12 @@ func (cfg *CasClientConfig) CloudproviderConfig(cpcfg cloudprovider.ProviderConf
 
 func (cfg *CasClientConfig) Debug(debug bool) *CasClientConfig {
 	cfg.debug = debug
+	return cfg
+}
+
+// DeployTimeout sets how long CreateVM waits for the vm/deploy task.
+func (cfg *CasClientConfig) DeployTimeout(d time.Duration) *CasClientConfig {
+	cfg.deployTimeout = d
 	return cfg
 }
 

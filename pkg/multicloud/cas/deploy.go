@@ -16,8 +16,10 @@ package cas
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
@@ -233,12 +235,78 @@ func rollbackDeployedVM(vm *SInstance, cause error) error {
 	return errors.Wrapf(cause, "rolled back deployed vm %s (%s) into the CAS recycle bin", vm.GetName(), vm.Uuid)
 }
 
+// DEFAULT_DEPLOY_TIMEOUT is the task wait for vm/deploy (a full copy of
+// a large template can exceed the 10 min default task timeout).
+// Override with CasClientConfig.DeployTimeout. UNVERIFIED on CAS how long
+// a deploy takes.
+const DEFAULT_DEPLOY_TIMEOUT = 30 * time.Minute
+
 // DeployVM is POST /cas/casrs/vm/deploy. Returns the finished SMessage
 // (targetId is the new domain id when CAS fills it).
 func (cli *SCasClient) DeployVM(body *SDomainDeploy) (*SMessage, error) {
+	c := cli.derive()
+	c.taskTimeout = cli.deployTaskTimeout()
 	// api.yaml parameter name is "domain"; JSON body is the deploy object
 	// itself (swagger body params are typically unwrapped to the schema).
-	return cli.doAsync(httputils.POST, "vm/deploy", nil, jsonutils.Marshal(body))
+	return c.doAsync(httputils.POST, "vm/deploy", nil, jsonutils.Marshal(body))
+}
+
+// deployTaskTimeout: CasClientConfig.DeployTimeout, else
+// DEFAULT_DEPLOY_TIMEOUT, unless a test shortened taskTimeout.
+func (cli *SCasClient) deployTaskTimeout() time.Duration {
+	switch {
+	case cli.deployTimeout > 0:
+		return cli.deployTimeout
+	case cli.taskTimeout > 0:
+		return cli.taskTimeout
+	}
+	return DEFAULT_DEPLOY_TIMEOUT
+}
+
+// S-1: a deploy must never be retried blind or leave a duplicate.
+//
+// UNVERIFIED on CAS: whether vm/deploy itself refuses a duplicate domain
+// name, whether vm/vmList lists the VM while the deploy task still runs
+// (a lookup right after a timeout may miss it; the message says so), and
+// whether a deploy whose task wait timed out still completes later.
+
+// deployNameCheck refuses a deploy when a live VM already has the name
+// (a retry after an ambiguous deploy would otherwise create a second
+// one) and returns the uuids of every VM with the name, recycled ones
+// included, so a later lookup can tell a new VM from an old one.
+func (cli *SCasClient) deployNameCheck(name string) (map[string]bool, error) {
+	vms, err := cli.findVMsByName(name)
+	if err != nil {
+		return nil, errors.Wrapf(err, "look up VMs named %q before deploy", name)
+	}
+	before := map[string]bool{}
+	for i := range vms {
+		if vms[i].isLiveGuest() {
+			return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "a VM named %q already exists on CAS (uuid %s, status %s); not deploying a second one. If it is left from an earlier failed or timed-out create, check it on CAS and delete it or adopt it by syncing", name, vms[i].Uuid, vms[i].VmStatus)
+		}
+		before[vms[i].Uuid] = true
+	}
+	return before, nil
+}
+
+// describeDeployLeftover looks for a VM the deploy may have created (a
+// live VM with the name that did not exist before) and returns text for
+// the error. It never adopts, stops or deletes it.
+func (cli *SCasClient) describeDeployLeftover(name string, before map[string]bool) string {
+	vms, err := cli.findVMsByName(name)
+	if err != nil {
+		return fmt.Sprintf("could not look for a VM named %q (%v): check CAS before retrying", name, err)
+	}
+	found := []string{}
+	for i := range vms {
+		if vms[i].isLiveGuest() && !before[vms[i].Uuid] {
+			found = append(found, fmt.Sprintf("%s (id %d, status %s)", vms[i].Uuid, vms[i].Id, vms[i].VmStatus))
+		}
+	}
+	if len(found) == 0 {
+		return fmt.Sprintf("no new VM named %q is listed yet; CAS may still create it: check CAS before retrying (a retry refuses while one exists)", name)
+	}
+	return fmt.Sprintf("CAS lists new VM(s) named %q: %s. It was NOT adopted or deleted: check it on CAS, then delete it or let the next sync import it, before retrying", name, strings.Join(found, ", "))
 }
 
 func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudprovider.ICloudVM, error) {
@@ -253,13 +321,24 @@ func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudpr
 	if err := self.ensureDataDiskFilesFree(plan); err != nil {
 		return nil, err
 	}
-	msg, err := self.zone.region.cli.DeployVM(body)
+	cli := self.zone.region.cli
+	before, err := cli.deployNameCheck(body.DomainName)
 	if err != nil {
-		return nil, errors.Wrapf(err, "DeployVM")
+		return nil, err
+	}
+	msg, err := cli.DeployVM(body)
+	if err != nil {
+		if isDefiniteRejection(err) {
+			// refused before any work: nothing to look for
+			return nil, errors.Wrapf(err, "DeployVM")
+		}
+		// a timeout, transport error, 409 or a failed task: CAS may have
+		// created the VM. Report it; never retry or adopt here.
+		return nil, errors.Wrapf(err, "DeployVM outcome unknown; %s", cli.describeDeployLeftover(body.DomainName, before))
 	}
 	vm, err := self.zone.region.findDeployedVM(msg)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "%s", cli.describeDeployLeftover(body.DomainName, before))
 	}
 	vm.host = self
 	vm.region = self.zone.region
