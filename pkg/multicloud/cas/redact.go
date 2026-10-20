@@ -28,8 +28,9 @@ const redacted = "******"
 // pwd|passw|token|secret|key|auth:
 //   - ends in "pw"/"pwd": pw, pwd, ipmiPw, encryptPw, netconfPw, hostPwd,
 //     vncPwd, cephPwd, slavePwd, arbitrationHostPwd;
-//   - contains "password"/"passwd"/"secret": password, vncPassword,
-//     loginPassword, passwd, secretKey (also masks the harmless isSecret,
+//   - contains "password"/"passwd"/"secret"/"privatekey"/"credential":
+//     password, vncPassword, loginPassword, passwd, secretKey, Password
+//     on backupFileList, privateKey; (also masks harmless isSecret,
 //     secretLevel, diskSecret, passwdMode);
 //   - ends in "token" or "authkey": token, authKey;
 //   - productKey (a licence key).
@@ -44,7 +45,7 @@ func isSecretKey(key string) bool {
 			return true
 		}
 	}
-	for _, sub := range []string{"password", "passwd", "secret"} {
+	for _, sub := range []string{"password", "passwd", "secret", "privatekey", "credential"} {
 		if strings.Contains(k, sub) {
 			return true
 		}
