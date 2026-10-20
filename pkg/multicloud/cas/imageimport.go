@@ -732,32 +732,13 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 		return fail(err)
 	}
 	vmAddSent = true
-	// rawRequest keeps the exact HTTP status for isDefiniteRejection
-	addData, addErr, err := c.rawRequest(httputils.POST, "vm/add", nil, []byte(jsonutils.Marshal(addBody).String()), "application/json; charset=UTF-8")
-	if err == nil && addErr != nil {
-		err = addErr
-	}
-	if err != nil {
-		vmAddRejected = isDefiniteRejection(err)
-		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
-	}
-	addResp, err := parseJSONBody(httputils.POST, "vm/add", addData)
-	if err != nil {
-		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
-	}
-	if _, err := c.waitAsync(httputils.POST, "vm/add", addResp); err != nil {
-		return fail(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
+	if vmAddRejected, err = c.postTempVM(opts.TempVMName, []byte(jsonutils.Marshal(addBody).String())); err != nil {
+		return fail(err)
 	}
 	res.add("create-vm", "POST", "vm/add", jsonutils.Marshal(addBody).String(), true, true)
-	vms, err := c.findVMsByName(opts.TempVMName)
-	if err != nil {
-		return fail(errors.Wrapf(err, "find temporary VM"))
+	if vm, err = c.findTempVM(region, opts.TempVMName); err != nil {
+		return fail(err)
 	}
-	if len(vms) != 1 {
-		return fail(errors.Errorf("expected 1 VM named %s after vm/add, found %d", opts.TempVMName, len(vms)))
-	}
-	vm = &vms[0]
-	vm.region = region
 
 	switch st := vm.GetStatus(); st {
 	case api.VM_READY:
@@ -776,18 +757,11 @@ func (cli *SCasClient) ImportQcow2AsTemplate(opts SImageImportOptions) (*SImageI
 	}
 	tpl, err := c.CreateVmTemplateFromVM(vm, opts.TemplateName, opts.Description)
 	if err != nil {
-		cause := errors.Wrapf(err, "clone temporary VM to template")
-		errs := []error{cause}
-		if found, lerr := c.findTemplatesNamed(opts.TemplateName); lerr != nil {
-			errs = append(errs, errors.Wrapf(lerr, "could not re-list templates; check by hand whether a template %q was left", opts.TemplateName))
-		} else if len(found) > 0 {
-			if len(found) == 1 {
-				res.Template = &found[0]
-			}
-			for i := range found {
-				errs = append(errs, errors.Errorf("template %d %q exists after the failure and may be incomplete: check it, and delete it by hand if broken", found[i].Id, found[i].Name))
-			}
+		found, lerrs := c.templateLeftovers(opts.TemplateName, "check it, and delete it by hand if broken")
+		if len(found) == 1 {
+			res.Template = &found[0]
 		}
+		errs := append([]error{errors.Wrapf(err, "clone temporary VM to template")}, lerrs...)
 		if isTimeout(err) {
 			// The clone task may still be copying the VM's disk: do not
 			// delete the VM under it.

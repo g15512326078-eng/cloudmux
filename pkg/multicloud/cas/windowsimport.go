@@ -791,31 +791,13 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 		return failBeforeStart(err)
 	}
 	vmAddSent = true
-	addData, addErr, err := c.rawRequest(httputils.POST, "vm/add", nil, []byte(addJSON), "application/json; charset=UTF-8")
-	if err == nil && addErr != nil {
-		err = addErr
-	}
-	if err != nil {
-		vmAddRejected = isDefiniteRejection(err)
-		return failBeforeStart(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
-	}
-	addResp, err := parseJSONBody(httputils.POST, "vm/add", addData)
-	if err != nil {
-		return failBeforeStart(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
-	}
-	if _, err := c.waitAsync(httputils.POST, "vm/add", addResp); err != nil {
-		return failBeforeStart(errors.Wrapf(err, "vm/add %s", opts.TempVMName))
+	if vmAddRejected, err = c.postTempVM(opts.TempVMName, []byte(addJSON)); err != nil {
+		return failBeforeStart(err)
 	}
 	res.add("create-vm", "POST", "vm/add", addJSON, true, true)
-	vms, err := c.findVMsByName(opts.TempVMName)
-	if err != nil {
-		return failBeforeStart(errors.Wrapf(err, "find temporary VM"))
+	if vm, err = c.findTempVM(region, opts.TempVMName); err != nil {
+		return failBeforeStart(err)
 	}
-	if len(vms) != 1 {
-		return failBeforeStart(errors.Errorf("expected 1 VM named %s after vm/add, found %d", opts.TempVMName, len(vms)))
-	}
-	vm = &vms[0]
-	vm.region = region
 	res.TempVMUuid = vm.Uuid
 	if st := vm.GetStatus(); st != api.VM_READY {
 		return keepVM(errors.Wrapf(cloudprovider.ErrInvalidStatus, "temporary VM %s has status %s right after vm/add (autoBooting=0)", vm.Name, vm.VmStatus), "it may already be running Setup")
@@ -893,14 +875,8 @@ func (cli *SCasClient) ImportWindowsISOAsTemplate(opts SWindowsImportOptions) (*
 	}
 	tpl, err := c.CreateVmTemplateFromVM(vm, opts.TemplateName, opts.Description)
 	if err != nil {
-		errs := []error{errors.Wrapf(err, "clone temporary VM to template")}
-		if found, lerr := c.findTemplatesNamed(opts.TemplateName); lerr != nil {
-			errs = append(errs, errors.Wrapf(lerr, "could not re-list templates; check by hand whether a template %q was left", opts.TemplateName))
-		} else {
-			for i := range found {
-				errs = append(errs, errors.Errorf("template %d %q exists after the failure and may be incomplete: check it", found[i].Id, found[i].Name))
-			}
-		}
+		_, lerrs := c.templateLeftovers(opts.TemplateName, "check it")
+		errs := append([]error{errors.Wrapf(err, "clone temporary VM to template")}, lerrs...)
 		return keepVM(errors.NewAggregate(errs), "it holds the finished install; clone it to a template by hand or rerun addVmTemplate")
 	}
 	res.Template = tpl
