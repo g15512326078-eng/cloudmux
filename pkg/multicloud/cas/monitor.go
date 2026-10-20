@@ -128,27 +128,30 @@ func epochToTime(t int64) time.Time {
 	return time.UnixMilli(t)
 }
 
+// monitorTimestamp picks the newest sample time. Each raw value is first
+// normalized with epochToTime (s vs ms per value), then the maximum is taken,
+// so a NIC reporting seconds and a disk reporting ms compare correctly.
 func monitorTimestamp(sample int64, nets []SVmMonitorNet, disks []SVmMonitorDisk) time.Time {
-	t := sample
-	if t == 0 {
-		for _, n := range nets {
-			if n.Time > t {
-				t = n.Time
-			}
+	if sample > 0 {
+		return epochToTime(sample)
+	}
+	var newest time.Time
+	consider := func(raw int64) {
+		if t := epochToTime(raw); t.After(newest) {
+			newest = t
 		}
 	}
-	if t == 0 {
-		for _, d := range disks {
-			if d.Time > t {
-				t = d.Time
-			}
-		}
+	for _, n := range nets {
+		consider(n.Time)
 	}
-	if t == 0 {
+	for _, d := range disks {
+		consider(d.Time)
+	}
+	if newest.IsZero() {
 		// Current-sample endpoint; cloudmon polls every few minutes.
 		return time.Now()
 	}
-	return epochToTime(t)
+	return newest
 }
 
 func onePoint(id string, mt cloudprovider.TMetricType, unit string, ts time.Time, v float64) cloudprovider.MetricValues {
