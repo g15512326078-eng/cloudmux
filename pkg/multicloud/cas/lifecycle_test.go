@@ -644,3 +644,25 @@ func TestDeployTimeout(t *testing.T) {
 		t.Fatalf("configured deploy timeout %s", got)
 	}
 }
+
+// N-3: on a read-only account CreateVM sends no request at all, not even
+// the name lookup.
+func TestCreateVMReadOnlySendsNothing(t *testing.T) {
+	f := &lifeFake{t: t}
+	cli := newLifeClient(t, f)
+	cli.cpcfg.ReadOnly = true
+	region := &SRegion{cli: cli}
+	zone := &SZone{SHostPool: SHostPool{Id: 1}, region: region}
+	host := &SHost{Id: 7, HostPoolId: 1, zone: zone}
+	_, err := host.CreateVM(&cloudprovider.SManagedVMCreateConfig{
+		Name: "newvm", ExternalImageId: "11", Cpu: 1, MemoryMB: 512,
+	})
+	if errors.Cause(err) != cloudprovider.ErrAccountReadOnly {
+		t.Fatalf("CreateVM read-only: %v", err)
+	}
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	if len(f.hits) != 0 {
+		t.Fatalf("read-only CreateVM sent %d request(s): %v", len(f.hits), f.hits)
+	}
+}

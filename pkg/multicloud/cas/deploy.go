@@ -310,6 +310,10 @@ func (cli *SCasClient) describeDeployLeftover(name string, before map[string]boo
 }
 
 func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudprovider.ICloudVM, error) {
+	// a read-only account sends nothing, not even the name lookup
+	if err := self.zone.region.cli.checkWritable("CreateVM"); err != nil {
+		return nil, err
+	}
 	body, err := buildDeployBody(self, opts)
 	if err != nil {
 		return nil, err
