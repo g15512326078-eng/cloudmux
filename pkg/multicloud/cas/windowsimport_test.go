@@ -60,7 +60,6 @@ type winFake struct {
 	installPolls int // vmList polls while running before the guest shuts off
 	running      int
 
-	isoFormat     string
 	vmAddStatus   int  // vm/add -> this status
 	vmAddCreates  bool // ... the VM exists anyway
 	extraDisk     bool // detail lists a second disk

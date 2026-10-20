@@ -508,14 +508,6 @@ func recurringSpikeVeto(f VmFeatures, cfg Config, loc *time.Location) bool {
 	return len(f.spike) >= 3
 }
 
-func (f VmFeatures) spikeDays() []string {
-	out := make([]string, 0, len(f.spike))
-	for d := range f.spike {
-		out = append(out, d)
-	}
-	return out
-}
-
 // SetSpikeDays records calendar days (YYYY-MM-DD) with a high-load spike.
 func (f *VmFeatures) SetSpikeDays(days []string) {
 	f.spike = map[string]bool{}

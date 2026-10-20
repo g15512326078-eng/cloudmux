@@ -226,9 +226,8 @@ func (cli *SCasClient) waitAsync(method httputils.THttpMethod, res string, resp 
 		}
 		return nil, errors.Errorf("%s %s returned RsTaskMsg without msgId", method, res)
 	}
-	if ack.Completed {
-		// UNVERIFIED: start/stop examples show completed=false on submit.
-		// If a build completes inline, still confirm via GetMessage.
-	}
+	// A nonzero msgId is always confirmed via GetMessage, even when the
+	// ack says completed (UNVERIFIED: start/stop examples show
+	// completed=false on submit).
 	return cli.waitTask(ack.MsgId)
 }

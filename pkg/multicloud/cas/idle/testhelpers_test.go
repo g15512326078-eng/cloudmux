@@ -12,9 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package shell is reserved for CAS-specific cmx subcommands.
-//
-// On the CAS-only cmx tree, metric-list and instance-idle-list are
-// registered in pkg/multicloud/cmx/shell so they share cmx's
-// ICloudProvider Invoke path. This package is blank-imported from cmx.
-package shell
+package idle
+
+import "strings"
+
+// suggestionForbiddenForNonIdle: a non-idle class must never suggest
+// downsizing or releasing the VM.
+func suggestionForbiddenForNonIdle(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "downsize") ||
+		strings.Contains(s, "release") ||
+		strings.Contains(s, "回收")
+}
+
+func (f VmFeatures) spikeDays() []string {
+	out := make([]string, 0, len(f.spike))
+	for d := range f.spike {
+		out = append(out, d)
+	}
+	return out
+}

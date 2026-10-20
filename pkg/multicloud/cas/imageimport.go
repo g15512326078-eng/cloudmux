@@ -979,31 +979,6 @@ func (c *SCasClient) checkTemplateFlat(hostId int64, tpl *SVmTemplate, srcPath, 
 	return "no backingStore on " + strings.Join(checked, ", "), nil
 }
 
-// waitVMStatus polls vm/vmList until the VM reports vmStatus want.
-func (c *SCasClient) waitVMStatus(vm *SInstance, want string) error {
-	interval, timeout := c.taskPollInterval, c.taskTimeout
-	if interval <= 0 {
-		interval = DEFAULT_TASK_POLL_INTERVAL
-	}
-	if timeout <= 0 {
-		timeout = DEFAULT_TASK_TIMEOUT
-	}
-	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
-		vms, err := c.findVMsByName(vm.Name)
-		if err != nil {
-			return false, err
-		}
-		for i := range vms {
-			if vms[i].Uuid == vm.Uuid {
-				vm.VmStatus = vms[i].VmStatus
-				return vms[i].VmStatus == want, nil
-			}
-		}
-		return false, errors.Wrapf(cloudprovider.ErrNotFound, "vm %s", vm.Uuid)
-	})
-	return errors.Wrapf(err, "wait for VM %s to be %s", vm.Name, want)
-}
-
 func findVSwitch(c *SCasClient, hostId int64, name string) (*SVSwitch, error) {
 	vss, err := c.GetHostVSwitches(hostId)
 	if err != nil {

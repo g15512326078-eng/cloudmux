@@ -19,7 +19,6 @@ import (
 	"math"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -282,10 +281,3 @@ func truncDay(t time.Time) time.Time {
 
 // suggestionKeepVerify is the only suggestion allowed for 间歇使用.
 const suggestionKeepVerify = "保留/核实"
-
-func suggestionForbiddenForNonIdle(s string) bool {
-	s = strings.ToLower(s)
-	return strings.Contains(s, "downsize") ||
-		strings.Contains(s, "release") ||
-		strings.Contains(s, "回收")
-}
