@@ -21,6 +21,16 @@ import (
 	"time"
 )
 
+// IdleClassMinScore is the §6.3 idle threshold (idle_score ≥ 80 → 闲置).
+//
+// HeadlineIdleScoreRule (CoS): IdleScore is the user-facing headline;
+// RawIdleScore always keeps the weighted computation.
+//   - 闲置 / 闲置(关机): IdleScore = RawIdleScore (ScoreHidden=false)
+//   - 间歇使用 / 定时使用 / 活跃 / 跳过 / 数据不足: IdleScore left unused,
+//     ScoreHidden=true → table and JSON consumers render SCORE as "-"
+//     so a raw 98 never sits next to 间歇使用.
+const IdleClassMinScore = 80
+
 func clamp01(v float64) float64 {
 	if v < 0 {
 		return 0
@@ -95,8 +105,9 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 	if !f.Vm.CreateDate.IsZero() && now.Sub(f.Vm.CreateDate) < cfg.MinAge {
 		r.Class = ClassSkipped
 		r.Reasons = append(r.Reasons, fmt.Sprintf("TOO_NEW: 创建未满 %s，跳过", cfg.MinAge))
-		r.Suggestion = "keep"
+		r.Suggestion = suggestionKeepVerify
 		r.Confidence = ConfLow
+		applyHeadlineScore(&r)
 		return r
 	}
 
@@ -107,6 +118,7 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 			r.OffDays = offDays
 			if offDays >= cfg.OffDays {
 				r.Class = ClassShutoffIdle
+				r.RawIdleScore = 100
 				r.IdleScore = 100
 				r.Confidence = ConfHigh
 				r.ConfidenceValue = 0.9
@@ -119,6 +131,7 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 			// shut off but younger than OffDays — not idle-by-age
 		} else if f.Vm.OnZombieList {
 			r.Class = ClassShutoffIdle
+			r.RawIdleScore = 95
 			r.IdleScore = 95
 			r.Confidence = ConfMedium
 			r.ConfidenceValue = 0.7
@@ -133,8 +146,9 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 			r.Confidence = ConfLow
 			r.ConfidenceValue = 0.3
 			r.Reasons = append(r.Reasons, "SHUTOFF_AGE_UNKNOWN: 已关机但无 lastOffTime，且不在 zombieVm 列表 — 请核实")
-			r.Suggestion = "核实"
+			r.Suggestion = suggestionKeepVerify
 			r.DataGaps = append(r.DataGaps, "lastOffTime=n/a")
+			applyHeadlineScore(&r)
 			return r
 		}
 	}
@@ -145,8 +159,9 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 		r.ConfidenceValue = f.Coverage
 		r.Reasons = append(r.Reasons, fmt.Sprintf(
 			"NO_DATA: 小时覆盖率 %.0f%% < %.0f%%", f.Coverage*100, cfg.MinCoverage*100))
-		r.Suggestion = "keep"
+		r.Suggestion = suggestionKeepVerify
 		r.DataGaps = append(r.DataGaps, fmt.Sprintf("coverage=%.2f", f.Coverage))
+		applyHeadlineScore(&r)
 		return r
 	}
 
@@ -213,7 +228,8 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 		scores = append(scores, p.s)
 	}
 	if wSum > 0 {
-		r.IdleScore = 100 * ws / wSum
+		r.RawIdleScore = 100 * ws / wSum
+		r.IdleScore = r.RawIdleScore
 	}
 
 	// Recurring-spike veto
@@ -240,33 +256,60 @@ func ScoreAndClassify(f VmFeatures, cfg Config, now time.Time, loc *time.Locatio
 	// Missing CPU series: never emit confident 闲置 (would be faking 0% CPU).
 	if cfg.Signals["cpu"] && !f.HasCpu && (r.Class == ClassIdle || r.Class == "") {
 		r.Class = ClassInsufficient
-		r.Suggestion = "keep"
 		r.Reasons = append(r.Reasons, "NO_CPU_SERIES: 无 CPU 数据，不做闲置判定")
 	}
 
 	// Score thresholds refine class when pattern said idle (spec §6.3):
 	// ≥80 idle, 50–80 intermittent, <50 active.
 	if !veto && r.Class == ClassIdle {
-		if r.IdleScore < 50 {
+		if r.RawIdleScore < 50 {
 			r.Class = ClassActive
-		} else if r.IdleScore < 80 {
+		} else if r.RawIdleScore < IdleClassMinScore {
 			r.Class = ClassIntermittent
 		}
 	}
 	if r.Class == "" {
-		if r.IdleScore >= 80 {
+		if r.RawIdleScore >= IdleClassMinScore {
 			r.Class = ClassIdle
-		} else if r.IdleScore >= 50 {
+		} else if r.RawIdleScore >= 50 {
 			r.Class = ClassIntermittent
 		} else {
 			r.Class = ClassActive
 		}
 	}
 
+	// Concrete burst reason for intermittent (overrides generic pattern text).
+	if r.Class == ClassIntermittent {
+		if burst := describeBurst(f, loc); burst != "" {
+			r.Reasons = append(r.Reasons, "BURST: "+burst)
+			// Prefer burst line as the primary reason for table display:
+			// move BURST to front after pattern reason already appended.
+			if len(r.Reasons) >= 2 {
+				last := r.Reasons[len(r.Reasons)-1]
+				// keep LOW_CPU etc., but ensure BURST is early in the list
+				r.Reasons = append([]string{last}, r.Reasons[:len(r.Reasons)-1]...)
+			}
+		}
+	}
+
 	r.Suggestion = suggestionFor(r.Class, pat.DetectedWindow, cfg)
+	applyHeadlineScore(&r)
 	r.ConfidenceValue = confidence(f, cfg, scores, now)
 	r.Confidence = confLabel(r.ConfidenceValue)
 	return r
+}
+
+// applyHeadlineScore implements HeadlineIdleScoreRule (see IdleClassMinScore).
+func applyHeadlineScore(r *Result) {
+	switch r.Class {
+	case ClassIdle, ClassShutoffIdle:
+		r.IdleScore = r.RawIdleScore
+		r.ScoreHidden = false
+	default:
+		// Never show a raw ≥ IdleClassMinScore next to a non-idle class.
+		r.ScoreHidden = true
+		r.IdleScore = -1
+	}
 }
 
 func firstNonEmpty(a, b string) string {
@@ -286,7 +329,9 @@ func suggestionFor(c Class, window string, cfg Config) string {
 		}
 		return "schedule on/off around work hours (print-only)"
 	case ClassIntermittent:
-		return "downsize"
+		return suggestionKeepVerify // never downsize/release
+	case ClassSkipped, ClassInsufficient:
+		return suggestionKeepVerify
 	default:
 		return "keep"
 	}

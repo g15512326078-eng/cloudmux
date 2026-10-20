@@ -20,8 +20,9 @@ import (
 )
 
 // HourlyBundle is the per-VM hourly series used for feature extraction.
-// Prefer hourly *max* when the API exposes it; otherwise the single rate
-// field (UNVERIFIED whether reports return avg or max — research §3.5).
+// D9: prefer hourly *max* when the API exposes a separate max; otherwise
+// the single reports rate field is used. Whether that field is avg or max
+// is UNVERIFIED (research §3.5) — CpuMax/p95 are peaks of that series only.
 type HourlyBundle struct {
 	CPU  []HourlyPoint
 	Mem  []HourlyPoint
@@ -80,6 +81,7 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 			index[k] = len(f.Hours)
 			f.Hours = append(f.Hours, h)
 			f.Active = append(f.Active, false)
+			f.HourCPU = append(f.HourCPU, 0)
 		}
 	}
 	addHour(b.CPU)
@@ -110,6 +112,9 @@ func ExtractFeatures(vm VmInventory, b HourlyBundle, cfg Config, loc *time.Locat
 		disk, _ := lookup(b.Disk, h)
 		iops, _ := lookup(b.Iops, h)
 		conn, hasConn := lookup(b.Conn, h)
+		if hasCpu {
+			f.HourCPU[i] = cpu
+		}
 
 		active := (hasCpu && cpu >= cfg.ActiveCPU) ||
 			net >= cfg.ActiveNetKBps ||

@@ -16,6 +16,7 @@ package idle
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -262,9 +263,7 @@ func TestWeeklySundayBatchNotIdle(t *testing.T) {
 	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
 	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
 	r := ScoreAndClassify(f, cfg, now, loc)
-	if r.Class != ClassIntermittent {
-		t.Fatalf("weekly batch want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
-	}
+	assertIntermittentBurst(t, r, "每周日", "02-04", 90)
 }
 
 func TestMonthlySixHourBurstNotIdle(t *testing.T) {
@@ -279,9 +278,7 @@ func TestMonthlySixHourBurstNotIdle(t *testing.T) {
 	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
 	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
 	r := ScoreAndClassify(f, cfg, now, loc)
-	if r.Class != ClassIntermittent {
-		t.Fatalf("monthly burst want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
-	}
+	assertIntermittentBurst(t, r, "每月一次", "6 小时", 95)
 }
 
 func TestSingleTwoHourBurstNotIdle(t *testing.T) {
@@ -296,9 +293,7 @@ func TestSingleTwoHourBurstNotIdle(t *testing.T) {
 	f := ExtractFeatures(baseVM("running"), b, cfg, loc)
 	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
 	r := ScoreAndClassify(f, cfg, now, loc)
-	if r.Class != ClassIntermittent {
-		t.Fatalf("2h burst want 间歇使用, got %s score=%.1f reasons=%v", r.Class, r.IdleScore, r.Reasons)
-	}
+	assertIntermittentBurst(t, r, "单次", "2 小时", 95)
 }
 
 func TestMissingCPUSeriesNotFakedIdle(t *testing.T) {
@@ -352,8 +347,8 @@ func TestShutoffUnknownAgeNoRelease(t *testing.T) {
 	if r.Suggestion == "release/回收" {
 		t.Fatalf("suggestion=%q", r.Suggestion)
 	}
-	if r.Suggestion != "核实" {
-		t.Errorf("suggestion=%q want 核实", r.Suggestion)
+	if r.Suggestion != suggestionKeepVerify {
+		t.Errorf("suggestion=%q want %q", r.Suggestion, suggestionKeepVerify)
 	}
 	if r.Confidence != ConfLow {
 		t.Errorf("confidence %s", r.Confidence)
@@ -377,5 +372,90 @@ func TestZombieListWithoutFabricatedLastOff(t *testing.T) {
 	}
 	if strings.Contains(joined, "已关机 31") || strings.Contains(joined, "31 天") {
 		t.Fatalf("must not fabricate day count from zombie list: %v", r.Reasons)
+	}
+}
+
+func assertIntermittentBurst(t *testing.T, r Result, phrasePart, windowPart string, peak float64) {
+	t.Helper()
+	if r.Class != ClassIntermittent {
+		t.Fatalf("want 间歇使用, got %s raw=%.1f reasons=%v", r.Class, r.RawIdleScore, r.Reasons)
+	}
+	if !r.ScoreHidden || r.IdleScore >= 0 {
+		t.Fatalf("headline must be hidden for 间歇使用: hidden=%v score=%.1f", r.ScoreHidden, r.IdleScore)
+	}
+	if r.RawIdleScore < IdleClassMinScore {
+		// batch VMs are quiet most hours so raw is high; require preserved raw
+		t.Logf("raw_idle_score=%.1f (may be high)", r.RawIdleScore)
+	}
+	if r.RawIdleScore <= 0 {
+		t.Fatalf("raw_idle_score must be preserved, got %.1f", r.RawIdleScore)
+	}
+	if r.Suggestion != suggestionKeepVerify {
+		t.Fatalf("suggestion=%q want %q", r.Suggestion, suggestionKeepVerify)
+	}
+	if suggestionForbiddenForNonIdle(r.Suggestion) {
+		t.Fatalf("forbidden suggestion %q", r.Suggestion)
+	}
+	joined := strings.Join(r.Reasons, ";")
+	if !strings.Contains(joined, "BURST:") {
+		t.Fatalf("want BURST reason, got %v", r.Reasons)
+	}
+	if !strings.Contains(joined, phrasePart) {
+		t.Fatalf("want %q in reasons %v", phrasePart, r.Reasons)
+	}
+	if !strings.Contains(joined, windowPart) {
+		t.Fatalf("want window %q in reasons %v", windowPart, r.Reasons)
+	}
+	peakStr := fmt.Sprintf("%.0f", peak)
+	if !strings.Contains(joined, peakStr) {
+		t.Fatalf("want peak %s in reasons %v", peakStr, r.Reasons)
+	}
+}
+
+func TestNonIdleNeverDownsizeOrRelease(t *testing.T) {
+	loc := shLoc(t)
+	cfg := DefaultConfig()
+	now := time.Date(2026, 3, 16, 12, 0, 0, 0, loc)
+	cases := []struct {
+		name string
+		fill func(d, h int) (float64, float64, float64, float64)
+		want Class
+	}{
+		{"scheduled", func(d, h int) (float64, float64, float64, float64) {
+			day := time.Date(2026, 3, 2+d, 0, 0, 0, 0, loc)
+			if day.Weekday() >= time.Monday && day.Weekday() <= time.Friday {
+				if (h >= 9 && h < 11) || (h >= 13 && h < 17) {
+					return 35, 200, 300, 30
+				}
+			}
+			return 0.4, 0.2, 0.2, 0.2
+		}, ClassScheduled},
+		{"active", func(d, h int) (float64, float64, float64, float64) {
+			return 40, 100, 100, 20
+		}, ClassActive},
+		{"burst", func(d, h int) (float64, float64, float64, float64) {
+			if d == 8 && (h == 3 || h == 4) {
+				return 95, 8, 8, 1
+			}
+			return 0.3, 0.1, 0.1, 0
+		}, ClassIntermittent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := synthHours(loc, 14, tc.fill)
+			f := ExtractFeatures(baseVM("running"), b, cfg, loc)
+			r := ScoreAndClassify(f, cfg, now, loc)
+			if r.Class != tc.want {
+				t.Fatalf("class=%s want %s", r.Class, tc.want)
+			}
+			if suggestionForbiddenForNonIdle(r.Suggestion) {
+				t.Fatalf("class %s suggestion %q forbids downsize/release", r.Class, r.Suggestion)
+			}
+			if r.Class != ClassIdle && r.Class != ClassShutoffIdle {
+				if !r.ScoreHidden {
+					t.Fatalf("non-idle class %s must hide headline score", r.Class)
+				}
+			}
+		})
 	}
 }

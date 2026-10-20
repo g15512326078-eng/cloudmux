@@ -56,7 +56,7 @@ type InstanceIdleListOptions struct {
 
 func init() {
 	cmd := NewCommand("instance-idle")
-	NewCO[InstanceIdleListOptions](cmd).RawRun("list", "Detect idle/scheduled/intermittent CAS VMs (read-only)", func(cli ICloudProvider, args *InstanceIdleListOptions) error {
+	NewCO[InstanceIdleListOptions](cmd).RawRun("list", "Detect idle/scheduled/intermittent CAS VMs (read-only; peaks from report rate field — avg/max UNVERIFIED, see idle/README D9)", func(cli ICloudProvider, args *InstanceIdleListOptions) error {
 		cfg, err := idleOptionsToConfig(args)
 		if err != nil {
 			return err

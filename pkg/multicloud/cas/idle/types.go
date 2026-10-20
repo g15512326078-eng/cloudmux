@@ -41,8 +41,12 @@ const (
 )
 
 // HourlyPoint is one hour bucket for one metric series.
-// Value is the preferred aggregate (max when available, else the rate
-// field). UNVERIFIED: whether reports EChartValue.rate is avg or max.
+//
+// D9 / live-CAS: Value comes from the single reports EChartValue.rate
+// field. Whether that rate is the hourly average or the hourly max is
+// UNVERIFIED — peaks (CpuMax, burst 峰值) are therefore peaks of that
+// single series, not a confirmed maxMerge. Calibrate on a live CAS before
+// treating p95/peak as true hourly maxima.
 type HourlyPoint struct {
 	Time  time.Time `json:"time"`
 	Value float64   `json:"value"`
@@ -96,9 +100,10 @@ type VmFeatures struct {
 
 	DroppedBuckets int // unparseable report bucket labels
 
-	// Active[i] aligns with Hours[i]
-	Hours  []time.Time
-	Active []bool
+	// Active[i] / HourCPU[i] align with Hours[i] (HourCPU is 0 when no CPU point).
+	Hours   []time.Time
+	Active  []bool
+	HourCPU []float64
 
 	LastActive time.Time
 
@@ -116,11 +121,16 @@ type Reason struct {
 
 // Result is the per-VM idle report row.
 type Result struct {
-	Name            string          `json:"name"`
-	Uuid            string          `json:"uuid"`
-	Status          string          `json:"status"`
-	Class           Class           `json:"class"`
+	Name   string `json:"name"`
+	Uuid   string `json:"uuid"`
+	Status string `json:"status"`
+	Class  Class  `json:"class"`
+	// IdleScore is the headline score shown next to CLASS.
+	// See applyHeadlineScore / IdleClassMinScore for the display rule.
+	// When ScoreHidden is true, table/JSON consumers should render IdleScore as "-".
 	IdleScore       float64         `json:"idle_score"`
+	RawIdleScore    float64         `json:"raw_idle_score"`
+	ScoreHidden     bool            `json:"score_hidden"`
 	Confidence      ConfidenceLabel `json:"confidence"`
 	ConfidenceValue float64         `json:"confidence_value"`
 	OffDays         float64         `json:"off_days"`
