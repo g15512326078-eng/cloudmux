@@ -18,12 +18,14 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/pkg/util/httputils"
+	"yunion.io/x/pkg/util/timeutils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -60,9 +62,10 @@ type SInstance struct {
 	OsDesc       string  `json:"osDesc"`
 	CreateDate   string  `json:"createDate"`
 	Type         int     `json:"type"` // 0 CAS, 1 VMware
-	// DelTime is DomainRsDomainvmList.delTime ("虚拟机逻辑回收时间"), a
-	// date string (api.yaml type=string, format=date). Non-empty means the
-	// VM is in the recycle bin (POST /vm/restoreVm can restore it).
+	// DelTime is DomainRsDomainvmList.delTime ("虚拟机逻辑回收时间").
+	// api.yaml types it as a date string, but the CVM schema stores
+	// tbl_domain.del_time as INTEGER DEFAULT 0, so a live VM may come back
+	// as 0 / "0". See isRecycled. POST /vm/restoreVm restores a recycled VM.
 	DelTime string `json:"delTime"`
 }
 
@@ -108,11 +111,29 @@ type SInstanceNetwork struct {
 // VMware host; those are not CAS-hypervisor guests and are not synced.
 const VM_TYPE_VMWARE = 1
 
-// isRecycled reports whether the VM is in the CAS recycle bin. api.yaml
-// DomainRsDomainvmList.delTime is a date string; any non-empty value means
-// recycled. UNVERIFIED: exact string CAS sends (RFC3339 vs "2020-10-29").
+// isRecycled reports whether the VM is in the CAS recycle bin, from
+// delTime. Live values: empty/null, or a zero time — an integer <= 0 (the
+// CVM column default is 0) or a date in 1970 or earlier (what a
+// serialized 0 looks like in any time zone). Anything else, including an unparseable
+// non-empty string, counts as recycled. UNVERIFIED on a real CAS: which of
+// the int / date-string forms vm/vmList actually emits.
 func (self *SInstance) isRecycled() bool {
-	return len(strings.TrimSpace(self.DelTime)) > 0
+	return isRecycledDelTime(self.DelTime)
+}
+
+func isRecycledDelTime(delTime string) bool {
+	s := strings.TrimSpace(delTime)
+	if len(s) == 0 || strings.EqualFold(s, "null") {
+		return false
+	}
+	if n, err := strconv.ParseFloat(s, 64); err == nil {
+		return n > 0
+	}
+	if t, err := timeutils.ParseTimeStr(s); err == nil {
+		// a zero int rendered as a local date is 1970-01-01 in any zone
+		return t.Year() > 1970
+	}
+	return true
 }
 
 // isLiveGuest is true for CAS-hypervisor VMs that are not in the recycle bin.

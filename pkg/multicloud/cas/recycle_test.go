@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -138,6 +139,53 @@ func TestGetInstancesFiltersDelTime(t *testing.T) {
 	cli := newRecycleClient(t, f)
 	vms, err := cli.GetInstances(nil)
 	if err != nil || len(vms) != 1 || vms[0].Uuid != "live-1" {
+		t.Fatalf("GetInstances = %+v, %v", vms, err)
+	}
+}
+
+// db/01-cvm-tables.sql in the reference stores tbl_domain.del_time as
+// INTEGER DEFAULT 0: a live VM must not be hidden when vmList returns 0.
+func TestIsRecycledDelTimeForms(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{`{}`, false},
+		{`{"delTime":null}`, false},
+		{`{"delTime":""}`, false},
+		{`{"delTime":0}`, false},
+		{`{"delTime":"0"}`, false},
+		{`{"delTime":"1970-01-01T08:00:00+08:00"}`, false},
+		{`{"delTime":"1970-01-01 08:00:00"}`, false},
+		{`{"delTime":1603983250}`, true},
+		{`{"delTime":"2020-10-29T22:54:10+08:00"}`, true},
+		{`{"delTime":"2020-10-29 22:54:10"}`, true},
+		{`{"delTime":"2020-10-29"}`, true},
+		{`{"delTime":"garbage"}`, true},
+	}
+	for _, c := range cases {
+		obj, err := jsonutils.ParseString(c.raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vm := &SInstance{}
+		if err := obj.Unmarshal(vm); err != nil {
+			t.Fatalf("%s: %v", c.raw, err)
+		}
+		if got := vm.isRecycled(); got != c.want {
+			t.Errorf("%s: delTime=%q isRecycled=%v want %v", c.raw, vm.DelTime, got, c.want)
+		}
+	}
+}
+
+func TestGetInstancesKeepsZeroDelTime(t *testing.T) {
+	f := &recycleFake{t: t, list: []dict{
+		{"id": 1, "uuid": "live-0", "name": "a", "hostId": 1, "hostPoolId": 1, "cpu": 1, "memory": 512, "vmStatus": "running", "system": 1, "type": 0, "delTime": 0},
+		{"id": 2, "uuid": "gone", "name": "b", "hostId": 1, "hostPoolId": 1, "cpu": 1, "memory": 512, "vmStatus": "shutOff", "system": 1, "type": 0, "delTime": 1603983250},
+	}}
+	cli := newRecycleClient(t, f)
+	vms, err := cli.GetInstances(nil)
+	if err != nil || len(vms) != 1 || vms[0].Uuid != "live-0" {
 		t.Fatalf("GetInstances = %+v, %v", vms, err)
 	}
 }
