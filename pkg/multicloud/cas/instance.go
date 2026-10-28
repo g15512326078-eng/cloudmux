@@ -169,6 +169,52 @@ func (cli *SCasClient) listInstances(params url.Values) ([]SInstance, error) {
 	return ret, jsonutils.NewArray(items...).Unmarshal(&ret)
 }
 
+// waitVMNotLive polls the raw vm/vmList until uuid is missing or recycled
+// (delTime set). Uses the same poll interval/timeout as waitTask.
+func (cli *SCasClient) waitVMNotLive(uuid string) error {
+	interval, timeout := cli.taskPollInterval, cli.taskTimeout
+	if interval <= 0 {
+		interval = DEFAULT_TASK_POLL_INTERVAL
+	}
+	if timeout <= 0 {
+		timeout = DEFAULT_TASK_TIMEOUT
+	}
+	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		if err := cli.ctxErr(); err != nil {
+			return false, err
+		}
+		live, err := cli.vmIsLiveInList(uuid)
+		if err != nil {
+			// A cancel during the read surfaces as a transport error.
+			if cerr := cli.ctxErr(); cerr != nil {
+				return false, errors.Wrap(cerr, "cancelled while waiting")
+			}
+			return false, err
+		}
+		return !live, nil
+	})
+	if err != nil {
+		return errors.Wrapf(err, "waitVMNotLive %s (still present as a live guest after delete)", uuid)
+	}
+	return nil
+}
+
+// vmIsLiveInList reports whether uuid appears in vm/vmList as a live
+// (non-VMware, non-recycled) guest. Uses the unfiltered list so a recycled
+// entry with delTime is visible and treated as not live.
+func (cli *SCasClient) vmIsLiveInList(uuid string) (bool, error) {
+	vms, err := cli.listInstances(nil)
+	if err != nil {
+		return false, err
+	}
+	for i := range vms {
+		if vms[i].Uuid == uuid {
+			return vms[i].isLiveGuest(), nil
+		}
+	}
+	return false, nil
+}
+
 // GetInstance looks a VM up by uuid (its external id):
 //  1. GET vm/detail/uuid/{uuid} (path-based, api.yaml returns a single
 //     VMRsDomainDetail); 404, or 409 whose message says "不存在" ("does not exist"), is
@@ -541,19 +587,81 @@ func (self *SInstance) SetSecurityGroups(secgroupIds []string) error {
 	return cloudprovider.ErrNotSupported
 }
 
-// StartVM is not supported yet.
-func (self *SInstance) StartVM(ctx context.Context) error { return cloudprovider.ErrNotImplemented }
-
-// StopVM is not supported yet.
-func (self *SInstance) StopVM(ctx context.Context, opts *cloudprovider.ServerStopOptions) error {
-	return cloudprovider.ErrNotImplemented
+// StartVM is PUT /cas/casrs/vm/start/{id} (api.yaml: "uuid also works", path type
+// is integer — we send the numeric domain id). Returns RsTaskMsg; waitTask.
+func (self *SInstance) StartVM(ctx context.Context) error {
+	_, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, fmt.Sprintf("vm/start/%d", self.Id), nil, nil)
+	return err
 }
 
-// RestartVM is not supported yet.
-func (self *SInstance) RestartVM(ctx context.Context) error { return cloudprovider.ErrNotImplemented }
+// StopVM is PUT /cas/casrs/vm/stop/{id}. When opts.IsForce is set it uses
+// PUT /cas/casrs/vm/powerOff/{id} instead ("power off the VM"). Both return
+// RsTaskMsg. UNVERIFIED: whether stop is ACPI-graceful and how long
+// powerOff takes vs stop.
+func (self *SInstance) StopVM(ctx context.Context, opts *cloudprovider.ServerStopOptions) error {
+	path := fmt.Sprintf("vm/stop/%d", self.Id)
+	if opts != nil && opts.IsForce {
+		path = fmt.Sprintf("vm/powerOff/%d", self.Id)
+	}
+	_, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, path, nil, nil)
+	return err
+}
 
-// DeleteVM is not supported yet.
-func (self *SInstance) DeleteVM(ctx context.Context) error { return cloudprovider.ErrNotImplemented }
+// RestartVM is PUT /cas/casrs/vm/restart/{id} (checklist 1.3). ICloudVM has
+// no Reboot method; cloudpods soft-reboot of managed guests typically
+// stop+start. This is exposed for callers that want the native restart.
+func (self *SInstance) RestartVM(ctx context.Context) error {
+	_, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, fmt.Sprintf("vm/restart/%d", self.Id), nil, nil)
+	return err
+}
+
+// DELETE_VM_TYPE is the api.yaml "type" query on DELETE
+// /vm/delete/uuid/{uuid}: 0=keep storage, 1=delete storage, 3=recycle bin.
+// Deletes default to the recycle bin so a mistaken delete is reversible on CAS.
+// Flip to "1" (and optionally set DELETE_VM_WIPE_VOLUME) only after a real
+// CAS confirms wipe/delete-storage behaviour.
+const DELETE_VM_TYPE = "3"
+
+// DELETE_VM_WIPE_VOLUME is api.yaml isWipeVolume ("delete the data permanently"). Kept
+// false; never combine with type=3 unless real CAS requires it.
+const DELETE_VM_WIPE_VOLUME = "false"
+
+// DELETE_VM_DEL_BASE0 is api.yaml delBase0 ("delete base0: true yes, false no",
+// delete base0). Always sent as "false" instead of leaving CAS to pick an
+// undocumented default: a VM disk can be a qcow2 overlay whose base is a
+// file someone else owns (the image importer's temp VM is backed by the
+// user's cloud image). UNVERIFIED: whether CAS honours it when the
+// recycle bin is purged later.
+const DELETE_VM_DEL_BASE0 = "false"
+
+// DeleteVM stops a running/paused guest first (force powerOff), then
+// DELETE /cas/casrs/vm/delete/uuid/{uuid} with DELETE_VM_TYPE /
+// DELETE_VM_WIPE_VOLUME / DELETE_VM_DEL_BASE0, then waits until the VM is absent from the live
+// vmList (missing, or present with delTime set). waitTask completion alone
+// is not enough: type=3 leaves the domain in the recycle bin and it can
+// still appear in vm/vmList until delTime is set / it disappears.
+// UNVERIFIED: whether CAS rejects delete while running, what delBase0
+// does on purge, and recycle-bin restore. Shared by cloudpods DeleteVM,
+// the deploy rollback and the image importer; delBase0=false is the
+// conservative value for all of them.
+func (self *SInstance) DeleteVM(ctx context.Context) error {
+	status := self.GetStatus()
+	if status == api.VM_RUNNING || status == api.VM_SUSPEND {
+		if err := self.StopVM(ctx, &cloudprovider.ServerStopOptions{IsForce: true}); err != nil {
+			return errors.Wrapf(err, "StopVM before DeleteVM (status was %s)", status)
+		}
+	}
+	params := url.Values{}
+	params.Set("type", DELETE_VM_TYPE)
+	params.Set("isWipeVolume", DELETE_VM_WIPE_VOLUME)
+	params.Set("delBase0", DELETE_VM_DEL_BASE0)
+	cli := self.region.cli.WithContext(ctx)
+	_, err := cli.doAsync(httputils.DELETE, "vm/delete/uuid/"+url.PathEscape(self.Uuid), params, nil)
+	if err != nil {
+		return err
+	}
+	return cli.waitVMNotLive(self.Uuid)
+}
 
 func (self *SInstance) UpdateVM(ctx context.Context, input cloudprovider.SInstanceUpdateOptions) error {
 	return errors.Wrap(cloudprovider.ErrNotImplemented, "UpdateVM")
@@ -575,9 +683,23 @@ func (self *SInstance) ChangeConfig(ctx context.Context, config *cloudprovider.S
 	return errors.Wrap(cloudprovider.ErrNotImplemented, "ChangeConfig")
 }
 
-// GetVNCInfo is not supported yet.
+// GetVNCInfo is GET /cas/casrs/vmvnc/vnc/{id} (sync). novnc/{id} also exists
+// (proxyIp + token) but is unused here — cloudpods' managed VNC path wants
+// host/port/password. Password is returned to the caller; it is redacted
+// in debug logs via isSecretKey.
 func (self *SInstance) GetVNCInfo(input *cloudprovider.ServerVncInput) (*cloudprovider.ServerVncOutput, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	info, err := self.region.cli.GetVnc(self.Id)
+	if err != nil {
+		return nil, err
+	}
+	return &cloudprovider.ServerVncOutput{
+		Protocol:   "vnc",
+		Host:       info.Ip,
+		Port:       int64(info.Port),
+		Password:   info.Password,
+		Hypervisor: api.HYPERVISOR_CAS,
+		InstanceId: self.Uuid,
+	}, nil
 }
 
 // vm/detail network[].netType: 0 bridge, 1 NAT, 2 none, 3 passthrough,

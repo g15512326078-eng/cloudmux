@@ -21,6 +21,12 @@
 //   - Read sync: host pools/clusters as zones, hosts, storage pools,
 //     vswitch-based networks, VMs with disks/NICs, VM templates as images.
 //
+//   - VM lifecycle: create from template, start/stop/restart, delete into
+//     the CAS recycle bin (never wipes volumes), VNC info. Create refuses
+//     a name a live VM already has, and an ambiguous deploy (timeout,
+//     transport error, failed task) names any VM it may have created
+//     instead of retrying or adopting it.
+//
 // Storagecache.UploadImage (cloudpods image upload) is not implemented.
 //
 // Every CAS request is bounded (10s dial, 10s TLS handshake, 30s response
@@ -36,7 +42,9 @@
 // documentation, or go beyond it, and have not yet been verified against
 // a real CAS; they are UNVERIFIED in the code:
 //
-//   - the legacy charset of the Error-Message header (decodeErrorMessage).
+//   - the legacy charset of the Error-Message header (decodeErrorMessage);
+//   - task polling: msgId -1 for writes that finish inline, a brief 403
+//     while the Digest nonce rolls over, and message keyValue context.
 //
 // This is not the H3C public/CloudOS provider (pkg/multicloud/h3c) and has
 // nothing to do with the Keystone CAS SSO driver.

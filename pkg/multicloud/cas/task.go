@@ -1,0 +1,269 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package cas
+
+import (
+	"context"
+	stderrors "errors"
+	"fmt"
+	"net"
+	"net/url"
+	"time"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/log"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
+
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
+)
+
+// STaskMsg is the body returned by write ops that start an async job
+// (api.yaml definitions/RsTaskMsg, xml name taskMsg). Start/stop/restart/
+// powerOff/delete/deploy all document this shape. completed/progress here
+// describe the submission ack; the authoritative completion state is on
+// GET /cas/casrs/message/{msgId} (SMessage below).
+type STaskMsg struct {
+	MsgId      int64  `json:"msgId"`
+	Completed  bool   `json:"completed"`
+	Progress   int    `json:"progress"`
+	TargetId   int64  `json:"targetId"`
+	TargetName string `json:"targetName"`
+	EventType  int    `json:"eventType"`
+}
+
+// SMessage is GET /cas/casrs/message/{msgId} (api.yaml: "view task details",
+// xml name taskMsg). result is documented as 0=success, 1=failure,
+// 2=partial success. failMsg is "failure message (the task message when the task succeeds)".
+type SMessage struct {
+	MsgId      int64  `json:"msgId"`
+	Name       string `json:"name"`
+	TargetId   int64  `json:"targetId"`
+	TargetName string `json:"targetName"`
+	Detail     string `json:"detail"`
+	Completed  bool   `json:"completed"`
+	Result     int    `json:"result"`
+	FailMsg    string `json:"failMsg"`
+	EventType  int    `json:"eventType"`
+	// KeyValue carries extra failure context next to failMsg when
+	// result != 0 (not in api.yaml; UNVERIFIED).
+	KeyValue []SMessageKeyValue `json:"keyValue"`
+}
+
+type SMessageKeyValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func (msg *SMessage) failText() string {
+	text := msg.FailMsg
+	if len(text) == 0 {
+		text = msg.Detail
+	}
+	for _, kv := range msg.KeyValue {
+		text += fmt.Sprintf(" [%s=%s]", kv.Key, kv.Value)
+	}
+	return text
+}
+
+const (
+	// TASK_RESULT_* match api.yaml on GET /message/{msgId}.result.
+	TASK_RESULT_SUCCESS         = 0
+	TASK_RESULT_FAILURE         = 1
+	TASK_RESULT_PARTIAL_SUCCESS = 2
+
+	// Defaults for waitTask. Neither the poll interval nor the overall
+	// timeout is documented in api.yaml; 5s / 10m mirrors the nutanix
+	// client and must be confirmed on a real CAS.
+	DEFAULT_TASK_POLL_INTERVAL = 5 * time.Second
+	DEFAULT_TASK_TIMEOUT       = 10 * time.Minute
+	// MAX_TASK_403 is how many consecutive 403s waitTask tolerates
+	// before treating the denial as real (Digest nonce blips are brief).
+	MAX_TASK_403 = 6
+	// MAX_TASK_TRANSPORT_ERRS is how many consecutive transport errors
+	// (timeouts, resets) a task poll tolerates: the task already runs on
+	// CAS, so one lost poll must not turn into "failed".
+	MAX_TASK_TRANSPORT_ERRS = 6
+)
+
+// isTransportError: the request did not get an HTTP answer (dial, TLS,
+// header or request timeout, reset). The server may or may not have acted.
+func isTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	c := errors.Cause(err)
+	if c == context.DeadlineExceeded {
+		return true
+	}
+	var ne net.Error
+	return stderrors.As(c, &ne)
+}
+
+// parseTaskMsg decodes an RsTaskMsg body. A missing/zero msgId with
+// completed=true is treated as a synchronous success (UNVERIFIED: api.yaml
+// examples always show completed=false and a non-zero msgId).
+func parseTaskMsg(resp jsonutils.JSONObject) (*STaskMsg, error) {
+	resp = unwrapRoot(resp)
+	msg := &STaskMsg{}
+	if err := resp.Unmarshal(msg); err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal RsTaskMsg")
+	}
+	return msg, nil
+}
+
+// GetMessage is GET /cas/casrs/message/{msgId}.
+func (cli *SCasClient) GetMessage(msgId int64) (*SMessage, error) {
+	resp, err := cli.request(httputils.GET, fmt.Sprintf("message/%d", msgId), nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp = unwrapRoot(resp)
+	msg := &SMessage{}
+	if err := resp.Unmarshal(msg); err != nil {
+		return nil, errors.Wrapf(err, "Unmarshal message %d", msgId)
+	}
+	if msg.MsgId == 0 {
+		msg.MsgId = msgId
+	}
+	return msg, nil
+}
+
+// waitTask polls GET /cas/casrs/message/{msgId} until completed is true.
+// On completion: result 0 -> nil; result 1 -> error with failMsg/detail;
+// result 2 (partial success) -> error (treated as failure until real-CAS
+// behaviour is known). Unknown: whether a still-running task can return
+// 404/409 for the message id, and whether cancel is ever needed.
+func (cli *SCasClient) waitTask(msgId int64) (*SMessage, error) {
+	if msgId == 0 {
+		return nil, errors.Errorf("waitTask: empty msgId")
+	}
+	interval, timeout := cli.taskPollInterval, cli.taskTimeout
+	if interval <= 0 {
+		interval = DEFAULT_TASK_POLL_INTERVAL
+	}
+	if timeout <= 0 {
+		timeout = DEFAULT_TASK_TIMEOUT
+	}
+	var last *SMessage
+	consecutive403, transportErrs := 0, 0
+	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		if err := cli.ctxErr(); err != nil {
+			return false, errors.Wrapf(err, "cancelled while waiting; task %d may still run on CAS", msgId)
+		}
+		msg, err := cli.GetMessage(msgId)
+		if err != nil {
+			// A cancel during the poll surfaces as a transport error;
+			// report it as the cancel, not as a raw url.Error.
+			if cerr := cli.ctxErr(); cerr != nil {
+				return false, errors.Wrapf(cerr, "cancelled while waiting; task %d may still run on CAS", msgId)
+			}
+			if isTransportError(err) && cli.ctxErr() == nil {
+				transportErrs++
+				if transportErrs >= MAX_TASK_TRANSPORT_ERRS {
+					return false, errors.Wrapf(err, "waitTask %d: %d consecutive transport errors; the task may still run on CAS", msgId, transportErrs)
+				}
+				return false, nil
+			}
+			// CAS may not publish the message immediately after submit.
+			// NotFound (and transient 5xx) keep polling until timeout;
+			// other errors abort.
+			if errors.Cause(err) == cloudprovider.ErrNotFound {
+				return false, nil
+			}
+			// Keep polling on 403: Digest auth may 403 briefly while the
+			// nonce rolls over (UNVERIFIED). Bound the streak so a
+			// real permission denial does not become a 10-minute timeout.
+			if errors.Cause(err) == cloudprovider.ErrNoPermission {
+				consecutive403++
+				if consecutive403 >= MAX_TASK_403 {
+					return false, errors.Wrapf(cloudprovider.ErrNoPermission, "waitTask %d: %d consecutive 403s", msgId, consecutive403)
+				}
+				return false, nil
+			}
+			if ce, ok := errors.Cause(err).(*SCasError); ok && ce.StatusCode >= 500 {
+				return false, nil
+			}
+			return false, err
+		}
+		consecutive403, transportErrs = 0, 0
+		last = msg
+		log.Debugf("cas task %d completed=%v result=%d progress from submit unknown failMsg=%q",
+			msg.MsgId, msg.Completed, msg.Result, msg.FailMsg)
+		if !msg.Completed {
+			return false, nil
+		}
+		switch msg.Result {
+		case TASK_RESULT_SUCCESS:
+			return true, nil
+		case TASK_RESULT_FAILURE, TASK_RESULT_PARTIAL_SUCCESS:
+			return false, errors.Wrapf(ErrTaskFailed, "cas task %d result=%d: %s", msg.MsgId, msg.Result, msg.failText())
+		default:
+			return false, errors.Errorf("cas task %d unknown result=%d detail=%q", msg.MsgId, msg.Result, msg.Detail)
+		}
+	})
+	if err != nil {
+		return last, errors.Wrapf(err, "waitTask %d", msgId)
+	}
+	return last, nil
+}
+
+// ErrTaskFailed is the cause of a waitTask error for a task that ended
+// with result 1 or 2: the task is over (unlike a timeout).
+const ErrTaskFailed = errors.Error("CasTaskFailed")
+
+// MSG_ID_NO_TASK is the msgId CAS returns when a write finished inline
+// and no task was created (not in api.yaml; UNVERIFIED; e.g. after
+// PUT /vm/modify).
+const MSG_ID_NO_TASK = -1
+
+// doAsync issues a write that returns RsTaskMsg and waits for the task.
+// msgId -1 means "done, no task" and returns at once. If the ack has
+// completed=true and msgId==0 it also returns without polling (UNVERIFIED
+// sync path). Otherwise it requires a positive msgId and polls it.
+func (cli *SCasClient) doAsync(method httputils.THttpMethod, res string, params url.Values, body jsonutils.JSONObject) (*SMessage, error) {
+	resp, err := cli.request(method, res, params, body)
+	if err != nil {
+		return nil, err
+	}
+	return cli.waitAsync(method, res, resp)
+}
+
+// waitAsync is the second half of doAsync: it parses the RsTaskMsg ack of
+// a write that was already sent and waits for its task. Split out so a
+// caller can tell a request CAS rejected outright (error from request,
+// no task) from a task that failed or timed out after it was accepted.
+func (cli *SCasClient) waitAsync(method httputils.THttpMethod, res string, resp jsonutils.JSONObject) (*SMessage, error) {
+	ack, err := parseTaskMsg(resp)
+	if err != nil {
+		return nil, err
+	}
+	if ack.MsgId == MSG_ID_NO_TASK {
+		return &SMessage{MsgId: ack.MsgId, Completed: true, Result: TASK_RESULT_SUCCESS, TargetId: ack.TargetId, TargetName: ack.TargetName}, nil
+	}
+	if ack.MsgId < 0 {
+		return nil, errors.Errorf("%s %s returned RsTaskMsg with msgId %d", method, res, ack.MsgId)
+	}
+	if ack.MsgId == 0 {
+		if ack.Completed {
+			return &SMessage{Completed: true, Result: TASK_RESULT_SUCCESS, TargetId: ack.TargetId, TargetName: ack.TargetName}, nil
+		}
+		return nil, errors.Errorf("%s %s returned RsTaskMsg without msgId", method, res)
+	}
+	// A nonzero msgId is always confirmed via GetMessage, even when the
+	// ack says completed (UNVERIFIED: start/stop examples show
+	// completed=false on submit).
+	return cli.waitTask(ack.MsgId)
+}

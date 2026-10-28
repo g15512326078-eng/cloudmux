@@ -104,6 +104,17 @@ func (cfg *CasClientConfig) SnapshotTimeZone(tz string) *CasClientConfig {
 	return cfg
 }
 
+// ReadOnlyClone returns a client that refuses non-GET/HEAD requests. It
+// builds its own HTTP client (the read-only guard is per client).
+func (cli *SCasClient) ReadOnlyClone() *SCasClient {
+	if cli == nil {
+		return nil
+	}
+	cfg := *cli.CasClientConfig
+	cfg.cpcfg.ReadOnly = true
+	return &SCasClient{CasClientConfig: &cfg, ctx: cli.ctx, timeouts: cli.timeouts, taskPollInterval: cli.taskPollInterval, taskTimeout: cli.taskTimeout}
+}
+
 // Every CAS request is bounded. The vendored adaptive client dials
 // for up to 120s and ignores the context, so an unreachable CAS took
 // about 135s to fail. These bounds replace it; waitTask keeps its own
@@ -613,9 +624,10 @@ func (cli *SCasClient) GetSubAccounts() ([]cloudprovider.SSubAccount, error) {
 }
 
 func (cli *SCasClient) GetCapabilities() []string {
-	// This version only reads CAS.
+	// Compute is writable (start/stop/delete/deploy). Network stays
+	// read-only: CreateINetwork / security groups are not implemented.
 	return []string{
-		cloudprovider.CLOUD_CAPABILITY_COMPUTE + cloudprovider.READ_ONLY_SUFFIX,
+		cloudprovider.CLOUD_CAPABILITY_COMPUTE,
 		cloudprovider.CLOUD_CAPABILITY_NETWORK + cloudprovider.READ_ONLY_SUFFIX,
 	}
 }
