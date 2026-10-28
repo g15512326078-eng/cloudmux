@@ -71,6 +71,30 @@
 //     stalled writes, and stops at once when Context is cancelled (cmx:
 //     Ctrl-C); cleanup then follows the usual keep-on-ambiguity rules.
 //
+//   - Windows ISO install (windowsimport.go, cmx
+//     image-import-windows-template): the install ISO (staged with the
+//     same stagers, ISOs only) and a generated answer ISO (unattend.go:
+//     autounattend.xml with virtio driver paths on the autoVirtio floppy,
+//     a disk-0 wipe of the new disk only, encoded Administrator password,
+//     Sysprep /generalize /oobe /shutdown; isowriter.go: pure-Go ISO 9660
+//     with Joliet) boot a temporary VM behind a fail-closed disk-wipe
+//     guard; once it shut itself off (with install evidence) its media are
+//     always disconnected (verified), the boot order is set disk-first
+//     (verified; the current bootFirmware is sent back and vm/detail
+//     must not change otherwise) and it is cloned with addVmTemplate
+//     opType=1, checked flat and recycled. Secrets never reach logs,
+//     plans or errors; the answer file deletes its cached copies and
+//     autologon before Sysprep, and the uploaded answer ISO is deleted
+//     and confirmed gone (else a loud SECRET LEFT warning). With
+//     Castools, CAStools must have been seen running (opt out:
+//     NoWaitCastools). Any doubt keeps the VM. Known
+//     limitations: an answer ISO is kept (with a loud warning) after a
+//     failure once the VM has started, since the VM still references
+//     it; the product key is in clear text in the answer file, as the
+//     schema requires; a UEFI boot prompt idles until the timeout and
+//     fails safe. The floppy layout, boot-order
+//     behaviour, firmware and the vm/modify bodies are UNVERIFIED on CAS.
+//
 // Storagecache.UploadImage (cloudpods image upload) and template storage
 // pool management are not implemented.
 //
