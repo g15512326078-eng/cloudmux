@@ -671,4 +671,6 @@ var (
 	_ cloudprovider.ICloudVpc          = (*SVpc)(nil)
 	_ cloudprovider.ICloudWire         = (*SWire)(nil)
 	_ cloudprovider.ICloudNetwork      = (*SNetwork)(nil)
+
+	_ cloudprovider.ICloudInstanceSnapshot = (*SVmSnapshot)(nil)
 )

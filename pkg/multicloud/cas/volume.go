@@ -22,6 +22,7 @@ import (
 
 	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
@@ -112,7 +113,98 @@ func (cli *SCasClient) GetStorageVolume(hostId int64, poolName, volName string) 
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "volume %s in pool %s on host %d", volName, poolName, hostId)
 }
 
+// SStorageVolumeCreate is the body of POST /cas/casrs/storage/volume
+// ("add a storage volume (as a task)"). capacity is MB (UNVERIFIED: api.yaml gives no
+// unit).
+type SStorageVolumeCreate struct {
+	HostId   int64  `json:"hostId"`
+	SpName   string `json:"spName"`
+	VolName  string `json:"volName"`
+	Capacity int64  `json:"capacity"`
+	Format   string `json:"format"`
+	// Mode: 0 lazy zero, 1 zero, other thin. We send thin (2).
+	Mode int `json:"mode"`
+	// BaseFile is api.yaml "base image file, optional": the backing file of a new
+	// qcow2 overlay. Only the image import sets it.
+	BaseFile string `json:"baseFile,omitempty"`
+}
+
 const VOLUME_MODE_THIN = 2
+
+// CreateStorageVolume is POST /cas/casrs/storage/volume. api.yaml documents
+// a bare 200 for it; a task body (msgId) is waited on, an empty body is
+// taken as done.
+func (cli *SCasClient) CreateStorageVolume(body *SStorageVolumeCreate) error {
+	resp, err := cli.request(httputils.POST, "storage/volume", nil, jsonutils.Marshal(body))
+	if err != nil {
+		if errors.Cause(err) == ErrEmptyBody {
+			return nil
+		}
+		return err
+	}
+	return cli.waitAck(resp, "POST storage/volume")
+}
+
+// waitStorageVolume polls GET storage/volume until the named volume
+// appears. POST storage/volume may answer a bare 200 before the file is
+// listed; a single immediate read would then fail and leave an orphan.
+func (cli *SCasClient) waitStorageVolume(hostId int64, poolName, volName string) (*SStorageVolume, error) {
+	interval, timeout := cli.taskPollInterval, cli.taskTimeout
+	if interval <= 0 {
+		interval = DEFAULT_TASK_POLL_INTERVAL
+	}
+	if timeout <= 0 {
+		timeout = DEFAULT_TASK_TIMEOUT
+	}
+	var found *SStorageVolume
+	var last error
+	err := cloudprovider.Wait(interval, timeout, func() (bool, error) {
+		if err := cli.ctxErr(); err != nil {
+			return false, err
+		}
+		vol, err := cli.GetStorageVolume(hostId, poolName, volName)
+		if err != nil {
+			// A cancel during the read surfaces as a transport error.
+			if cerr := cli.ctxErr(); cerr != nil {
+				return false, errors.Wrapf(cerr, "cancelled while waiting for volume %s", volName)
+			}
+		}
+		if err == nil {
+			found = vol
+			last = nil
+			return true, nil
+		}
+		last = err
+		if errors.Cause(err) == cloudprovider.ErrNotFound {
+			return false, nil
+		}
+		return false, err
+	})
+	if err != nil {
+		if last != nil {
+			return nil, errors.Wrapf(err, "waitStorageVolume %s: last=%v", volName, last)
+		}
+		return nil, errors.Wrapf(err, "waitStorageVolume %s", volName)
+	}
+	return found, nil
+}
+
+// DeleteStorageVolume is DELETE /cas/casrs/storage/volume/delete/{hostId}/
+// {poolName}/{volName}. isWipeVolume is always sent as false: the volume
+// file is removed, but its blocks are not zeroed.
+func (cli *SCasClient) DeleteStorageVolume(hostId int64, poolName, volName string) error {
+	params := url.Values{}
+	params.Set("isWipeVolume", "false")
+	res := fmt.Sprintf("storage/volume/delete/%d/%s/%s", hostId, url.PathEscape(poolName), url.PathEscape(volName))
+	resp, err := cli.request(httputils.DELETE, res, params, nil)
+	if err != nil {
+		if errors.Cause(err) == ErrEmptyBody {
+			return nil // 204, as documented
+		}
+		return err
+	}
+	return cli.waitAck(resp, "DELETE "+res)
+}
 
 // waitAck waits on an RsTaskMsg body if the response is one; any other
 // non-empty body is accepted as a synchronous success.

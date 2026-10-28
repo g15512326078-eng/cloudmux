@@ -27,6 +27,9 @@
 //     transport error, failed task) names any VM it may have created
 //     instead of retrying or adopting it.
 //
+//   - Disks and snapshots: create/attach/detach data disks (detach keeps
+//     the volume), VM snapshots create/revert/delete.
+//
 // Storagecache.UploadImage (cloudpods image upload) is not implemented.
 //
 // Every CAS request is bounded (10s dial, 10s TLS handshake, 30s response
