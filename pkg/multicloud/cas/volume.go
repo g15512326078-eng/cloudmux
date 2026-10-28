@@ -112,6 +112,22 @@ func (cli *SCasClient) GetStorageVolume(hostId int64, poolName, volName string) 
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "volume %s in pool %s on host %d", volName, poolName, hostId)
 }
 
+const VOLUME_MODE_THIN = 2
+
+// waitAck waits on an RsTaskMsg body if the response is one; any other
+// non-empty body is accepted as a synchronous success.
+func (cli *SCasClient) waitAck(resp jsonutils.JSONObject, what string) error {
+	ack, err := parseTaskMsg(resp)
+	if err != nil || ack.MsgId == 0 || ack.MsgId == MSG_ID_NO_TASK {
+		return nil
+	}
+	if ack.MsgId < 0 {
+		return errors.Errorf("%s returned msgId %d", what, ack.MsgId)
+	}
+	_, err = cli.waitTask(ack.MsgId)
+	return err
+}
+
 // diskId builds the stable external id of a volume: the storage global id
 // plus the file name, e.g. "host/1/defaultpool/vm1-data.qcow2" or
 // "hostpool/1/share1/data1". It does not change on attach/detach.

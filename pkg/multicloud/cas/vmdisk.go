@@ -16,9 +16,77 @@ package cas
 
 import (
 	"context"
+	"fmt"
+	"path"
+
+	"yunion.io/x/jsonutils"
+	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 )
+
+// SVmAddStorage is StorageConfigADD in PUT /cas/casrs/vm/addDevice.
+type SVmAddStorage struct {
+	Device     string `json:"device"` // disk
+	DeviceName string `json:"deviceName,omitempty"`
+	TargetBus  string `json:"targetBus"`
+	FileType   string `json:"fileType"` // file
+	CacheType  string `json:"cacheType"`
+	Format     string `json:"format,omitempty"`
+	// PathType 0: existing file (Path); 2: new file (PoolName, FileName, Size).
+	PathType int    `json:"pathType"`
+	Path     string `json:"path,omitempty"`
+	PoolName string `json:"poolName,omitempty"`
+	FileName string `json:"fileName,omitempty"`
+	Size     int64  `json:"size,omitempty"` // MB
+	Mode     int    `json:"mode,omitempty"` // preallocation, 2 = thin
+}
+
+type SVmAddDeviceBody struct {
+	Id      int64         `json:"id"`
+	Storage SVmAddStorage `json:"storage"`
+}
+
+// SVmDelStorage is StorageConfigDEL in PUT /cas/casrs/vm/delDevice. The
+// schema has only deviceName and path: there is no "delete the volume"
+// flag, so delDevice unplugs the disk and leaves its file in the pool.
+type SVmDelStorage struct {
+	DeviceName string `json:"deviceName"`
+	Path       string `json:"path,omitempty"`
+}
+
+type SVmDelDeviceBody struct {
+	Id      int64         `json:"id"`
+	Storage SVmDelStorage `json:"storage"`
+}
+
+const (
+	ADD_DEVICE_PATH_EXISTING_FILE = 0
+	ADD_DEVICE_PATH_NEW_FILE      = 2
+
+	DEFAULT_DISK_BUS   = "virtio"
+	DEFAULT_DISK_CACHE = "directsync" // cache mode observed on CAS attach
+)
+
+// diskBus reuses the bus of the VM's first disk so the guest has a driver
+// for it; virtio when the VM has no disk.
+func (self *SInstance) diskBus() string {
+	disks, err := self.getDisks()
+	if err == nil && len(disks) > 0 && len(disks[0].TargetBus) > 0 {
+		return disks[0].TargetBus
+	}
+	return DEFAULT_DISK_BUS
+}
+
+func (self *SInstance) addDevice(storage SVmAddStorage) error {
+	body := SVmAddDeviceBody{Id: self.Id, Storage: storage}
+	if _, err := self.region.cli.doAsync(httputils.PUT, "vm/addDevice", nil, jsonutils.Marshal(body)); err != nil {
+		return errors.Wrapf(err, "vm/addDevice")
+	}
+	// re-read without the per-sync cache so callers see the new disk
+	return self.Refresh()
+}
 
 // AttachDisk is not supported yet.
 func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
@@ -28,4 +96,28 @@ func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
 // DetachDisk is not supported yet.
 func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
 	return cloudprovider.ErrNotImplemented
+}
+
+// createDataDisk adds a new thin qcow2 file of sizeMB to the VM in one
+// PUT /vm/addDevice call (pathType 2 = new file in poolName).
+func (self *SInstance) createDataDisk(poolName, fileName string, sizeMB int64) error {
+	if sizeMB <= 0 {
+		return errors.Wrapf(cloudprovider.ErrInputParameter, "data disk size %d MB", sizeMB)
+	}
+	return self.addDevice(SVmAddStorage{
+		Device:    "disk",
+		TargetBus: self.diskBus(),
+		FileType:  "file",
+		CacheType: DEFAULT_DISK_CACHE,
+		Format:    "qcow2",
+		PathType:  ADD_DEVICE_PATH_NEW_FILE,
+		PoolName:  poolName,
+		FileName:  fileName,
+		Size:      sizeMB,
+		Mode:      VOLUME_MODE_THIN,
+	})
+}
+
+func dataDiskFileName(vmName string, idx int) string {
+	return path.Base(fmt.Sprintf("%s-data%d", vmName, idx))
 }

@@ -203,6 +203,8 @@ func (self *SHost) GetVersion() string {
 	return ""
 }
 
+// CreateVM is implemented in deploy.go (POST vm/deploy + waitTask).
+
 // getWires returns one wire per distinct vswitch name on the host, in the
 // host's pool. vpcs shares VPC objects between hosts (may be nil).
 func (self *SHost) getWires(vpcs map[string]*SVpc) ([]*SWire, error) {
@@ -304,9 +306,4 @@ func (self *SHost) GetIVMById(id string) (cloudprovider.ICloudVM, error) {
 	vm.region = self.zone.region
 	vm.host = self
 	return vm, nil
-}
-
-// CreateVM is not supported yet.
-func (self *SHost) CreateVM(opts *cloudprovider.SManagedVMCreateConfig) (cloudprovider.ICloudVM, error) {
-	return nil, cloudprovider.ErrNotImplemented
 }
