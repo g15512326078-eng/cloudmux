@@ -245,6 +245,10 @@ func TestWaitLoopsCancelDuringPoll(t *testing.T) {
 	defer srv.Close()
 	for name, fn := range map[string]func(*SCasClient) error{
 		"waitVMNotLive": func(c *SCasClient) error { return c.waitVMNotLive("u1") },
+		"waitStorageVolume": func(c *SCasClient) error {
+			_, err := c.waitStorageVolume(1, "pool", "vol")
+			return err
+		},
 	} {
 		cli := timeoutClient(srv.URL, sClientTimeouts{})
 		cli.taskPollInterval, cli.taskTimeout = 10*time.Millisecond, time.Minute
