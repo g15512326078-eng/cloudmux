@@ -244,3 +244,25 @@ func iterResources[T cloudprovider.ICloudResource](
 // func HostR[T IHostBaseOptions](opts T, command string, desc string, cb func(cloudprovider.ICloudHost, T) error) {
 // 	hostR(opts, command, desc, true, cb)
 // }
+
+// OfflineFixtureOptions is implemented by subcommand options that support an
+// offline --fixture run (currently only instance-idle-list).
+type OfflineFixtureOptions interface {
+	OfflineFixturePath() string
+}
+
+// WantsOfflineFixture reports whether the parsed options of the selected
+// subcommand request an offline --fixture run (no cloud credentials). Only
+// that subcommand's own parsed flag counts; other argv tokens are ignored.
+func WantsOfflineFixture(suboptions interface{}) bool {
+	o, ok := suboptions.(OfflineFixtureOptions)
+	return ok && len(o.OfflineFixturePath()) > 0
+}
+
+type offlineProvider struct{}
+
+// NewOfflineProvider is a no-op ICloudProvider wrapper for --fixture runs.
+func NewOfflineProvider() ICloudProvider { return offlineProvider{} }
+
+func (offlineProvider) GetProvider() cloudprovider.ICloudProvider { return nil }
+func (offlineProvider) GetDefaultRegionId() string                { return "" }
