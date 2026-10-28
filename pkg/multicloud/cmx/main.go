@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"os"
 
+	_ "time/tzdata"
+
 	"yunion.io/x/pkg/errors"
 	"yunion.io/x/structarg"
 

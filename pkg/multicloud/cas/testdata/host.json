@@ -1,0 +1,15 @@
+{
+  "host": [
+    {
+      "clusterId": 1,
+      "enableBackupNetwork": false,
+      "enableStorNode": false,
+      "hostType": 16,
+      "id": 1,
+      "ip": "10.125.35.186",
+      "name": "cvknode186",
+      "status": 1,
+      "type": "kvm"
+    }
+  ]
+}

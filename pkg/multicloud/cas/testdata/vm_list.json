@@ -1,0 +1,53 @@
+{
+  "domain": [
+    {
+      "antivirusEnable": 0,
+      "autoMem": 0,
+      "castoolsStatus": 1,
+      "castoolsVersion": "7.1.0.0",
+      "clusterId": 1,
+      "computerName": "lada",
+      "cpu": 2,
+      "cpuRate": 0.1,
+      "createDate": "2020-10-29T22:54:10+08:00",
+      "delTime": "",
+      "deployed": false,
+      "description": "ll",
+      "destroyTime": "2020-10-29T14:54:10",
+      "diskDetail": "adad",
+      "diskInfo": "ada",
+      "enable": 1,
+      "flag": 1,
+      "haManage": 1,
+      "haStatus": 0,
+      "hostHaEnable": 0,
+      "hostId": 1,
+      "hostName": "cvknode186",
+      "hostPoolId": 1,
+      "hoststatus": 0,
+      "id": 9,
+      "ipv4Attribute": {
+        "ipv4": {
+          "ipAddress": "10.125.32.31",
+          "mask": "255.255.252.0"
+        },
+        "mac": "0c:da:41:1d:44:13"
+      },
+      "kernelType": 1,
+      "memRate": 54.2880833333333,
+      "memory": 4096,
+      "name": "win7-ipv6",
+      "originate": 0,
+      "osDesc": "Windows 7 Ultimate, 64-bit",
+      "protectModel": 0,
+      "system": 0,
+      "templateId": 8,
+      "title": "win7-ipv6",
+      "type": 0,
+      "uptime": 1452,
+      "uuid": "3a07b70f-085a-4558-ab22-fd1db6bcb4f3",
+      "vmStatus": "running",
+      "vmType": 1
+    }
+  ]
+}

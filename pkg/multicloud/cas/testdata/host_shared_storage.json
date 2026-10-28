@@ -1,0 +1,14 @@
+{
+  "storagePool": [
+    {
+      "autoStart": false,
+      "freeSize": 923190,
+      "name": "share2",
+      "path": "/vms/share2",
+      "symbolic": false,
+      "title": "share2",
+      "totalSize": 1048576,
+      "type": "fs"
+    }
+  ]
+}

@@ -27,6 +27,7 @@ import (
 	"yunion.io/x/pkg/util/printutils"
 	"yunion.io/x/pkg/util/shellutils"
 
+	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
 	"yunion.io/x/cloudmux/pkg/cloudprovider/generic"
 )
@@ -73,8 +74,13 @@ func NewCloudProvider(opt *GlobalOptions) (ICloudProvider, error) {
 		return nil, errors.Wrapf(err, "GetProviderFactory")
 	}
 
+	accessUrl := opt.CloudEnv
+	if opt.Provider == api.CLOUD_PROVIDER_CAS {
+		accessUrl = opt.CasUrl
+	}
+
 	p, err := factory.GetProvider(cloudprovider.ProviderConfig{
-		URL:       opt.CloudEnv,
+		URL:       accessUrl,
 		Account:   opt.AccessKey,
 		Secret:    opt.Secret,
 		ProxyFunc: proxyFunc,

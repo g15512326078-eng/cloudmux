@@ -1,0 +1,11 @@
+{
+  "hostPool": [
+    {
+      "childNum": 3,
+      "id": 1,
+      "name": "hostpool1",
+      "operatorGroupCode": "11",
+      "operatorGroupId": 1
+    }
+  ]
+}
