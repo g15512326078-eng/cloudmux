@@ -201,9 +201,47 @@ func (self *SStorage) IsSysDiskStore() bool {
 	return true
 }
 
-// CreateIDisk is not supported yet.
+// CreateIDisk creates an empty qcow2 volume in this pool with
+// POST /cas/casrs/storage/volume (capacity MB, thin provisioned) and returns
+// it unattached. The file name is conf.Name plus ".qcow2"; an existing file
+// of that name is an error, never reused or overwritten.
 func (self *SStorage) CreateIDisk(conf *cloudprovider.DiskCreateConfig) (cloudprovider.ICloudDisk, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	if conf == nil || len(conf.Name) == 0 || conf.SizeGb <= 0 {
+		return nil, errors.Wrap(cloudprovider.ErrInputParameter, "name and positive SizeGb are required")
+	}
+	if len(conf.SnapshotId) > 0 || len(conf.ImageId) > 0 {
+		return nil, errors.Wrap(cloudprovider.ErrNotSupported, "CAS CreateIDisk from snapshot or image")
+	}
+	volName := conf.Name
+	if strings.ContainsAny(volName, "/\\") {
+		return nil, errors.Wrapf(cloudprovider.ErrInputParameter, "disk name %q must not contain a path separator", volName)
+	}
+	if !strings.HasSuffix(volName, ".qcow2") {
+		volName += ".qcow2"
+	}
+	cli := self.host.zone.region.cli
+	if _, err := cli.GetStorageVolume(self.host.Id, self.Name, volName); err == nil {
+		return nil, errors.Wrapf(cloudprovider.ErrDuplicateId, "volume %s already exists in pool %s", volName, self.Name)
+	} else if errors.Cause(err) != cloudprovider.ErrNotFound {
+		return nil, errors.Wrapf(err, "GetStorageVolume")
+	}
+	body := &SStorageVolumeCreate{
+		HostId:   self.host.Id,
+		SpName:   self.Name,
+		VolName:  volName,
+		Capacity: int64(conf.SizeGb) * 1024,
+		Format:   "qcow2",
+		Mode:     VOLUME_MODE_THIN,
+	}
+	if err := cli.CreateStorageVolume(body); err != nil {
+		return nil, errors.Wrapf(err, "CreateStorageVolume %s", volName)
+	}
+	vol, err := cli.waitStorageVolume(self.host.Id, self.Name, volName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "waitStorageVolume %s after create", volName)
+	}
+	disk := volumeDisk(self, vol)
+	return &disk, nil
 }
 
 // contains reports whether a volume path lives in this pool.

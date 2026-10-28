@@ -20,7 +20,9 @@ import (
 	"path"
 	"strings"
 
+	"yunion.io/x/jsonutils"
 	"yunion.io/x/pkg/errors"
+	"yunion.io/x/pkg/util/httputils"
 
 	api "yunion.io/x/cloudmux/pkg/apis/compute"
 	"yunion.io/x/cloudmux/pkg/cloudprovider"
@@ -187,21 +189,104 @@ func (self *SDisk) GetAccessPath() string {
 	return self.Path
 }
 
-// Delete is not supported yet.
-func (self *SDisk) Delete(ctx context.Context) error { return cloudprovider.ErrNotImplemented }
+// Delete removes an unattached volume file with
+// DELETE storage/volume/delete/{hostId}/{pool}/{vol}?isWipeVolume=false.
+// It refuses a disk attached to a VM (detach it first) and re-reads the
+// volume first so a volume attached since the last sync is not removed.
+// The file is deleted but not wiped.
+func (self *SDisk) Delete(ctx context.Context) error {
+	if self.ins != nil {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "disk %s is attached to vm %s; detach it before deleting", self.GetGlobalId(), self.ins.GetName())
+	}
+	storage, err := self.getStorage()
+	if err != nil {
+		return err
+	}
+	cli := storage.host.zone.region.cli.WithContext(ctx)
+	volName := path.Base(self.Path)
+	vol, err := cli.GetStorageVolume(storage.host.Id, storage.Name, volName)
+	if err != nil {
+		if errors.Cause(err) == cloudprovider.ErrNotFound {
+			return nil
+		}
+		return errors.Wrapf(err, "GetStorageVolume")
+	}
+	if vol.isAttached() {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "volume %s is used by %s", volName, vol.Users)
+	}
+	return cli.DeleteStorageVolume(storage.host.Id, storage.Name, volName)
+}
 
-// CreateISnapshot is not supported yet.
+// CAS snapshots are whole-VM (POST /vm/snapshot); there is no per-disk
+// snapshot API, so disk snapshots are not offered. See snapshot.go for the
+// instance-snapshot implementation.
 func (self *SDisk) CreateISnapshot(ctx context.Context, name string, desc string) (cloudprovider.ICloudSnapshot, error) {
-	return nil, cloudprovider.ErrNotImplemented
+	return nil, errors.Wrap(cloudprovider.ErrNotSupported, "CAS has VM snapshots only; use instance snapshots")
 }
 
 func (self *SDisk) GetISnapshots() ([]cloudprovider.ICloudSnapshot, error) {
 	return []cloudprovider.ICloudSnapshot{}, nil
 }
 
-// Resize is not supported yet.
+// SVmModifyStorage is VMModifyStorageConfig in the body of PUT /vm/modify.
+type SVmModifyStorage struct {
+	Device     string `json:"device"`
+	DeviceName string `json:"deviceName"`
+	Format     string `json:"format"`
+	Size       int64  `json:"size"` // MB, like vm/detail storage[].size
+	CacheType  string `json:"cacheType"`
+}
+
+type SVmModifyStorageBody struct {
+	Id      int64            `json:"id"`
+	Storage SVmModifyStorage `json:"storage"`
+}
+
+// Resize grows an attached disk with PUT /cas/casrs/vm/modify
+// (RsDomainModifyBasic.storage: device, format, size, cacheType are
+// required), waits for the task, then re-reads the VM detail and fails if
+// the disk did not reach the new size. It never shrinks: a smaller size
+// is rejected, the same size is a no-op. An unattached volume cannot be
+// resized (no non-cinder API for that).
 func (self *SDisk) Resize(ctx context.Context, newSizeMB int64) error {
-	return cloudprovider.ErrNotImplemented
+	if self.ins == nil {
+		return errors.Wrap(cloudprovider.ErrNotSupported, "resize of an unattached CAS volume; attach it to a VM first")
+	}
+	if newSizeMB < self.Size {
+		return errors.Wrapf(cloudprovider.ErrInputParameter, "shrinking disk %s from %d MB to %d MB is not allowed", self.DeviceName, self.Size, newSizeMB)
+	}
+	if newSizeMB == self.Size {
+		return nil
+	}
+	cli := self.ins.region.cli.WithContext(ctx)
+	body := SVmModifyStorageBody{
+		Id: self.ins.Id,
+		Storage: SVmModifyStorage{
+			Device:     "disk",
+			DeviceName: self.DeviceName,
+			Format:     self.Format,
+			Size:       newSizeMB,
+			CacheType:  self.CacheType,
+		},
+	}
+	if _, err := cli.doAsync(httputils.PUT, "vm/modify", nil, jsonutils.Marshal(body)); err != nil {
+		return errors.Wrapf(err, "vm/modify resize %s", self.DeviceName)
+	}
+	detail, err := cli.GetInstanceDetail(self.ins.Id)
+	if err != nil {
+		return errors.Wrapf(err, "GetInstanceDetail after resize")
+	}
+	for i := range detail.disks {
+		if detail.disks[i].DeviceName == self.DeviceName {
+			if detail.disks[i].Size < newSizeMB {
+				return errors.Errorf("disk %s is %d MB after resize, want %d MB", self.DeviceName, detail.disks[i].Size, newSizeMB)
+			}
+			self.Size = detail.disks[i].Size
+			self.ins.detail = detail
+			return nil
+		}
+	}
+	return errors.Errorf("disk %s missing from vm %s after resize", self.DeviceName, self.ins.GetName())
 }
 
 func (self *SDisk) Reset(ctx context.Context, snapshotId string) (string, error) {

@@ -88,14 +88,97 @@ func (self *SInstance) addDevice(storage SVmAddStorage) error {
 	return self.Refresh()
 }
 
-// AttachDisk is not supported yet.
-func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
-	return cloudprovider.ErrNotImplemented
+// resolveVolume finds the pool and volume a diskId names, as seen from
+// this VM's host: a local pool must be on the VM's host, a shared pool in
+// the VM's host pool.
+func (self *SInstance) resolveVolume(diskId string) (*SStorage, *SStorageVolume, error) {
+	storageId, volName, err := parseDiskId(diskId)
+	if err != nil {
+		return nil, nil, err
+	}
+	host, err := self.getHost()
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "getHost")
+	}
+	storages, err := host.getStorages()
+	if err != nil {
+		return nil, nil, errors.Wrapf(err, "getStorages")
+	}
+	var storage *SStorage
+	for i := range storages {
+		if storages[i].GetGlobalId() == storageId {
+			storage = &storages[i]
+			break
+		}
+	}
+	if storage == nil {
+		return nil, nil, errors.Wrapf(cloudprovider.ErrNotFound, "storage %s is not reachable from host %s of vm %s", storageId, host.Name, self.GetName())
+	}
+	vol, err := self.region.cli.GetStorageVolume(host.Id, storage.Name, volName)
+	if err != nil {
+		return nil, nil, err
+	}
+	return storage, vol, nil
 }
 
-// DetachDisk is not supported yet.
+// AttachDisk plugs an existing volume (diskId from CreateIDisk / a pool
+// listing) into the VM with PUT /vm/addDevice (pathType 0 = existing
+// file) and waits for the task. Attaching a disk the VM already has is a
+// no-op; a volume used by another VM is refused.
+func (self *SInstance) AttachDisk(ctx context.Context, diskId string) error {
+	storage, vol, err := self.resolveVolume(diskId)
+	if err != nil {
+		return err
+	}
+	if err := self.Refresh(); err != nil {
+		return err
+	}
+	volPath := volumePath(storage, vol.Name)
+	if vmHasDiskPath(self, volPath) {
+		return nil
+	}
+	if vol.isAttached() {
+		return errors.Wrapf(cloudprovider.ErrInvalidStatus, "volume %s is already used by %s", vol.Name, vol.Users)
+	}
+	if !vol.isDataVolume() {
+		return errors.Wrapf(cloudprovider.ErrInputParameter, "volume %s (format %s, level %d) is not a data disk", vol.Name, vol.Format, vol.Level)
+	}
+	return self.addDevice(SVmAddStorage{
+		Device:    "disk",
+		TargetBus: self.diskBus(),
+		FileType:  "file",
+		CacheType: DEFAULT_DISK_CACHE,
+		Format:    vol.Format,
+		PathType:  ADD_DEVICE_PATH_EXISTING_FILE,
+		Path:      volPath,
+	})
+}
+
+// DetachDisk unplugs a data disk with PUT /vm/delDevice and waits for the
+// task. The volume file is kept (delDevice has no delete option). A disk
+// the VM does not have is a no-op; the system disk is refused.
 func (self *SInstance) DetachDisk(ctx context.Context, diskId string) error {
-	return cloudprovider.ErrNotImplemented
+	if err := self.Refresh(); err != nil {
+		return err
+	}
+	disks, err := self.getDisks()
+	if err != nil {
+		return err
+	}
+	for i := range disks {
+		if disks[i].GetGlobalId() != diskId {
+			continue
+		}
+		if disks[i].index == 0 {
+			return errors.Wrapf(cloudprovider.ErrNotSupported, "detaching the system disk %s", disks[i].DeviceName)
+		}
+		body := SVmDelDeviceBody{Id: self.Id, Storage: SVmDelStorage{DeviceName: disks[i].DeviceName, Path: disks[i].Path}}
+		if _, err := self.region.cli.WithContext(ctx).doAsync(httputils.PUT, "vm/delDevice", nil, jsonutils.Marshal(body)); err != nil {
+			return errors.Wrapf(err, "vm/delDevice %s", disks[i].DeviceName)
+		}
+		return self.Refresh()
+	}
+	return nil
 }
 
 // createDataDisk adds a new thin qcow2 file of sizeMB to the VM in one
