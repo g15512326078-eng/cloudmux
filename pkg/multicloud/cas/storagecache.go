@@ -86,7 +86,6 @@ func (self *SStoragecache) GetIImageById(id string) (cloudprovider.ICloudImage, 
 	return nil, errors.Wrapf(cloudprovider.ErrNotFound, "template %s", id)
 }
 
-// UploadImage is not supported yet.
 func (self *SStoragecache) UploadImage(ctx context.Context, opts *cloudprovider.SImageCreateOption, callback func(float32)) (string, error) {
-	return "", cloudprovider.ErrNotImplemented
+	return "", errors.Wrap(cloudprovider.ErrNotImplemented, "UploadImage")
 }
