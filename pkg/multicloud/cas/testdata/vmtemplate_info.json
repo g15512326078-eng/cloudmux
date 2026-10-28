@@ -1,0 +1,17 @@
+{
+  "cpuCores": 1,
+  "cpuMax": 1,
+  "cpuSockets": 1,
+  "createDate": "2020-10-29T19:57:17+08:00",
+  "deployed": true,
+  "description": "desc",
+  "id": 4,
+  "memory": 1024,
+  "memoryInit": 1,
+  "memoryUnit": "GB",
+  "name": "tmpName",
+  "storageCapacity": 1024,
+  "system": 0,
+  "title": "tmpName",
+  "vmType": 0
+}

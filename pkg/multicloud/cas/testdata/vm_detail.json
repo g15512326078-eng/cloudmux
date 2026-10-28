@@ -1,0 +1,219 @@
+{
+  "advance": {
+    "enableAntivirus": false,
+    "redirUsb": 1,
+    "spiceChannels": [],
+    "spiceSet": false,
+    "spiceTls": false
+  },
+  "basic": {
+    "acpi": 1,
+    "apic": 1,
+    "architecture": "X86_64",
+    "autoMem": 0,
+    "autoMigrate": 0,
+    "autoTools": true,
+    "blkiotune": 300,
+    "castoolStatus": 0,
+    "clock": "utc",
+    "controller": [
+      1
+    ],
+    "desc": "new",
+    "emulator": "/usr/bin/kvm",
+    "haManage": 1,
+    "manager": "kvm",
+    "osVersion": "Red Hat Enterprise Linux 8(64-bit)",
+    "osha": 0,
+    "pae": 1,
+    "runTime": -1,
+    "startPriority": 0,
+    "system": 1,
+    "timeSync": 0
+  },
+  "bootDev": {
+    "autoStart": 0
+  },
+  "cpu": {
+    "bindcpu": [
+      {
+        "pcpu": [
+          0,
+          1,
+          2
+        ],
+        "vcpu": 0
+      }
+    ],
+    "cpuArch": "x86_64",
+    "cpuCores": 1,
+    "cpuGurantee": 0,
+    "cpuMaxRate": 2200,
+    "cpuMinRate": 10,
+    "cpuMode": "custom",
+    "cpuQuota": 2.2,
+    "cpuQuotaUnit": "GHz",
+    "cpuShares": 512,
+    "cpuSockets": 8,
+    "maxCpuNum": 40
+  },
+  "gpu": [
+    {
+      "bus": "0000:05:00.0",
+      "framebuffer": "512M",
+      "heads": 2,
+      "maxInstance": 16,
+      "maxResolution": "2560x1600",
+      "name": "GRID M60-0Q",
+      "producers": "NVIDIA",
+      "type": "nvidia-12",
+      "uuid": "c2177883-f1bb-47f0-914d-32a22e3a8804"
+    }
+  ],
+  "graphics": [
+    {
+      "address": "0.0.0.0",
+      "kayboardMap": "-",
+      "password": "******",
+      "port": 5908,
+      "type": "vnc"
+    }
+  ],
+  "id": 4,
+  "input": [
+    {
+      "bus": "usb",
+      "model": "absolute",
+      "type": "tablet"
+    }
+  ],
+  "memory": {
+    "autoMem": 0,
+    "hostMemory": 128554,
+    "hugepage": false,
+    "maxMemory": 65536,
+    "memoryBacking": 0,
+    "memoryInit": 4.0,
+    "memoryLimit": 2.0,
+    "memoryLimitUnit": "GB",
+    "memoryPriority": 0,
+    "memoryUnit": "GB",
+    "size": 4096
+  },
+  "name": "test",
+  "network": [
+    {
+      "bindIp": true,
+      "bindIpv6": true,
+      "deviceModel": "virtio",
+      "dns": "114.144.144.144",
+      "ethName": "eth0",
+      "gateway": "10.10.10.1",
+      "ipAddr": "10.10.10.1",
+      "ipv4Dhcp": false,
+      "ipv6": "11:33:33::4",
+      "ipv6Dhcp": false,
+      "ipv6Dns": "11:33:33::1",
+      "ipv6Gateway": "11:33:33::45",
+      "ipv6Mode": "",
+      "ipv6PrefixLength": 96,
+      "ipv6SecondDns": "11:33:33::2",
+      "isKernelAccelerated": 1,
+      "location": "",
+      "mac": "0c:da:41:1d:19:d0",
+      "maskAddr": "255.255.255.0",
+      "netType": 0,
+      "netUUID": "3bbe092b-fad3-4203-87ed-d539e85b98d8",
+      "portgroupUUID": "3bbe092b-fad3-4203-87ed-d539e85b98d8",
+      "profileId": 1,
+      "profileName": "Default",
+      "secondDns": "4.4.4.4",
+      "tcpCheckSum": true,
+      "vlan": 1,
+      "vlanType": 1,
+      "vsId": 1,
+      "vsMode": 0,
+      "vsName": "vswitch0"
+    }
+  ],
+  "numa": {
+    "nodeSet": "numa1",
+    "nodeSize": 10
+  },
+  "pci": [
+    {
+      "bus": 3,
+      "devName": "pci_0000_03_00_2",
+      "driver": "VFIO",
+      "ethName": "eth2",
+      "function": 2,
+      "product": "NetXtreme BCM5719 Gigabit Ethernet PCIe",
+      "productId": "0x1657",
+      "slot": 0,
+      "vendor": "Intel Corporation",
+      "vendorId": "0x14e4"
+    }
+  ],
+  "serial": [
+    {
+      "devPath": "/",
+      "mode": "",
+      "monitor": false,
+      "port": 0,
+      "type": "dev"
+    }
+  ],
+  "soundType": "ac97",
+  "status": "shutOff",
+  "storage": [
+    {
+      "allocation": 1,
+      "backingFile": "/vms/images/aa",
+      "cacheType": "directsync",
+      "clusterSize": 262144,
+      "device": "disk",
+      "deviceName": "vda",
+      "fileType": "file",
+      "format": "qcow2",
+      "isShareStorage": true,
+      "maxSize": 994485,
+      "mode": 0,
+      "path": "/vms/images/aa_inc_1",
+      "readBytesSec": 13,
+      "readIopsSec": 13,
+      "size": 81920,
+      "snapShot": 1,
+      "targetBus": "ide",
+      "writeBytesSec": 13,
+      "writeIopsSec": 13
+    }
+  ],
+  "title": "test",
+  "tpm": {},
+  "uptime": -1,
+  "usb": [
+    {
+      "bus": 2,
+      "controller": 2,
+      "devName": "usb_usb3",
+      "device": 1,
+      "product": "2.0 root hub",
+      "productId": 2,
+      "vendor": "Linux Foundation",
+      "vendorId": 7531
+    }
+  ],
+  "uuid": "de37a558-443e-4e93-9eb1-6d12d5abbfa6",
+  "video": [
+    {
+      "pciView": "0000.00.02.0",
+      "type": "vga",
+      "vgamem": 11,
+      "vram": 1
+    }
+  ],
+  "videoType": [
+    "qxl",
+    "qxl"
+  ]
+}

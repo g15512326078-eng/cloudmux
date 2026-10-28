@@ -1,0 +1,28 @@
+{
+  "domain": [
+    {
+      "antivirusEnable": 0,
+      "autoMem": 0,
+      "castoolsStatus": 0,
+      "cpu": 1,
+      "createDate": "2020-11-03T14:43:34+08:00",
+      "deployed": false,
+      "description": "fafa",
+      "hostHaEnable": 1,
+      "hoststatus": 0,
+      "id": 1,
+      "memory": 4096,
+      "memoryFormat": "2.00GB",
+      "memoryInit": 4.0,
+      "memoryUnit": "GB",
+      "name": "sdfsdf",
+      "originate": 0,
+      "osVersion": "Microsoft Windows Server 2019(64-bit)",
+      "storageCapacity": 1024,
+      "storageCapacityFormat": "4.00GB",
+      "system": 0,
+      "templetStoragePath": "/vms/template",
+      "uptime": 0
+    }
+  ]
+}

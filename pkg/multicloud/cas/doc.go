@@ -1,0 +1,58 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package cas implements a cloudmux provider for H3C CAS (CVM/CVK)
+// virtualization, talking to the CAS REST API under
+// {AccessUrl}/cas/casrs/ with HTTP Digest authentication.
+//
+// Current scope:
+//
+//   - Read sync: host pools/clusters as zones, hosts, storage pools,
+//     vswitch-based networks, VMs with disks/NICs, VM templates as images.
+//
+// Storagecache.UploadImage (cloudpods image upload) is not implemented.
+//
+// Every CAS request is bounded (10s dial, 10s TLS handshake, 30s response
+// header, 5 min per request; the probe 30s) and follows the ctx of the
+// cloudpods call; task waits keep their own overall deadline.
+//
+// A read-only cloud account (ProviderConfig.ReadOnly) is enforced in the
+// HTTP transport: every request other than GET/HEAD fails with
+// ErrAccountReadOnly before it is sent.
+//
+// Provenance: request and response shapes follow the CAS REST API
+// reference (api.yaml). Where it is silent or incomplete, the behaviour
+// was observed in the CAS web console's own API traffic against a CAS
+// installation; such points are marked "observed" in the code and are
+// UNVERIFIED across CAS versions. They include:
+//
+//   - the legacy charset of the Error-Message header (decodeErrorMessage).
+//
+// This is not the H3C public/CloudOS provider (pkg/multicloud/h3c) and has
+// nothing to do with the Keystone CAS SSO driver.
+package cas // import "yunion.io/x/cloudmux/pkg/multicloud/cas"

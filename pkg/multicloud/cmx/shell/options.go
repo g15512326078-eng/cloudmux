@@ -18,11 +18,12 @@ type GlobalOptions struct {
 	Debug      bool   `help:"Debug mode"`
 	SUBCOMMAND string `help:"Cloudmux client subcommand" subcommand:"true"`
 
-	Provider string `help:"Cloud provider" required:"true" choices:"Aliyun|Aws|Azure|Qcloud"`
+	Provider string `help:"Cloud provider" required:"true" choices:"Aliyun|Aws|Azure|Qcloud|CAS"`
 
 	CloudEnv  string `help:"Cloud environment" default:"$CLOUDMUX_CLOUD_ENV" choices:"InternationalCloud|FinanceCloud|ChinaCloud|AzureGermanCloud|AzureChinaCloud|AzureUSGovernmentCloud|AzurePublicCloud" metavar:"CLOUDMUX_CLOUD_ENV"`
 	AccessKey string `help:"Access key" default:"$CLOUDMUX_ACCESS_KEY" metavar:"CLOUDMUX_ACCESS_KEY"`
 	Secret    string `help:"Secret" default:"$CLOUDMUX_SECRET" metavar:"CLOUDMUX_SECRET"`
+	CasUrl    string `help:"CAS access URL, e.g. http://cas.example.com:8080 (used only with --provider CAS)" default:"$CLOUDMUX_CAS_URL" metavar:"CLOUDMUX_CAS_URL"`
 	Region    string `help:"Default region" default:"$CLOUDMUX_REGION" metavar:"CLOUDMUX_REGION" short-token:"r"`
 }
 
