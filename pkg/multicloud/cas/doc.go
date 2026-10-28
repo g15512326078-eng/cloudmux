@@ -49,7 +49,30 @@
 //     (refused unless the current storages can be sent back unchanged),
 //     delete (refused while fast-deployed or referenced by any VM).
 //
-// Storagecache.UploadImage (cloudpods image upload) is not implemented.
+//   - Image import: a qcow2 cloud image already in a file pool (or copied
+//     there over SSH, or pulled by CAS over HTTP, when explicitly
+//     configured) becomes a template via a
+//     qcow2 overlay, a never-booted temporary VM and addVmTemplate opType=1
+//     (imageimport.go, cmx image-import-template). The import fails if
+//     the new template's disk still has a backing file, or if that cannot
+//     be checked. The upload step is pluggable (ImportSourceStager). The
+//     SSH stager (sshupload.go) is only compiled with -tags cas_ssh, so the
+//     default build does not link golang.org/x/crypto/ssh (x/crypto
+//     v0.19.0 has open advisories; the newest release usable on go 1.24
+//     does not fix them). Without the tag cmx --ssh-upload fails and says
+//     to rebuild with -tags cas_ssh. The HTTP stager (httpupload.go,
+//     always built) serves the file from a one-run Glance V1 stub
+//     (GET /v1/images/<uuid>, random x-auth-token) only while it runs, has
+//     CAS pull it with POST nova/download (PUT cinder/download only on a
+//     404) into /vms/nova/<uuid>, then cinder/volume/createFromImage copies
+//     it into the pool. Dry-run and read-only accounts never start the stub.
+//     The stub refuses a wildcard bind (0.0.0.0, ::, empty host) unless
+//     AllowAnyAddr (cmx --serve-any-addr) is set, caps connections and
+//     stalled writes, and stops at once when Context is cancelled (cmx:
+//     Ctrl-C); cleanup then follows the usual keep-on-ambiguity rules.
+//
+// Storagecache.UploadImage (cloudpods image upload) and template storage
+// pool management are not implemented.
 //
 // Every CAS request is bounded (10s dial, 10s TLS handshake, 30s response
 // header, 5 min per request; the probe 30s) and follows the ctx of the
@@ -68,7 +91,12 @@
 //
 //   - the legacy charset of the Error-Message header (decodeErrorMessage);
 //   - task polling: msgId -1 for writes that finish inline, a brief 403
-//     while the Digest nonce rolls over, and message keyValue context.
+//     while the Digest nonce rolls over, and message keyValue context;
+//   - POST nova/download (body shape; not in api.yaml) and
+//     DELETE nova/image/<uuid> (not in api.yaml), the extra
+//     nova/image/ifExists results 1 (present) and 2 (downloading), and
+//     the PUT cinder/download fallback and cinder/volume/createFromImage
+//     use beyond their api.yaml schema (httpupload.go).
 //
 // This is not the H3C public/CloudOS provider (pkg/multicloud/h3c) and has
 // nothing to do with the Keystone CAS SSO driver.

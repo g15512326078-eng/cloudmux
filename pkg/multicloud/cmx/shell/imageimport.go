@@ -1,0 +1,208 @@
+// Copyright 2019 Yunion
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package shell
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+
+	"yunion.io/x/pkg/errors"
+
+	"yunion.io/x/cloudmux/pkg/cloudprovider"
+	"yunion.io/x/cloudmux/pkg/multicloud/cas"
+	casprovider "yunion.io/x/cloudmux/pkg/multicloud/cas/provider"
+)
+
+// SSH_PASSWORD_ENV is read when --ssh-password is not given.
+const SSH_PASSWORD_ENV = "CAS_SSH_PASSWORD"
+
+type ImageImportTemplateOptions struct {
+	HostId       int64  `help:"CAS host id that sees the pool" required:"true"`
+	Pool         string `help:"Storage pool name (file pool: dir/netfs/fs)" required:"true"`
+	File         string `help:"qcow2 file name in the pool, or its absolute path inside the pool directory" required:"true"`
+	TemplateName string `help:"Name of the new template" required:"true"`
+	Desc         string `help:"Template description"`
+	Vswitch      string `help:"vSwitch of the temporary VM NIC" required:"true"`
+	Profile      string `help:"Network profile name" default:"Default"`
+	OsVersion    string `help:"CAS osVersion string" default:"Other Linux(64-bit)"`
+	Cpu          int    `help:"vCPUs of the temporary VM" default:"1"`
+	MemoryMb     int    `help:"Memory MB of the temporary VM (>= 512)" default:"1024"`
+	TempVmName   string `help:"Temporary VM name (default tplimp-<template name>)"`
+	Refresh      bool   `help:"GET storage/refresh before looking the file up (use after copying it in by hand)"`
+	DryRun       bool   `help:"Only read and print the planned calls; no writes"`
+
+	SshUpload                string `help:"Mode b: local qcow2 to copy into the pool over SSH first (off unless set; needs a cmx built with -tags cas_ssh)"`
+	SshAddr                  string `help:"SSH host:port (default <host ip>:22)"`
+	SshUser                  string `help:"SSH user; it only needs write access to the pool directory" default:"root"`
+	SshPassword              string `help:"SSH password (prefer env CAS_SSH_PASSWORD; avoid ps/history)"`
+	SshKeyFile               string `help:"SSH private key file (PEM, unencrypted)"`
+	SshKnownHosts            string `help:"known_hosts file used to verify the host key"`
+	SshHostKeySha256         string `help:"Pinned host key fingerprint, e.g. SHA256:... (ssh-keygen -lf)"`
+	SshInsecureIgnoreHostKey bool   `help:"Explicitly skip host key verification (not recommended)"`
+
+	UploadMode       string `help:"How the file gets into the pool: pool-file (already there, default), ssh (--ssh-upload), http (--http-upload; CAS pulls it from cmx)" choices:"pool-file|ssh|http"`
+	HttpUpload       string `help:"Mode http: local qcow2 that CAS pulls from a temporary Glance-V1 stub served by cmx"`
+	ServeAddr        string `help:"Mode http: host:port the stub listens on, only while the import runs"`
+	ServeAdvertise   string `help:"Mode http: host:port CAS is told to fetch from (default --serve-addr); must be reachable from the CAS node"`
+	HttpSkipChecksum bool   `help:"Mode http: do not send the md5 checksum to nova/download and ifExists"`
+	ServeAnyAddr     bool   `help:"Mode http: allow --serve-addr 0.0.0.0, [::] or an empty host (listen on every interface); off by default"`
+}
+
+func (o *ImageImportTemplateOptions) uploadMode() (string, error) {
+	mode := o.UploadMode
+	if len(mode) == 0 {
+		switch {
+		case len(o.SshUpload) > 0 && len(o.HttpUpload) > 0:
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-upload and --http-upload are exclusive")
+		case len(o.SshUpload) > 0:
+			mode = "ssh"
+		case len(o.HttpUpload) > 0:
+			mode = "http"
+		default:
+			mode = "pool-file"
+		}
+	}
+	sshSet := len(o.SshUpload) > 0
+	for _, s := range []string{o.SshAddr, o.SshPassword, o.SshKeyFile, o.SshKnownHosts, o.SshHostKeySha256} {
+		sshSet = sshSet || len(s) > 0
+	}
+	sshSet = sshSet || o.SshInsecureIgnoreHostKey
+	httpSet := len(o.HttpUpload) > 0 || len(o.ServeAddr) > 0 || len(o.ServeAdvertise) > 0 || o.HttpSkipChecksum || o.ServeAnyAddr
+	switch mode {
+	case "pool-file":
+		if sshSet || httpSet {
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-* / --http-* / --serve-* options need --upload-mode ssh or http")
+		}
+	case "ssh":
+		if httpSet {
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--http-* / --serve-* options are for --upload-mode http")
+		}
+		if len(o.SshUpload) == 0 {
+			return "", errors.Wrap(cloudprovider.ErrMissingParameter, "--upload-mode ssh needs --ssh-upload <local file>")
+		}
+	case "http":
+		if sshSet {
+			return "", errors.Wrap(cloudprovider.ErrInputParameter, "--ssh-* options are for --upload-mode ssh")
+		}
+		if len(o.HttpUpload) == 0 || len(o.ServeAddr) == 0 {
+			return "", errors.Wrap(cloudprovider.ErrMissingParameter, "--upload-mode http needs --http-upload <local file> and --serve-addr host:port")
+		}
+	default:
+		return "", errors.Wrapf(cloudprovider.ErrInputParameter, "upload mode %q", mode)
+	}
+	return mode, nil
+}
+
+func (o *ImageImportTemplateOptions) importOptions() (cas.SImageImportOptions, error) {
+	ret := cas.SImageImportOptions{
+		HostId: o.HostId, PoolName: o.Pool, File: o.File, TemplateName: o.TemplateName, Description: o.Desc,
+		OsVersion: o.OsVersion, CpuCores: o.Cpu, MemoryMB: o.MemoryMb, VSwitchName: o.Vswitch, ProfileName: o.Profile,
+		TempVMName: o.TempVmName, Refresh: o.Refresh, DryRun: o.DryRun,
+	}
+	mode, err := o.uploadMode()
+	if err != nil {
+		return ret, err
+	}
+	switch mode {
+	case "pool-file":
+		return ret, nil
+	case "http":
+		ret.Stager = cas.NewHTTPStager(cas.SHTTPUploadOptions{
+			LocalPath: o.HttpUpload, ServeAddr: o.ServeAddr, AdvertiseAddr: o.ServeAdvertise, SkipChecksum: o.HttpSkipChecksum,
+			AllowAnyAddr: o.ServeAnyAddr,
+		})
+		return ret, nil
+	}
+	stager, err := o.sshStager()
+	if err != nil {
+		return ret, err
+	}
+	ret.Stager = stager
+	return ret, nil
+}
+
+func init() {
+	cmd := NewCommand("image-import")
+	NewCO[ImageImportTemplateOptions](cmd).RawRun("template", "Turn a qcow2 cloud image in a CAS pool (or uploaded over SSH, or pulled by CAS over HTTP from cmx) into a VM template; --dry-run prints the plan", func(cli ICloudProvider, args *ImageImportTemplateOptions) error {
+		opts, err := args.importOptions()
+		if err != nil {
+			return err
+		}
+		if cli == nil || cli.GetProvider() == nil {
+			return errors.Wrap(cloudprovider.ErrMissingParameter, "image-import-template needs CAS credentials")
+		}
+		p, ok := cli.GetProvider().(*casprovider.SCasProvider)
+		if !ok {
+			return errors.Wrap(cloudprovider.ErrNotSupported, "image-import-template requires the CAS provider")
+		}
+		for _, w := range args.sshPreflightWarnings() {
+			// before anything connects, not only in the result
+			fmt.Fprintln(os.Stderr, "WARNING: "+w)
+		}
+		ctx, stop := interruptContext()
+		defer stop()
+		opts.Context = ctx
+		res, err := p.GetClient().ImportQcow2AsTemplate(opts)
+		if res != nil {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if eerr := enc.Encode(res); eerr != nil {
+				fmt.Fprintln(os.Stderr, eerr)
+			}
+			for _, w := range res.Warnings {
+				fmt.Fprintln(os.Stderr, "WARNING: "+w)
+			}
+		}
+		// a non-nil err makes cmx exit non-zero, also when a template was
+		// created but failed the backing-file check
+		return err
+	})
+}
+
+// interruptContext is cancelled by the first SIGINT/SIGTERM: the import
+// stops before its next step, the HTTP stub stops at once, and cleanup
+// runs under the usual keep-on-ambiguity rules (a CAS task already sent
+// is still waited for). The handler is then removed, so a second Ctrl-C
+// kills cmx immediately (skipping that cleanup). (signal.Notify rather
+// than signal.NotifyContext, so a normal stop() is not reported as an
+// interrupt.)
+func interruptContext() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGTERM)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case sig := <-ch:
+			signal.Stop(ch)
+			fmt.Fprintf(os.Stderr, "%s: stopping after the current CAS call and cleaning up; press Ctrl-C again to exit at once (no cleanup)\n", sig)
+			cancel()
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return ctx, func() {
+		once.Do(func() {
+			signal.Stop(ch)
+			close(done)
+			cancel()
+		})
+	}
+}
