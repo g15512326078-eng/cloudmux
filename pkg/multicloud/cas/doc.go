@@ -30,6 +30,11 @@
 //   - Disks and snapshots: create/attach/detach data disks (detach keeps
 //     the volume), VM snapshots create/revert/delete.
 //
+//   - Templates: create from a shut-off VM (clone, the VM is kept; the
+//     template must be proven flat, else it is kept and reported), rename
+//     (refused unless the current storages can be sent back unchanged),
+//     delete (refused while fast-deployed or referenced by any VM).
+//
 // Storagecache.UploadImage (cloudpods image upload) is not implemented.
 //
 // Every CAS request is bounded (10s dial, 10s TLS handshake, 30s response
@@ -38,7 +43,8 @@
 //
 // A read-only cloud account (ProviderConfig.ReadOnly) is enforced in the
 // HTTP transport: every request other than GET/HEAD fails with
-// ErrAccountReadOnly before it is sent.
+// ErrAccountReadOnly before it is sent. Template writes also check this
+// up front, before any lookup.
 //
 // Provenance: request and response shapes follow the CAS REST API
 // reference (api.yaml). The points below are not in the official CAS API

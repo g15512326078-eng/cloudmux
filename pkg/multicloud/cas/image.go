@@ -164,8 +164,20 @@ func (self *SImage) GetBios() cloudprovider.TBiosType {
 	return cloudprovider.BIOS
 }
 
-// Delete is not supported yet.
-func (self *SImage) Delete(ctx context.Context) error { return cloudprovider.ErrNotImplemented }
+// Delete removes the template with DELETE vmTemplate/deleteVmTemplateInfo
+// after the in-use checks in SCasClient.DeleteVmTemplate. A template that
+// is already gone counts as deleted.
+func (self *SImage) Delete(ctx context.Context) error {
+	return self.cache.region.cli.WithContext(ctx).DeleteVmTemplate(self.Id)
+}
 
-// Rename is not supported yet.
-func (self *SImage) Rename(name string, desc *string) error { return cloudprovider.ErrNotImplemented }
+// Rename changes only the template name (and description when desc is
+// not nil); see SCasClient.RenameVmTemplate.
+func (self *SImage) Rename(name string, desc *string) error {
+	tpl, err := self.cache.region.cli.RenameVmTemplate(self.Id, name, desc)
+	if err != nil {
+		return err
+	}
+	self.SVmTemplate = *tpl
+	return nil
+}
