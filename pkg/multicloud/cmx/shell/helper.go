@@ -59,6 +59,14 @@ func NewCloudProvider(opt *GlobalOptions) (ICloudProvider, error) {
 		return nil, errors.Errorf("Missing secret")
 	}
 
+	accessUrl := opt.CloudEnv
+	if opt.Provider == api.CLOUD_PROVIDER_CAS {
+		if len(opt.CasUrl) == 0 {
+			return nil, errors.Errorf("CAS requires --cas-url (or CLOUDMUX_CAS_URL)")
+		}
+		accessUrl = opt.CasUrl
+	}
+
 	cfg := &httpproxy.Config{
 		HTTPProxy:  os.Getenv("HTTP_PROXY"),
 		HTTPSProxy: os.Getenv("HTTPS_PROXY"),
@@ -72,11 +80,6 @@ func NewCloudProvider(opt *GlobalOptions) (ICloudProvider, error) {
 	factory, err := cloudprovider.GetProviderFactory(opt.Provider)
 	if err != nil {
 		return nil, errors.Wrapf(err, "GetProviderFactory")
-	}
-
-	accessUrl := opt.CloudEnv
-	if opt.Provider == api.CLOUD_PROVIDER_CAS {
-		accessUrl = opt.CasUrl
 	}
 
 	p, err := factory.GetProvider(cloudprovider.ProviderConfig{
