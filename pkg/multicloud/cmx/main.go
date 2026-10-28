@@ -84,9 +84,14 @@ func Main() {
 		fmt.Print(subparser.HelpString())
 		return
 	}
-	provider, e := shell.NewCloudProvider(options)
-	if e != nil {
-		showErrorAndExit(e)
+	var provider shell.ICloudProvider
+	if shell.WantsOfflineFixture(suboptions) {
+		provider = shell.NewOfflineProvider()
+	} else {
+		provider, e = shell.NewCloudProvider(options)
+		if e != nil {
+			showErrorAndExit(e)
+		}
 	}
 
 	if e := subcmd.Invoke(provider, suboptions); e != nil {

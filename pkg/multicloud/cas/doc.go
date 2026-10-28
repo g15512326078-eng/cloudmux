@@ -30,6 +30,9 @@
 //   - Disks and snapshots: create/attach/detach data disks (detach keeps
 //     the volume), VM snapshots create/revert/delete.
 //
+//   - Idle analysis: read-only monitor/report metrics and the idle
+//     scoring in the idle subpackage (cmx instance-idle-list).
+//
 //   - Templates: create from a shut-off VM (clone, the VM is kept; the
 //     template must be proven flat, else it is kept and reported), rename
 //     (refused unless the current storages can be sent back unchanged),
